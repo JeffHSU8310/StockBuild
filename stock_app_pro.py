@@ -3426,6 +3426,21 @@ class StockTradingAppPro(tk.Tk):
         except Exception:
             return None
 
+    def _trade_type_for_symbol(self, sym):
+        """依代碼判斷策略編輯器「交易種類」應帶入股票或期貨,規則與
+        on_watchlist_select 的市場模式判斷一致,只是把結果收斂成
+        strategy_engine.TRADE_TYPES 看得懂的值 (股票/期貨)。"""
+        sym = (sym or '').strip().upper()
+        if not sym:
+            return '股票'
+        if self._looks_like_futures_symbol(sym):
+            return '期貨'
+        if any(ch.isdigit() for ch in sym):
+            return '股票'
+        if sym in self.FUT_ALIASES or sym in ("TXF", "MXF") or (self.api_logged_in and HAS_SJ and self._resolve_futures_contract(sym)):
+            return '期貨'
+        return '股票'
+
     def _log_futures_candidates(self, raw):
         """
         【ADR-028】台期貨模式查無代號時,列出可用/相近的期貨商品代號,
@@ -4898,6 +4913,20 @@ class StockTradingAppPro(tk.Tk):
         self.entry_symbol.delete(0, tk.END)
         self.entry_symbol.insert(0, sym)
         self.start_fetch_thread()
+        # 【策略編輯器帶入】若「新增/編輯策略」對話框正開著,點自選股同時把
+        # 商品代碼帶進對話框,交易種類 (股票/期貨) 也一併自動判斷,不用手key。
+        target = getattr(self, '_qt_editor_symbol_target', None)
+        if target is not None:
+            try:
+                dlg_ref, e_sym_ref, cb_tt_ref, lookup_cb = target
+                if dlg_ref.winfo_exists():
+                    e_sym_ref.delete(0, tk.END)
+                    e_sym_ref.insert(0, sym)
+                    cb_tt_ref.set(self._trade_type_for_symbol(sym))
+                    if lookup_cb:
+                        lookup_cb()
+            except Exception:
+                pass
 
     def add_to_wl(self):
         group = self.current_wl_name.get()
@@ -5869,6 +5898,8 @@ class StockTradingAppPro(tk.Tk):
         _lbl(top, "交易種類").grid(row=0, column=4, sticky='w', padx=(8, 0))
         cb_tt = ttk.Combobox(top, values=list(strategy_engine.TRADE_TYPES), width=7, state='readonly', style="BlackText.TCombobox")
         cb_tt.set(strategy_engine.trade_type_of(s)); cb_tt.grid(row=0, column=5, padx=4)
+        tk.Label(top, text="← 也可直接點左側自選股帶入(自動判斷股票/期貨)", bg="#1A2026",
+                 fg="#8A99AD", font=('微軟正黑體', 8)).grid(row=0, column=6, sticky='w', padx=(10, 0))
         lbl_cname = tk.Label(top, text="", bg="#1A2026", fg="#29B6F6", font=('微軟正黑體', 9, 'bold'))
         lbl_cname.grid(row=4, column=0, columnspan=6, sticky='w', pady=(4, 0))
         def _clook(*_a):
@@ -5881,6 +5912,8 @@ class StockTradingAppPro(tk.Tk):
                 lbl_cname.config(text="")
         e_sym.bind('<KeyRelease>', _clook); e_sym.bind('<FocusOut>', _clook)
         cb_tt.bind('<<ComboboxSelected>>', _clook)
+        # 【策略編輯器帶入】同 _qt_open_editor:記住欄位讓點自選股可以帶入。
+        self._qt_editor_symbol_target = (dlg, e_sym, cb_tt, _clook)
         _lbl(top, "週期").grid(row=1, column=0, sticky='w', pady=(6, 0))
         cb_tf = ttk.Combobox(top, values=list(strategy_engine.VALID_TIMEFRAMES), width=7, state='readonly', style="BlackText.TCombobox")
         cb_tf.set(s.get('timeframe', '5分K')); cb_tf.grid(row=1, column=1, padx=4, pady=(6, 0))
@@ -6398,6 +6431,8 @@ class StockTradingAppPro(tk.Tk):
         lbl_name = tk.Label(top, text="", bg="#1A2026", fg="#29B6F6", font=('微軟正黑體', 9, 'bold'))
         lbl_name.grid(row=5, column=0, columnspan=7, sticky='w', pady=(2, 0))
         _lbl(top, "交易種類").grid(row=0, column=4, sticky='w', padx=(10, 0))
+        tk.Label(top, text="← 也可直接點左側自選股帶入(自動判斷股票/期貨)", bg="#1A2026",
+                 fg="#8A99AD", font=('微軟正黑體', 8)).grid(row=0, column=6, sticky='w', padx=(10, 0))
         cb_tt = ttk.Combobox(top, values=list(strategy_engine.TRADE_TYPES), width=7, state='readonly', style="BlackText.TCombobox")
         cb_tt.set(strategy_engine.trade_type_of(s)); cb_tt.grid(row=0, column=5, padx=4)
         def _lookup_name(*_a):
@@ -6415,6 +6450,9 @@ class StockTradingAppPro(tk.Tk):
         e_sym.bind('<KeyRelease>', _lookup_name)
         e_sym.bind('<FocusOut>', _lookup_name)
         cb_tt.bind('<<ComboboxSelected>>', _lookup_name)
+        # 【策略編輯器帶入】記住這個對話框的商品代碼/交易種類欄位,讓
+        # on_watchlist_select 點自選股時可以直接寫回來 (見該函式的說明)。
+        self._qt_editor_symbol_target = (dlg, e_sym, cb_tt, _lookup_name)
         _lbl(top, "週期").grid(row=1, column=0, sticky='w', pady=(6, 0))
         cb_tf = ttk.Combobox(top, values=list(strategy_engine.VALID_TIMEFRAMES), width=7, state='readonly', style="BlackText.TCombobox")
         cb_tf.set(s.get('timeframe', '5分K')); cb_tf.grid(row=1, column=1, padx=4, pady=(6, 0))
