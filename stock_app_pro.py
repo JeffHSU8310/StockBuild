@@ -877,8 +877,14 @@ class StockTradingAppPro(tk.Tk):
         self.main_pane = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         self.main_pane.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        left_frame = tk.Frame(self.main_pane, bg="#12161A", width=240)
-        left_frame.pack_propagate(False) 
+        # 【使用者調整】自選股 Treeview 的 5 欄寬度 (56+76+62+52+54=300px) 加上
+        # LabelFrame 內距 (padx=5*2) 本來就超過舊預設值 240px,導致「名稱」欄
+        # 這類文字被自動壓縮/截斷,使用者得手動拖曳 PanedWindow 分隔線才看得到
+        # 完整內容——但拖曳分隔線本身會觸發圖表持續重繪 (ADR-036 已知效能問題),
+        # 越拉越卡。改成預設值直接夠寬,不需要使用者手動拖曳:這是啟動時一次性
+        # 決定的靜態寬度,跟拖曳當下的重繪節流是兩件事,不會有 ADR-036 的效能疑慮。
+        left_frame = tk.Frame(self.main_pane, bg="#12161A", width=330)
+        left_frame.pack_propagate(False)
         self.main_pane.add(left_frame, weight=0) 
 
         wl_box = tk.LabelFrame(left_frame, text=" 多群組自選股 ", bg="#1A2026", fg="#FFCA28", font=('微軟正黑體', 10, 'bold'), padx=5, pady=3)
