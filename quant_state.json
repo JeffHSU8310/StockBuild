@@ -1,0 +1,28 @@
+{
+  "1acdaf6624": {
+    "state": "LONG",
+    "entry_price": 90.0,
+    "qty": 1,
+    "last_bar_ts": "2026-05-03 00:00:00",
+    "trades_today": 1,
+    "day": "2026-06-05",
+    "last_order_ts": 100.0,
+    "realized_pnl_today": 0.0,
+    "error_count": 0,
+    "condition_errors": [],
+    "time_window_skips": []
+  },
+  "6ca6b4c5c0": {
+    "state": "LONG",
+    "entry_price": 90.0,
+    "qty": 1,
+    "last_bar_ts": "2026-05-03 00:00:00",
+    "trades_today": 1,
+    "day": "2026-06-05",
+    "last_order_ts": 100.0,
+    "realized_pnl_today": 0.0,
+    "error_count": 0,
+    "condition_errors": [],
+    "time_window_skips": []
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "ma_shows": [
+    true,
+    true,
+    false,
+    false,
+    false,
+    false
+  ],
+  "ma_types": [
+    "SMA",
+    "SMA",
+    "SMA",
+    "EMA",
+    "SMA",
+    "SMA"
+  ],
+  "ma_periods": [
+    "5",
+    "20",
+    "120",
+    "240",
+    "120",
+    "240"
+  ],
+  "ma_colors": [
+    "黃 (#FFCA28)",
+    "白 (#FFFFFF)",
+    "藍 (#29B6F6)",
+    "紫 (#E040FB)",
+    "橘 (#FF9100)",
+    "紅 (#FF1744)"
+  ],
+  "bb_show": false,
+  "bb_color": "青 (#00E5FF)",
+  "bb_period": 20,
+  "bb_std1": 2.0,
+  "bb_std2": 3.0,
+  "var_bbw": false,
+  "var_macd": true,
+  "macd_f": "12",
+  "macd_s": "26",
+  "macd_sig": "9",
+  "var_rsi": false,
+  "rsi_p": "14",
+  "var_kdj": false,
+  "kd_n": "9",
+  "kd_m1": "3",
+  "kd_m2": "3",
+  "var_dmi": false,
+  "dmi_n": "14"
+}

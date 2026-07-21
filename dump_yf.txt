@@ -1,0 +1,35 @@
+    def _extend_with_yahoo(self, pub_df, tf, sym=None):
+        """對於股票/ETF，若 shioaji 資料不夠長，向 yfinance 請求深層歷史補齊。"""
+        try:
+            if pub_df is None or pub_df.empty: return pub_df
+            sym = sym or getattr(self, 'current_symbol', '')
+            if not sym or not sym[0].isdigit(): return pub_df
+            
+            yf_params = {"日K": ("20y", "1d"), "周K": ("20y", "1wk"), "月K": ("20y", "1mo")}
+            if tf not in yf_params: return pub_df
+            period, interval = yf_params[tf]
+            
+            import yfinance as yf
+            df_yf = pd.DataFrame()
+            for suffix in [".TW", ".TWO"]:
+                df_yf = yf.Ticker(f"{sym}{suffix}").history(period=period, interval=interval, auto_adjust=False)
+                if not df_yf.empty:
+                    break
+            if df_yf.empty: return pub_df
+            
+            df_yf.index = pd.to_datetime(df_yf.index)
+            if df_yf.index.tz is not None: df_yf.index = df_yf.index.tz_localize(None)
+            
+            earliest_sj = pub_df.index[0]
+            df_yf = df_yf[df_yf.index < earliest_sj]
+            if df_yf.empty: return pub_df
+            
+            df_yf = df_yf[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+            merged = pd.concat([df_yf, pub_df]).sort_index()
+            merged = merged[~merged.index.duplicated(keep='last')]
+            return merged
+        except Exception as e:
+            self.safe_after(0, self.log_message, f"【深層歷史】由 yfinance 補齊失敗: {e}")
+            return pub_df
+
+    def _extend_with_taifex(self, pub_df, tf, contract=None, session='all'):

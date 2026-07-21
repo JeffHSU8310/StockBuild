@@ -1,0 +1,47 @@
+{
+  "id": "11d43b147f",
+  "name": "555555",
+  "symbol": "MXFR1",
+  "market": "台期貨",
+  "trade_type": "期貨",
+  "timeframe": "5分K",
+  "direction": "做多",
+  "qty": 1,
+  "slippage_ticks": 2,
+  "entry": [
+    {
+      "type": "ma_cross_up",
+      "params": {
+        "fast": 5,
+        "slow": 20
+      }
+    }
+  ],
+  "exit_signals": [
+    {
+      "type": "ma_cross_down",
+      "params": {
+        "fast": 5,
+        "slow": 20
+      }
+    }
+  ],
+  "stop_loss_pct": 0.0,
+  "take_profit_pct": 0.0,
+  "stop_loss_abs": 0.0,
+  "take_profit_abs": 0.0,
+  "max_trades_per_day": 1,
+  "cooldown_sec": 300.0,
+  "daily_loss_limit": 0.0,
+  "mode": "模擬",
+  "enabled": false,
+  "buy_and_hold": false,
+  "bnh_mode": "accumulate",
+  "dca_amount": 10000.0,
+  "dca_interval": "month",
+  "entry_time_start": "",
+  "entry_time_end": "",
+  "exit_time_start": "",
+  "exit_time_end": "",
+  "specific_entry_time": ""
+}

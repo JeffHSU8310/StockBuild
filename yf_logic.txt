@@ -1,0 +1,284 @@
+
+                        def _sub(qtype, odd, label):
+                            try:
+                                try:
+                                    self.sj_api.quote.subscribe(contract, quote_type=qtype, version=sj.constant.QuoteVersion.v1, intraday_odd=odd)
+                                except TypeError:
+                                    # 舊版簽名不吃 version 關鍵字時的相容退路
+                                    self.sj_api.quote.subscribe(contract, quote_type=qtype, intraday_odd=odd)
+                                return True
+                            except Exception as sub_e:
+                                self.safe_after(0, self.log_message, f"【訂閱失敗】{label}: {sub_e}")
+                                return False
+
+                        ok_t = _sub(sj.constant.QuoteType.Tick, False, "整股Tick")
+                        ok_b = _sub(sj.constant.QuoteType.BidAsk, False, "整股五檔")
+                        if self.asset_type == "stock":
+                            ok_ot = _sub(sj.constant.QuoteType.Tick, True, "零股Tick")
+                            ok_ob = _sub(sj.constant.QuoteType.BidAsk, True, "零股五檔")
+                            self.safe_after(0, self.log_message, f"【訂閱結果】整股Tick:{'✓' if ok_t else '✗'} 整股五檔:{'✓' if ok_b else '✗'} 零股Tick:{'✓' if ok_ot else '✗'} 零股五檔:{'✓' if ok_ob else '✗'}")
+                        else:
+                            self.safe_after(0, self.log_message, f"【訂閱結果】Tick:{'✓' if ok_t else '✗'} 五檔:{'✓' if ok_b else '✗'}")
+                except Exception as e:
+                    self.safe_after(0, self.log_message, f"訂閱報價串流異常: {e}")
+            else:
+                # 美股:自動使用 yfinance,shioaji 本來就不支援美股。
+                self.asset_type = "us_stock"
+                self.data_source = ""
+
+            df = pd.DataFrame()
+            adjust_flag = self.var_adjusted.get()
+
+            # 【ADR-024】發布函式:worker 的每一次「出圖」都經過這裡。
+            # - seq 防護:發布前檢查序號,若使用者已切到別的商品/週期就放棄,
+            #   避免慢的舊查詢 (台指期) 最後才回來把新圖蓋掉。
+            # - full_ui:第一次發布更新價格欄/面板/hover;背景補全時只換圖,
+            #   並在 UI 執行緒讀取目前視角、依「前面新增了幾根K」平移 xlim,
+            #   使用者看到的視窗不會跳動。
+            _pub_state = {'n': None}  # 【ADR-049】上次實際發布的K棒根數 (含期交所延伸)
+
+            def _publish(pub_df, full_ui=True, prev_len=None, note=""):
+                if seq is not None and seq != self._fetch_seq:
+                    return False  # 已有更新的查詢,放棄發布
+                # 【ADR-049】期貨 R1 連續合約的日/周/月K,用期交所官方日行情往前
+                # 延伸更長歷史 (只補 shioaji 涵蓋不到的更早日期,重疊處 shioaji 權威)。
+                # 放在 _publish 統一入口:快取/快速段/完整段三條路徑都同樣延伸,
+                # prev_len 平移邏輯不受影響 (兩次發布延伸的根數相同,差值仍正確)。
+                if self.asset_type == "future" and tf in ("日K", "周K", "月K"):
+                    pub_df = self._extend_with_taifex(pub_df, tf)
+                elif self.asset_type == "stock" and tf in ("日K", "周K", "月K"):
+                    pub_df = self._extend_with_yahoo(pub_df, tf)
+                pub_df = pub_df.dropna(subset=['Open', 'High', 'Low', 'Close'])
+                if pub_df.empty:
+                    return False
+                # 【ADR-049】記錄實際發布根數 (含延伸)。背景補全的 prev_len 必須用
+                # 「上次實際發布的根數」計算平移量;若用延伸前的長度,xlim 會被
+                # 多平移「延伸根數」而跳離原視角。
+                _pub_state['n'] = len(pub_df)
+                pub_df = pub_df.copy()
+                if pub_df.index.tz is not None:
+                    pub_df.index = pub_df.index.tz_localize(None)
+                pub_df.index = pd.to_datetime(pub_df.index)
+                
+                if adjust_flag and self.asset_type == "stock" and is_taiwan_instrument:
+                    try:
+                        from data import dividend_store
+                        adjusted = dividend_store.adjust_dataframe(pub_df, search_sym)
+                        if adjusted and full_ui:
+                            self.safe_after(0, self.log_message, f"【還原權息】已套用 {search_sym} 的除權息價格調整。")
+                    except Exception as e:
+                        self.safe_after(0, self.log_message, f"【還原權息】調整失敗: {e}")
+
+                self.current_symbol = search_sym; self.current_stock_name = stock_name; self.current_df = pub_df
+                self.current_timeframe = tf  # 【第十六輪 第6項】自動更新 worker 依此判斷K棒邊界
+
+                latest_p = pub_df['Close'].iloc[-1]
+                tick = self.get_tick(latest_p)
+                if tick >= 1: format_str = f"{int(latest_p)}"
+                elif tick == 0.5 or tick == 0.1: format_str = f"{latest_p:.1f}"
+                else: format_str = f"{latest_p:.2f}"
+
+                def update_ui():
+                    try:
+                        if seq is not None and seq != self._fetch_seq:
+                            return
+                        if full_ui:
+                            # 【ADR-008】entry_price 在「盤後定價」模式下是 disabled,
+                            # 寫入前先暫時解鎖,再依目前交易別鎖回。
+                            was_disabled = (str(self.entry_price['state']) == 'disabled')
+                            if was_disabled: self.entry_price.config(state="normal")
+                            self.entry_price.delete(0, tk.END)
+                            self.entry_price.insert(0, format_str)
+                            if was_disabled or self.trade_mode == "Fixing":
+                                self.entry_price.config(state="disabled")
+                            # 換股後 asset_type 可能從股票變期貨或反之,同步下單面板
+                            self.update_order_panel_for_asset_type()
+                            # 換股清 hover 資訊列 (詳見 ADR-018)
+                            self.lbl_hover_info.config(text="滑鼠游標移至 K 線圖上方以顯示詳細資訊...", fg="#29B6F6")
+                            self.last_hover_idx = -1
+                        elif prev_len is not None and self.axlist:
+                            # 背景補全:歷史K是「往前面加」,positional x 索引整體右移。
+                            # 讀取目前視角並平移相同根數,視覺上完全不動。
+                            try:
+                                added = len(pub_df) - prev_len
+                                if added > 0:
+                                    x0, x1 = self.axlist[0].get_xlim()
+                                    self.saved_xlim = (x0 + added, x1 + added)
+                            except Exception:
+                                pass
+                        if note:
+                            self.log_message(note)
+                        self.draw_chart(pub_df)
+                    except Exception as e:
+                        self.log_message(f"介面更新異常: {e}")
+                self.safe_after(0, update_ui)
+                return True
+
+            if is_taiwan_instrument:
+                self.data_source = "shioaji"
+                days = self.SJ_DAYS.get(tf, 180)
+                end_dt = datetime.now(); start_dt = end_dt - timedelta(days=days)
+                cache_key = search_sym
+
+                # ---- 第一優先:快取涵蓋範圍 → 立即重採樣出圖 (秒開) ----
+                cached_raw, cache_fresh = self._kbars_cache_get(cache_key, start_dt)
+                published_from_cache = False
+                cached_len = None
+                if cached_raw is not None and not cached_raw.empty:
+                    try:
+                        df_cached = self._resample_sj_df(cached_raw, tf)
+                        if _publish(df_cached, full_ui=True):
+                            published_from_cache = True
+                            cached_len = _pub_state['n']  # 【ADR-049】含延伸的實際發布根數
+                    except Exception:
+                        pass
+                if published_from_cache and cache_fresh:
+                    return  # 快取新鮮,直接完工——這就是「換週期/切回商品秒開」的路徑
+
+                # ---- 兩段式第一段:首次載入慢商品 (期貨/指數 且 日K以上) 先抓小範圍搶先出圖 ----
+                quick_len = None
+                slow_asset = self.asset_type in ("future", "index_tw")
+                if (not published_from_cache) and slow_asset and tf in self.QUICK_DAYS:
+                    try:
+                        q_days = self.QUICK_DAYS[tf]
+                        q_start = end_dt - timedelta(days=q_days)
+                        self.safe_after(0, self.log_message, f"⚡ 先載入近 {q_days} 天搶先出圖,完整歷史背景補全中...")
+                        quick_raw = self._download_kbars_raw(contract, q_start, end_dt)
+                        if quick_raw is not None and not quick_raw.empty:
+                            df_quick = self._resample_sj_df(quick_raw, tf)
+                            if _publish(df_quick, full_ui=True):
+                                quick_len = _pub_state['n']  # 【ADR-049】含延伸的實際發布根數
+                    except Exception as e:
+                        if self._looks_like_session_dead(e):
+                            self._mark_session_dead()
+
+                # ---- 完整下載 (或 stale 快取的背景刷新) ----
+                self.safe_after(0, self.log_message, f"⚡ 極速引擎：透過永豐金 API 抓取 {stock_name} 歷史 K 線...")
+                try:
+                    # 【第二十輪修正 → ADR-046 改版】單次完整下載優先 (正常商品
+                    # 一次就成,維持既有速度);失敗才改「分段下載」補救:90 天
+                    # 一段逐段抓,壞段跳過其餘照收。舊法「整段失敗 → 縮短成
+                    # 180/90 天」會把還拿得到的早期資料整批放棄 (使用者實例:
+                    # MXFR1 載入後沒有之前的歷史)。每段失敗都有例外證據進日誌。
+                    # 【ADR-060】主圖也套用「期交所已涵蓋就別下載」(原本只有回測/
+                    # 最佳化有做,所以使用者純粹看圖時照樣被流量管制洗版)。
+                    # _f is None 代表整段都有期交所資料 → 完全不呼叫券商,
+                    # raw 留空,後面 _publish 會用 _extend_with_taifex 把歷史接上。
+                    _f, _t, _note = self._taifex_plan_download(
+                        contract, self.asset_type, tf, start_dt, end_dt, tag="背景補全")
+                    if _note:
+                        self.safe_after(0, self.log_message, f"【背景補全】{_note}")
+                    if _f is None:
+                        raw = pd.DataFrame()
+                    else:
+                        try:
+                            raw = self._download_kbars_raw(contract, _f, _t)
+                        except Exception as e1:
+                            if self._looks_like_session_dead(e1):
+                                raise
+                            self.safe_after(0, self.log_message,
+                                            f"【背景補全】完整範圍單次下載失敗 ({type(e1).__name__}: {str(e1)[:100]}),改分段下載補救...")
+                            raw = self._download_kbars_chunked(contract, _f, _t, chunk_days=90)
+                        if raw is None or raw.empty:
+                            raise RuntimeError("完整範圍與分段下載皆無資料 (合約可能剛上市或該期間無交易)")
+                except Exception as e:
+                    # 【第十一輪修正】兩段式載入時,快速段已出圖、只是完整段失敗
+                    # ——訊息要講清楚,不要讓使用者以為整個載入失敗 (TXFR2 實例)。
+                    err_detail = f"{type(e).__name__}: {str(e)[:150]}"
+                    if quick_len is not None or published_from_cache:
+                        self.safe_after(0, self.log_message,
+                                        f"【背景補全】完整歷史下載失敗 ({err_detail}),目前先顯示已載入的近期資料;切換週期或重新查詢會再嘗試。")
+                    else:
+                        self.safe_after(0, self.log_message, f"【提示】無法取得歷史 K 線報價 (shioaji): {err_detail}")
+                    if self._looks_like_session_dead(e):
+                        self._mark_session_dead()
+                    raw = pd.DataFrame()
+
+                if raw is None or raw.empty:
+                    if not (published_from_cache or quick_len):
+                        self.safe_after(0, self.log_message, f"券商 API 查無 {raw_sym} 資料，請確認代碼、連線狀態，或該檔是否已完成合約下載。")
+                    return
+
+                if seq is not None and seq != self._fetch_seq:
+                    return  # 下載期間使用者已切走,連快取都不必污染? 快取仍可留:資料本身沒錯
+                self._kbars_cache_put(cache_key, start_dt, raw, tf)
+                df_full = self._resample_sj_df(raw, tf)
+                prev = quick_len if quick_len is not None else cached_len
+                if prev is not None:
+                    _publish(df_full, full_ui=False, prev_len=prev, note="【背景補全】完整歷史已更新。")
+                else:
+                    _publish(df_full, full_ui=True)
+                return
+            else:
+                # 美股:自動使用 yfinance
+                self.data_source = "yfinance"
+                self.safe_after(0, self.log_message, f"正在透過 YFinance 載入 {raw_sym} 歷史數據 (美股)...")
+                try:
+                    df = yf.Ticker(raw_sym).history(period=period, interval=interval, auto_adjust=adjust_flag)
+                    if not df.empty and df.index.tz is not None:
+                        df.index = df.index.tz_convert('Asia/Taipei').tz_localize(None)
+                except Exception:
+                    pass
+
+                if df.empty:
+                    self.safe_after(0, self.log_message, f"YFinance 查無 {raw_sym} 資料，請確認美股代碼是否正確。")
+                    return
+
+                search_sym = raw_sym
+                try: stock_name = yf.Ticker(search_sym).info.get('shortName', '')
+                except Exception: pass
+                _publish(df, full_ui=True)
+        except Exception as e: self.safe_after(0, self.log_message, f"數據處理異常: {e}")
+
+    def _apply_chart_margins(self, fig, axlist, panel_ratios):
+        """
+        【第五輪修正:白邊真正的解法】mplfinance 面板是 fig.add_axes([固定矩形])
+        建立的,fig.subplots_adjust() 動不了它們,必須對每個面板軸域直接
+        set_position() 才能真正搬動。這裡依 self.chart_layout 的邊界比例
+        (margin_left/right/top/bottom + hspace) 與各面板高度比例 panel_ratios,
+        由上到下重新計算每個面板的矩形位置並套用。
+
+        axlist 的排列是 [面板0主軸, 面板0孿生軸, 面板1主軸, 面板1孿生軸, ...]
+        (mplfinance 每個面板都配一個 secondary_y 的 twinx),所以第 i 個面板
+        對應 axlist[2i] 與 axlist[2i+1],兩個都要搬到同一個矩形。
+
+        hspace 採「每個面板間隙 = hspace × 平均面板高度」的近似,貼近
+        matplotlib subplots_adjust 的 hspace 語意,讓 0.02~0.35 的滑桿範圍
+        對應到合理的面板間距。
+        """
+        try:
+            layout = self.chart_layout
+            left = float(layout['margin_left']); right = float(layout['margin_right'])
+            top = float(layout['margin_top']); bottom = float(layout['margin_bottom'])
+            hspace = float(layout['hspace'])
+            n = len(panel_ratios)
+            if n <= 0 or not axlist:
+                return
+            avail_w = max(right - left, 0.05)
+            span_h = max(top - bottom, 0.05)
+            total_ratio = float(sum(panel_ratios)) or 1.0
+            gap = hspace * (span_h / n)
+            drawable_h = span_h - gap * (n - 1)
+            if drawable_h <= 0.02:  # 間距過大會把面板壓成負高度,退回無間距
+                gap = 0.0
+                drawable_h = span_h
+            unit = drawable_h / total_ratio
+            y_cursor = top
+            for i, ratio in enumerate(panel_ratios):
+                h = unit * ratio
+                rect = [left, y_cursor - h, avail_w, h]
+                for j in (2 * i, 2 * i + 1):
+                    if j < len(axlist) and axlist[j] is not None:
+                        try:
+                            axlist[j].set_position(rect)
+                        except Exception:
+                            pass
+                y_cursor = y_cursor - h - gap
+        except Exception as e:
+            self.log_message(f"【版面套用異常】{e}")
+
+    def draw_chart(self, raw_df):
+        try:
+            df = self.calculate_custom_indicators(raw_df)
+            if len(df) > 1200: df = df.iloc[-1200:].copy()
+            self.plot_df = df 

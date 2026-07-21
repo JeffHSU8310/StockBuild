@@ -1,0 +1,520 @@
+# PITFALLS.md — 已知陷阱清單
+
+> 台股自動交易系統 (`stock_app_pro.py`) 踩過、且**容易被後人重新踩一次**的坑。
+> 開工前先讀 `CLAUDE.md`，再讀本文件確認要改的區塊有沒有已知地雷。
+> 每個坑的格式：**症狀 → 根因 → 正確做法 → 出處 ADR**。
+> 新踩到坑、或修掉一個坑時，請同步更新這裡與 `DECISIONS.md`。
+
+---
+
+## 一、shioaji 報價 / 資料
+
+### P-01　v0 字典 callback 用 topic 字串分流零股/整股，不可靠
+- **症狀**：零股資料混進整股、或整股混進零股，數據時好時壞。
+- **根因**：`set_quote_callback` (v0) 只能靠 topic 字串裡有沒有 "ODD" 判斷，
+  字串格式一旦變動判斷就失效，本質不可靠。
+- **正確做法**：只用 v1 typed callback (`set_on_tick_stk_v1_callback` /
+  `set_on_bidask_stk_v1_callback` /`set_on_tick_fop_v1_callback` /
+  `set_on_bidask_fop_v1_callback`)，讀物件上的 `intraday_odd` 布林欄位分流。
+  絕不要再註冊 v0 callback。
+- **出處**：ADR-005，鐵則 2。
+
+### P-02　`Snapshot` 沒有 `bid_ask` 屬性，盤後五檔不能捏造
+- **症狀**：盤後五檔量看起來「有資料」，但其實是假的、會誤導委買賣力道判讀。
+- **根因**：shioaji `Snapshot` 只有最佳一檔 (`buy_price/sell_price/buy_volume/
+  sell_volume`)，**沒有** `bid_ask`。任何「用總量除以 10 展開五檔」都是編造。
+- **正確做法**：第 1 檔顯示 snapshot 真實值，第 2~5 檔量一律 `--`，物件帶
+  `is_simulated=True`，UI 標「(參考)」/「快照」。沒有真資料就誠實顯示 `--`。
+- **出處**：ADR-005，鐵則 4。
+
+### P-03　`snapshots()` 無節流會把當日 API 配額打光
+- **症狀**：盤中用著用著，整個系統報價突然全部失效一整天。
+- **根因**：shioaji 有每日流量配額，fallback 迴圈若無限制高頻呼叫
+  `snapshots()` 會在盤中把配額耗盡。
+- **正確做法**：無串流 fallback 快照間隔 **≥ 5 秒** (`self.last_fallback_snap_time`
+  節流)。要縮短必須先查官方流量文件並記進 DECISIONS.md，不可憑感覺調。
+- **出處**：ADR-005，鐵則 5。
+
+### P-04　零股/整股暫存共用變數 + 裸讀寫會競態污染
+- **症狀**：零股與整股 tick / 五檔互相蓋來蓋去。
+- **根因**：callback 在 shioaji 背景執行緒觸發，UI worker
+  (`fetch_realtime_worker`) 在另一條執行緒讀，兩邊裸讀寫同一組變數。
+- **正確做法**：`current_tick_normal`/`current_tick_odd`、
+  `current_bidask_normal`/`current_bidask_odd` 永遠分開；所有讀寫都經
+  `self.quote_lock`。
+- **出處**：ADR-005，鐵則 3。
+
+### P-05　四路訂閱包在一個大 try，失敗無聲無息
+- **症狀**：零股沒資料，卻查不出是哪一路訂閱失敗。
+- **根因**：整股 Tick / 整股 BidAsk / 零股 Tick / 零股 BidAsk 四路共用一個
+  `try/except`，任一路掛掉整批中斷且無記錄。
+- **正確做法**：逐路獨立 try/except，每路成功/失敗都印日誌，格式如
+  `【訂閱結果】整股Tick:✓ 整股五檔:✓ 零股Tick:✗ 零股五檔:✗`。
+- **出處**：ADR-005，鐵則 8。
+
+### P-06　盤後冷登入拿不到「當日零股收盤價」，這是 shioaji 先天限制
+- **症狀**：盤後 (如晚上 21:30) 開 App，零股看板顯示整股參考價，跟當日零股
+  實際收盤對不上。
+- **根因**：`snapshots()` 的 close 永遠是整股價；零股收盤價唯一來源是整股
+  v1 tick 串流物件上的 `closing_oddlot_close`（14:30 盤後零股收完才推送）；
+  shioaji **沒有**盤中零股歷史 tick 查詢 API。冷登入時串流早已錯過。
+- **正確做法**：`on_tick_stk_v1` 收到 `closing_oddlot_close>0` 就快取；冷登入
+  拿不到時退回整股參考價並**明確標註**「今日零股收盤 shioaji 盤後無法回補」，
+  不要讓使用者誤以為是 bug。要拿真實零股收盤，App 需在 13:40–14:30 保持連線。
+- **出處**：ADR-006。
+
+---
+
+## 二、K 線聚合
+
+### P-07　期貨用 `resample('D')` 會被夜盤污染
+- **症狀**：台指期日/週/月K的開高低收跟券商軟體對不上（收盤被夜盤最新價蓋掉）。
+- **根因**：`kbars()` 對期貨只回分K，日K靠自行聚合。`resample('D')` 依自然日
+  00:00 切割，會把 15:00 起的夜盤混進隔天日盤（夜盤量約佔全日三分之一，不可忽略）。
+- **正確做法**：期貨走 `core/futures_session.py` 的**交易日 (session date) 聚合**：
+  時間 >13:45 歸下一交易日，≤13:45 維持當天；日盤排在夜盤兩段之後，取 `'last'`
+  當 Close 自然落在日盤 13:45（「近全」收盤定義）。股票/指數沒夜盤，維持自然日
+  resample。要改收盤定義需另開 ADR。
+- **出處**：ADR-007。
+
+---
+
+## 三、下單
+
+### P-08　`order_lot` 有 4 種，不是 2 種
+- **症狀**：只支援整股/盤中零股，缺盤後定價、盤後零股。
+- **根因**：舊版誤以為只有 Common/IntradayOdd。實際是
+  `Common`(整股)、`Fixing`(盤後定價)、`Odd`(盤後零股)、`IntradayOdd`(盤中零股)。
+- **正確做法**：四種模式都要支援；委託驗證統一走 `core/order_rules.py`。
+- **出處**：ADR-008。
+
+### P-09　零股類交易所規則：只能現股 / 限價 / ROD，數量 1~999 股
+- **症狀**：零股掛市價或融資融券被券商退單，浪費一次 API 呼叫。
+- **根因**：交易所硬規則，不是可放寬的選項。
+- **正確做法**：`execute_order()` 送出前本地擋下不合規的零股委託，這個防呆
+  不可被移除或繞過。整股/盤後定價上限 499 張、零股類 999 股
+  (`core/order_rules.py` 的 `MAX_QTY_LOT`/`MAX_QTY_ODD`)。
+- **出處**：ADR-005 / ADR-008，鐵則 6、鐵則 14。
+
+### P-10　下單必須先跳確認視窗，只有一個方法可以真正送單
+- **症狀**：為了「方便測試」把送單直接接回 `execute_order` → 誤送真實委託。
+- **根因**：實盤下單，繞過確認 = 高風險。
+- **正確做法**：`execute_order()` 只驗證+組裝 Order → `_show_order_confirmation()`
+  顯示欄位 → **只有** `_confirm_and_place_order()` 可呼叫
+  `self.sj_api.place_order(...)`。不可繞過。
+- **出處**：ADR-013，鐵則 14。
+
+### P-11　委託剛送出 (PendingSubmit) 時 `trade.order.id` 可能為空
+- **症狀**：日誌印「委託成功 PendingSubmit」，但「我的委託單」清單是空的。
+- **根因**：PendingSubmit（交易所尚未完全確認）時 `trade.order.id` 常是空字串，
+  舊版 `if order_id:` 判斷為否就整段靜默跳過，外層又 `except: pass` 吞掉例外。
+- **正確做法**：取 id 用獨立 try/except（存取真實 shioaji 物件可能丟例外），
+  取不到就用 `_pending_` 開頭本地暫時 key 先讓委託顯示；之後
+  `_handle_order_event` 收到真實 id 再替換。**seed 成功/失敗都要印明確日誌**，
+  `_refresh_my_orders_ui` 例外不可靜默吞掉。數量轉換用 `_safe_int()`。
+- **出處**：ADR-018 / ADR-019 / ADR-020。
+
+### P-31　Treeview「先刪光再組列」會在中途炸掉時留下永久空白清單
+- **症狀**：日誌印「已加入清單 (共 N 筆)」，分頁卻空白且**一直**空白
+  （資料在 `my_orders` 裡都對）。
+- **根因**：refresh 流程是「刪光 Treeview → sorted() → 逐列 fmt_price 插入」。
+  排序或格式化中途丟例外（實測重現點：seed 的 `ts:0` 與委託回報的
+  `exchange_ts` 型別混排，`sorted()` TypeError），畫面停在「已刪光、還沒插」，
+  之後每次 refresh 死在同一處。
+- **正確做法**：「**先備妥 → 再刪 → 再插**」——所有列先在記憶體組好
+  （排序 key 經 `_safe_ts()` 強制轉 float、逐列獨立 try/except 壞一列跳一列），
+  組完才動 Treeview。清單類 UI 更新一律遵守此原則。
+- **出處**：ADR-021。
+
+### P-33　ttk Treeview (clam 主題) 只設 `'.'` foreground,資料列會「插了卻看不見」
+- **症狀**：委託單/已成交分頁,**標題列看得到、資料列整片空白**;日誌證明資料
+  已插入 (`Treeview N 列 / my_orders M 筆` 兩數皆 >0) 且無任何例外。
+- **根因**：clam 主題下,`style.configure('.', foreground='#FFFFFF')` 只讓
+  **標題列**上色,**資料列**的文字色/背景色/列高必須針對 `Treeview` style
+  明確設定,否則資料列以主題預設渲染 (文字色可能與底色相近),看起來像空白。
+- **正確做法**：建專用 style（如 `Trades.Treeview`）明確設 `background`/
+  `fieldbackground`/`foreground`/`rowheight`,Treeview 建構時 `style=` 套用;
+  每列插入再套 `tags=('visible_row',)` + `tag_configure(foreground=...)` 雙保險;
+  插入後 `update_idletasks()`。並保留「refresh 後印出實際列數」的診斷日誌,
+  讓「插了卻看不見」這種最難查的狀況變成看得到的數字。
+- **出處**：ADR-022。
+
+### P-12　委託狀態用「主動回報」，不可用 `update_status()` 輪詢
+- **症狀**：想每隔幾秒輪詢委託狀態。
+- **根因**：官方「使用限制」文件明確要求用主動回報 (callback/SSE)，避免輪詢。
+- **正確做法**：`api.set_order_callback()` 註冊 push callback
+  (`on_order_deal_callback` → `_handle_order_event`/`_handle_deal_event`)，
+  完全不輪詢。callback 在 shioaji 執行緒，更新畫面一律經 `safe_after`。
+- **出處**：ADR-018。
+
+### P-13　現沖 checkbox 只在「換股」決定起始值，不可被其他操作覆蓋
+- **症狀**：使用者在某檔手動取消現沖勾選後，點了別的按鈕又被悄悄勾回去。
+- **根因**：`update_daytrade_checkbox_state()` 在切換交易別/種類時也會被呼叫；
+  若它在「合格時」主動把 `daytrade_var` 設回 True，就會覆蓋使用者的手動取消。
+- **正確做法**：換股時依 `current_day_trade` 設一次起始值；
+  `update_daytrade_checkbox_state()` **只**負責「不合格時強制清空並鎖住」，
+  合格時**不主動勾回**。系統決定起始值、使用者可在單筆委託上覆蓋。
+- **出處**：ADR-015 / ADR-018，鐵則 16。
+
+### P-14　shioaji 當沖旗標參數名稱有版本差異
+- **症狀**：`Order(..., daytrade_short=True)` 在某些版本丟 `TypeError`。
+- **根因**：不同 shioaji 版本參數名可能是 `daytrade_short` 或舊版 `first_sell`。
+- **正確做法**：`execute_order()` 依序 try `daytrade_short=True` →
+  `first_sell=StockFirstSell.Yes` → 無旗標一般委託 (並提示使用者手動確認)。
+- **出處**：`stock_app_pro.py` `execute_order()`。
+
+---
+
+## 四、繪圖 / 版面（踩最多次的一區）
+
+### P-15　⚠️ `fig.subplots_adjust()` 對 mplfinance 面板無效
+- **症狀**：不管邊界比例、figsize、tight_layout 怎麼調，圖表四周白邊/面板位置
+  一動也不動（此坑連續踩了四~五輪才找到根因）。
+- **根因**：mplfinance 的每個面板是用 `fig.add_axes([固定矩形])` 建立的，
+  而 `subplots_adjust()` **只影響 subplot/GridSpec 建立的軸域**，對 add_axes
+  的固定位置軸域完全無效。用 `plt.subplots()` 測會「有效」是假象，因為那不是
+  mplfinance 的建法。
+- **正確做法**：用 `_apply_chart_margins(fig, axlist, panel_ratios)` 對每個面板
+  （`axlist[2i]` 主軸 + `axlist[2i+1]` secondary_y 孿生軸）直接 `set_position(rect)`。
+  即時預覽走同一個方法 + `canvas.draw_idle()`，不做完整重繪。
+- **出處**：ADR-020。
+
+### P-16　`canvas_widget.config(width,height)` 會被 `pack(fill=BOTH, expand=True)` 覆蓋
+- **症狀**：想用像素微調畫布尺寸，滑桿拉到最大也完全沒反應。
+- **根因**：`pack(fill=BOTH, expand=True)` 會強制 widget 撐滿容器、忽略 config
+  指定的尺寸。兩者同時用，config 等於白設。
+- **正確做法**：畫布本來就該用 `pack(fill=BOTH, expand=True)` 自動填滿容器
+  （這正是我們要的）；圖表內部留白改用 P-15 的 `set_position` 控制。不要再加
+  無效的 config 寬高，也不要提供會誤導的「像素微調」滑桿。
+- **出處**：ADR-020。
+
+### P-17　副圖 Y 軸不會自動跟著縮放/平移重算，會被畫面外極端值壓扁
+- **症狀**：MACD/RSI 等副圖線被壓成貼底的扁平線，看起來「跑掉/壞掉」，且查詢
+  天數越長越容易發生。
+- **根因**：`auto_scale_y` 原本只套主圖；副圖 Y 軸是 mplfinance 依「整個資料集」
+  算的固定範圍，即使某極端值已捲到畫面外，仍撐開整個副圖 Y 軸。
+- **正確做法**：`auto_scale_indicator_panels(xmin, xmax)` 依「目前可見 X 範圍」
+  重算每個副圖 Y 軸；在初始載入、還原縮放、滾輪縮放、拖曳平移四處都要呼叫
+  （拖曳任一面板都要重算，因為各面板共用 x 軸）。
+- **出處**：ADR-018。
+
+### P-18　換股後 hover 資訊列殘留上一檔股票資料
+- **症狀**：換股後上方 hover 列還顯示前一檔的名稱/開高低收，跟新圖表標題不一致。
+- **根因**：`lbl_hover_info` 只在滑鼠移到圖上才更新；換股後若還沒移滑鼠，會停在
+  上一檔最後 hover 的資料。
+- **正確做法**：`update_ui()` 呼叫 `draw_chart()` 前，把 `lbl_hover_info` 重置為
+  預設提示、`last_hover_idx=-1`。
+- **出處**：ADR-018。
+
+### P-19　紅漲綠跌，絕不可換
+- **症狀**：某處顏色寫反。
+- **根因**：台股慣例紅=漲、綠=跌，與美股相反。
+- **正確做法**：所有 K 線、五檔、漲跌文字、MACD Hist 一律紅漲綠跌；寫反視為
+  bug 立即修。Hist 依數值正負動態上色。
+- **出處**：鐵則 1，ADR-017。
+
+### P-20　價格格式化一律走 `fmt_price()`，不可無腦 `.2f`
+- **症狀**：交界價位 (10/50/100/500/1000) 出現非法小數位。
+- **根因**：ETF (00 開頭) 與一般股票 tick 表不同，各處自己寫格式化會不一致。
+- **正確做法**：一律 `self.fmt_price(p)` → `core/tick_rules.py`。手動輸入不對齊
+  tick 時用 `round_to_tick()` 修正（`FocusOut` + 送單前各一道）。
+- **出處**：鐵則 7，ADR-018。
+
+### P-21　中文輸入法送「全形句號」，小數點打不出來
+- **症狀**：輸入法非英文模式時，價格欄位打不出小數點（或顯示全形「。」）。
+- **根因**：中文輸入法句號鍵送出全形「。」而非半形「.」。原本只在 `FocusOut`
+  才轉，打字當下畫面仍是錯的。
+- **正確做法**：`entry_price` 綁 `<KeyRelease>` → `_normalize_decimal_realtime`，
+  打字當下即時把全形句號/小數點轉半形並保留游標；另備「.」按鈕與 `FocusOut`
+  修正當保險。（NumLock 關閉送 `KP_Delete` 的舊猜測已非主因。）
+- **出處**：ADR-016 / ADR-020。
+
+---
+
+## 五、生命週期 / 執行緒
+
+### P-22　背景執行緒排回 UI 一律用 `safe_after`，不可裸用 `self.after`
+- **症狀**：關視窗時主控台噴 `_tkinter.TclError: invalid command name`。
+- **根因**：daemon worker 會跑到行程結束；視窗關閉後仍想 `self.after()` 更新已
+  銷毀的 widget。
+- **正確做法**：一律 `self.safe_after(...)`（兩層防護：排程前檢查 `_closing`、
+  執行時再檢查一次並包 `try/except TclError`）。新增任何背景排程都要沿用。
+- **出處**：ADR-012，鐵則 13。
+
+### P-23　關視窗要先 `logout()` 再 `os._exit(0)` 保底
+- **症狀**：關掉視窗後終端機跳不回提示字元（行程沒真正結束）。
+- **根因**：shioaji 內部 WebSocket 執行緒不是我們開的，無法保證是 daemon；只
+  `destroy()` 行程可能永遠不結束。
+- **正確做法**：`on_app_close()` 依序 (1) 已登入時 `sj_api.logout()` (2) `destroy()`
+  (3) `os._exit(0)` 保底。三步都要有。
+- **出處**：ADR-014，鐵則 15。
+
+### P-24　`create_widgets()` 裡呼叫依賴其他 widget 的方法，順序要對
+- **症狀**：啟動即 `AttributeError` 崩潰（例如 `set_trade_mode` 用到還沒建的
+  `log_txt`），連帶整個行程死掉、看起來像「無法登入券商 API」。
+- **根因**：初始化呼叫的時間點早於它依賴的 widget 建立。
+- **正確做法**：把 `self.set_trade_mode("Common")` 這類初始化呼叫移到
+  `create_widgets()` **最尾端**（所有 widget 都建好之後）。不要靠在
+  `log_message` 加防呆蓋症狀。
+- **出處**：ADR-010。
+
+### P-25　同時登入券商官網會造成 API session 中斷
+- **症狀**：`SessionNotEstablished` / session 相關錯誤，報價/下單失效。
+- **根因**：同一帳號在官網與 API 並行登入會互踢。
+- **正確做法**：用 API 前先登出官網。程式端 `_looks_like_session_dead()` 偵測
+  斷線關鍵字、`_mark_session_dead()` 把 `api_logged_in` 撥回 False 並更新狀態列。
+- **出處**：ADR-016。
+
+---
+
+## 六、資料源政策
+
+### P-26　台股一律 shioaji，不可偷偷加回 yfinance/FinMind 備援
+- **症狀**：未登入時台股查詢安靜退化成別的資料源，數據來源不一致。
+- **根因**：多資料源混用會造成資料不一致與難以除錯。
+- **正確做法**：台股（股票/ETF/指數/期貨）未登入 API 時**直接報錯退出**並提示先
+  登入，不退化；美股才自動用 yfinance（shioaji 不支援美股）。FinMind 及其
+  法人/資券籌碼指標已整個移除，不可因「以前有」順手加回，要恢復需先確認並開
+  新 ADR。判斷邏輯在 `is_taiwan_instrument`。
+- **出處**：ADR-011，鐵則 12。
+
+---
+
+## 七、開發 / 測試
+
+### P-27　`core/`、`data/` 必須零 tkinter、零 shioaji 依賴
+- **症狀**：想在 core 裡 `import shioaji` 或讓函式簽名依賴 `self`/tkinter Variable。
+- **根因**：這兩個套件存在的唯一理由是「可離線單元測試」，一旦有 GUI/券商依賴
+  就破功。
+- **正確做法**：純計算/純規則（技術指標、tick、委託驗證、K 線聚合）寫成 `core/`
+  純函式並補 `tests/test_core.py`；需要 `self.after`/widget/callback 的留在
+  `stock_app_pro.py`。改 `core/`/`data/` 後必跑 `python tests/test_core.py`。
+- **出處**：ADR-009，鐵則 11。
+
+### P-28　假 mplfinance 若用空殼 `mpf.plot`，`draw_chart` 內部完全沒被測到
+- **症狀**：`draw_chart` 裡打錯方法名/參數，headless 測試卻全過，實機才爆。
+- **根因**：早期假 `mpf.plot()` 回傳 `(None, [])`，所有動 `axlist` 的程式碼
+  （`set_title`/`.text()`/`set_position`/`axvline`）從沒真正執行。
+- **正確做法**：假 mplfinance 要用**真的 matplotlib Figure + `add_axes`** 建面板
+  （見 `diag_mock_tkinter.py`），讓 `draw_chart` 對真 Axes 執行才抓得到錯。這也
+  是能重現 P-15（subplots_adjust 無效）的關鍵。
+- **出處**：ADR-017 / ADR-018。
+
+### P-29　技術指標四塊 (MACD/RSI/KDJ/DMI) 共用一個 try/except 的既有耦合
+- **症狀**：其中一個參數轉換失敗，會連帶跳過其餘幾個指標。
+- **根因**：`core/indicators.py` 重構時**刻意保留**這個重構前就有的耦合，避免重構
+  夾帶邏輯修正。
+- **正確做法**：知道這是已知行為即可。若要拆成互不影響的獨立 try/except，請**另
+  開一筆 ADR**，不要在其他重構裡順手改掉。
+- **出處**：ADR-009。
+
+### P-30　交付前的固定收尾檢查
+- **必做**：(1) `python -m py_compile stock_app_pro.py`；(2) AST 掃描（找不到定義
+  來源的 `self.xxx`、重複定義的方法）；(3) 改 `core/`/`data/` 就跑
+  `python tests/test_core.py`；(4) 動到 GUI/繪圖/下單就跑 `diag_repro_issues.py`
+  等假 tkinter 診斷；(5) GUI 深度耦合的部分無法在 headless 驗證，要明確請使用者
+  實機驗證並附上「怎麼驗」。
+- **出處**：CLAUDE.md 開工流程、歷次 ADR 的驗證段。
+
+### P-34　shioaji 刪改是對 `Trade` 物件操作,不是給 order id
+- **症狀**：想做刪單/改單,手上只有回報來的 order id,`cancel_order`/`update_order`
+  無從呼叫。
+- **根因**：shioaji 的刪改 API 簽名是 `cancel_order(trade)` / `update_order(trade,
+  price=/qty=)`,需要 `place_order` 回傳的 `Trade` 物件。
+- **正確做法**：seed 時把 trade 存進 `my_orders[id]['trade']`;暫時項目被正式
+  回報替換時要把 trade 接續過去。沒有 trade 時用 `list_trades()` 依 id 找回
+  (一次性,非輪詢);再找不到就誠實告知請於券商 App 處理,不亂送。
+- **出處**：ADR-023。
+
+### P-35　`update_order` 改量的 qty 語意 (減量 vs 新總量) 不可憑記憶硬寫
+- **症狀**：改量 10→7 結果變成 7 張被砍剩 3、或方向整個相反。
+- **根因**：qty 參數語意依文件版本描述不一,離線環境無法查證,寫錯直接改錯
+  實盤數字。
+- **正確做法**：目前實作採「qty=要減少的量」(交易所「改量即減量」慣例);
+  送出前日誌同時印「意圖 (10→7)」與「實際參數 (qty=3)」;**首次實機用最小
+  差距 (10→9) 驗證**,若方向相反只需改 `_send_order_modification` 一處。
+  驗證結果務必回寫本條與 ADR-023。
+- **出處**：ADR-023。
+
+### P-36　shioaji kbars 回傳「一分K」,長週期抓太多天會慢到不行
+- **症狀**：切台指期/指數要等數秒到十幾秒;日K以上週期特別慢。
+- **根因**：kbars 沒有日K端點,一律回一分K。台指期一天近 19 小時 ≈ 1140 根/天,
+  日K抓 730 天 ≈ 55 萬根,下載+重採樣成本巨大;且若無快取,換週期/切回商品
+  都整套重來。
+- **正確做法**：(1) `SJ_DAYS` 控制下載天數,勿隨手加大;(2) 原始分K進
+  `_kbars_raw_cache`,重採樣自快取,同商品換週期零下載;(3) 慢商品 (期貨/指數)
+  日K以上用兩段式:小範圍搶先出圖、背景補全並平移 xlim;(4) 任何發布都要過
+  `_fetch_seq` 序號防護,舊查詢不可蓋新圖;(5) 同商品換週期跳過退訂/重訂閱。
+- **出處**：ADR-024。
+
+### P-37　matplotlib 互動事件裡呼叫整圖重繪,會把整個視窗拖到滑鼠都卡
+- **症狀**：滑鼠移到K棒上十字線跟不上,且滑鼠在本軟體視窗內移動本身就變慢
+  (其他軟體正常);拖曳平移也頓。
+- **根因**：`motion_notify_event` 每移一像素觸發一次;在裡面呼叫
+  `draw_idle()` 等於高頻「整張圖重繪」(幾百根K棒×多面板,單次上百毫秒),
+  Tk 主執行緒飽和,連視窗游標渲染都被拖慢。
+- **正確做法**：hover 疊加物 (十字線/文字) 一律 `animated=True` + blitting:
+  `draw_event` 時 `copy_from_bbox` 快取乾淨底圖,滑鼠移動只
+  `restore_region + draw_artist + blit` (毫秒級),blit 失敗才降級 draw_idle;
+  所有更新 (含資訊列字串重組) 收進「換K棒才做」的 gating;真重繪類互動
+  (平移) 用時間節流 (30ms) + 放開時補最終一繪。新增任何圖表互動都遵守:
+  **motion 事件裡絕不整圖重繪**。
+- **出處**：ADR-025。
+
+### P-38　對同一個 Shioaji 物件重複 login 會陷入「重登永遠失敗」死循環
+- **症狀**：session 斷線 (常見:官網互踢) 後,不論怎麼點重新登入都出現
+  「同一帳號同時間只能有一個生效」,只有重開整個程式才能恢復。
+- **根因**：斷線後只撥 `api_logged_in=False` 旗標:客戶端物件內部狀態
+  (WebSocket/token) 已壞,券商端舊 session 又還佔著名額,對同一物件再
+  login 必被拒。
+- **正確做法**：(1) `_mark_session_dead` 時背景 best-effort `logout()` 釋放
+  券商端名額;(2) 重登一律「logout 舊物件 → `sj.Shioaji()` 建全新物件 →
+  `current_contract` 作廢 → login」;(3) 斷線判斷關鍵字只認明確字樣
+  (SessionNotEstablished 等),泛用的 "session"/"not ready"/"connection error"
+  會把暫時性錯誤誤標成斷線,引發假性登出循環。
+- **出處**：ADR-026 (P-25 的程式端完整解法)。
+
+### P-39　功能只綁「雙擊」而無可見入口 = 使用者當成功能不存在
+- **症狀**：功能明明做好了 (如委託刪改),使用者回報「看不到/沒有這功能」。
+- **根因**：唯一入口是雙擊列,介面上沒有任何按鈕或文字提示,無從發現。
+- **正確做法**：互動功能至少給一個「看得見」的入口 (按鈕/選單) + 操作提示;
+  雙擊可作為快捷,但不能是唯一入口。對話框 Entry 明確配色 (bg/fg/
+  insertbackground) 避免同色隱形 (P-33 同源),並 lift()+focus_force() 確保
+  不開在主視窗後面。
+- **出處**：ADR-027。
+
+### P-40　委託回報可能比 place_order() 回傳「更早」抵達,造成清單重複
+- **症狀**：下一筆單,清單偶爾出現兩筆一模一樣的委託。
+- **根因**：shioaji order callback 在 `place_order()` 還沒 return 時就先觸發,
+  正式項目先入清單;seed 隨後又建 `_pending_` 暫時項目 → 永久重複。
+- **正確做法**：seed 建暫時項目前,先掃清單有無「同商品/同買賣/同量、數秒內」
+  的正式項目,有就不建暫時項目直接返回。(與 P-11/P-32 的「晚到」情境互補,
+  兩個方向都要防。)
+- **出處**：ADR-027。
+
+### P-41　Treeview 的 selection_set 會發 <<TreeviewSelect>> 事件,Listbox 不會
+- **症狀**：自選股按「上移/下移」後,圖表莫名重新載入 (等於誤點了那一檔)。
+- **根因**：Listbox 的 selection_set 不發事件,Treeview 的會;把 Listbox 換成
+  Treeview 後,程式化選取 (上移/下移/重建列表) 觸發了 select handler。
+- **正確做法**：程式化選取前設抑制旗標 (`_wl_select_suppress`),handler 開頭
+  檢查;旗標用 `safe_after(50ms)` 延後解除 (事件在 idle 才派發)。任何
+  Listbox→Treeview 遷移都要檢查這個行為差異。
+- **出處**：ADR-028。
+
+### P-42　純英文代號 ≠ 美股:期貨代號需要使用者指定市場,不能用字元特徵猜
+- **症狀**：輸入 ZEF/CDF 等期貨代號被當成美股丟給 yfinance,查無資料。
+- **根因**：舊判斷「含數字=台股,其餘=美股」,只對 TXF/MXF 等少數代號硬編
+  例外,涵蓋不了全部期貨商品。
+- **正確做法**：市場模式由使用者指定 (台股/台期貨/美股 segmented 按鈕),
+  台期貨模式走 `_resolve_futures_contract` 通用解析 (`<代號>R1` 連續合約);
+  查無代號用 `_log_futures_candidates` 列出可用商品幫使用者找代號。
+  下單端的合約解析也要同步通用化 (直接用 current_contract),否則新期貨
+  能看圖不能下單。
+- **出處**：ADR-028。
+
+### P-43　訂閱期貨 R1 連續合約,推送的 tick.code 是「實際月份合約」,相等比對必失敗
+- **症狀**:台指期報價 5 秒才跳一次 (當沖等級完全不夠用),但訂閱明明成功。
+- **根因**:訂閱 TXFR1 後,shioaji 推送的 tick/bidask 的 code 是實際月份合約
+  (如 TXFG6),`tick.code == contract.code` ('TXFR1') 永遠 False → 串流全被
+  丟棄 → 永遠走 5 秒快照 fallback。極隱蔽:訂閱成功、callback 有進來,
+  只是被自己的過濾條件丟掉。
+- **正確做法**:期貨比對用「商品前綴 (前3碼)」(`_fop_code_match`),一次只訂
+  一檔期貨不會誤收;完全相等亦接受 (訂特定月份時)。若未來多檔期貨同時
+  串流,需改 per-symbol 暫存並另開 ADR。
+- **出處**:ADR-029。
+
+### P-44　tkinter 空間不足時「後 pack 的先被擠出視窗」— 關鍵資訊區要先 pack
+- **症狀**:面板加了一列新元件後,最底部的五檔報價「不見了」(標題卡在視窗邊緣)。
+- **根因**:pack 順序決定空間分配優先權;空間不足時最後 pack 的元件先被擠出。
+  五檔原本是左側面板最後 pack 的,任何讓面板長高的改動都會把它擠掉。
+- **正確做法**:關鍵必見區塊「先 pack + side=BOTTOM」(順序=優先權、side=位置,
+  兩者獨立);把可壓縮的滾動列表 (如成交明細) 留在後面當犧牲者。在左側面板
+  新增任何元件時,都要想「擠掉的會是誰」。
+- **出處**:ADR-030。
+
+### P-45　跨檔案簽名變更,主程式要能容忍附屬模組版本落後
+- **症狀**:只更新主程式、忘了同步覆蓋 core/ 模組 → TypeError → 整張K線圖
+  空白 (主功能全掛)。
+- **根因**:主程式以新關鍵字參數呼叫舊簽名的 core 函式;交付含多檔且路徑
+  不同 (主程式在根目錄、模組在 core/),使用者漏放其一機率很高。
+- **正確做法**:(1) 新參數盡量放簽名尾端給預設值 (向下相容);(2) 呼叫端
+  try/except TypeError 降級到舊簽名,主功能照常、印一次性版本提示與確切
+  覆蓋路徑;(3) 交付訊息明列「每個檔案 → 哪個資料夾」。
+- **出處**:ADR-030。
+
+### P-46　`on_app_close` 在主執行緒同步呼叫會卡死的 I/O (logout),視窗會「沒有回應」
+- **症狀**:按 X 關不掉,標題列出現 (沒有回應)。
+- **根因**:session 殭屍時 `sj_api.logout()` 永不返回,主執行緒被卡死。
+- **正確做法**:關閉流程的網路 I/O 一律「背景執行緒 + join(timeout)」;
+  逾時放行,交給 `os._exit(0)` 保底 (P-23)。任何寫在主執行緒的阻塞式
+  第三方呼叫都要問:它卡住時使用者還關得掉視窗嗎?
+- **出處**:ADR-030 (P-23 的補強)。
+
+### P-47　「含數字=台股」啟發式會誤殺期貨完整代號 (TXFR2/TXF202609 都含數字)
+- **症狀**:點自選股的 TXFR2 報「券商合約查無」,該列報價永遠 '--'。
+- **根因**:市場自動判斷與自選股報價解析把「含數字」當台股,但期貨完整
+  代號 (R2 的 2、月份 202609) 本來就含數字,被搶先誤判成股票。
+- **正確做法**:`_looks_like_futures_symbol` (3 英文字母 + R1/R2 或 6 位數字)
+  必須排在「含數字」判斷之前;同一份判斷邏輯的每個使用點 (市場切換/
+  報價解析/台股模式 fallback) 都要一起改,漏一處就會有一條路徑復發。
+  與 P-42 (純英文≠美股) 同族:代號路由一律「樣式/解析優先,字元特徵墊底」。
+- **出處**:ADR-031。
+
+### P-48　CPU 密集的第三方 SDK 呼叫即使丟到背景執行緒,仍可能靠 GIL 卡死整個 GUI
+- **症狀**:登入/查詢等操作丟給 `threading.Thread` 執行了,理論上主執行緒
+  該保持順暢,但 GUI 卻整個「沒有回應」,連視窗都關不掉。
+- **根因**:Python 的 GIL 是「整個行程共用一把鎖」,不是「每個執行緒各自
+  獨立」。如果背景執行緒在跑的是長時間 CPU 密集且不常釋放 GIL 的 C 擴充
+  呼叫 (如編譯過的交易 SDK 解析大量合約資料),GUI 主執行緒 (含 Tk 事件
+  迴圈) 一樣會被卡住排不到執行機會——這與「有沒有用 threading.Thread」
+  無關,threading 只解決「我方 Python 邏輯」之間的並發,解決不了「別人的
+  C 擴充長時間不放 GIL」。
+- **正確做法**:(1) 先確定並清除自己程式碼裡任何額外的、可驗證的卡住來源
+  (例如對從未連線過的物件呼叫 logout 造成的不必要風險);(2) 防止使用者
+  誤觸疊加第二個同類型背景工作,讓 GIL 爭用加倍;(3) 及早且持續給出「這是
+  已知現象、預期要等多久、不要強制關閉」的訊息,把「看起來當機」轉換成
+  「已知道在等什麼」;(4) 若確認是真正的 GIL 長時間不放,結構性解法是把
+  該 SDK 呼叫隔離到獨立行程 (multiprocessing),但這是大改動,值不值得做
+  取決於實機卡頓的實際時長與頻率。
+- **出處**:ADR-032。
+
+### P-49　自動交易絕不能用「未完成的K棒」評估訊號 (repaint 假訊號)
+- **症狀**:策略盤中頻繁觸發又「反悔」——同一根K棒的指標值隨即時價不斷
+  變動,交叉成立又消失,若直接拿最新一根K棒評估,會下出大量事後看根本
+  不存在訊號的單。
+- **根因**:重採樣後的最後一根K棒在該週期結束前是「進行中」狀態,
+  Close/High/Low 都還會變。
+- **正確做法**:評估一律剔除最後一根 (`df.iloc[:-1]`),只用已收盤K棒;
+  搭配「同一根K棒只評估一次」閘門 (記錄 last_bar_ts) 與「交叉條件只在
+  交叉當根為 True」,三層合起來才能杜絕重複/假訊號。代價是訊號最多晚
+  一根K棒,這是正確性換來的,不要為了「更即時」把這層拿掉。
+- **出處**:ADR-035。
+
+### P-50　多執行緒共用單一 broker 連線,併發呼叫同一 API 會互相干擾
+- **症狀**:新增背景自動更新後,切換商品時「背景補全下載失敗」、K線圖異常。
+- **根因**:手動查詢、主圖自動更新、量化 runner 三個背景執行緒共用同一條
+  shioaji 連線;同時呼叫 kbars 造成互相干擾。且自動更新可能讀到「新商品的
+  contract + 舊商品的 df」而把兩者資料合併。
+- **正確做法**:(1) 單一連線的下載 API 用一把鎖 (`_kbars_lock`) 強制串行化;
+  (2) 手動查詢設 `_fetch_in_progress` 旗標,背景自動更新偵測到就完全讓路;
+  (3) 自動更新用「df 物件身分守衛」(記下開始時的 df 參照,套用前比對是否
+  同一物件) + 序號守衛,確保絕不把 A 商品資料黏進 B 商品的圖。凡是新增
+  會碰共用連線/共用狀態的背景執行緒,都要先想清楚與既有流程的併發關係。
+- **出處**:ADR-038 (P-44 pack 擠出、ADR-024 序號守衛的延伸)。
+
+### P-51　主程式模組長期缺 import sys/json 卻沒爆,是因為之前剛好沒走到那行
+- **症狀**:新增「自訂策略子行程」功能時,`sys.executable` 報 NameError;
+  補 sys 後 `json.dumps` 又報 json 未定義。
+- **根因**:stock_app_pro.py 檔頭一直沒 import sys 與 json —— 過去 os._exit
+  路徑上實際觸發,所以潛伏很久沒被發現。新功能一用到就爆。
+- **正確做法**:(1) 檔頭 import 該檔實際用到的所有標準庫;(2) 每加一個用到
+  新標準庫的功能,先確認 import 存在;(3) 收尾的 py_compile 只能抓語法、
+  抓不到 NameError,真正跑過 (診斷案例/離線測試走到那行) 才會現形 ——
+  這也是為什麼每個新功能都要有實際執行的回歸案例,不能只靠編譯通過。
+- **出處**:ADR-040。
+
+### P-52　交叉條件的瞬時性與錯誤重置
+- **症狀**: 模擬單或實單符合出場條件（如均線死亡交叉），但系統卻沒有自動出場。介面顯示策略仍為「啟用」，且沒有被自動停用。
+- **根因**: `core/strategy_engine.py` 中的 `_close_intent` 函式定義被意外刪除或未正確縮排，導致條件成立時拋出 `NameError`。因為交叉條件（如 `ma_cross_down`）通常只有在一根 K 棒上成立，拋出異常後，下一根 K 棒條件不再成立，系統成功執行其他邏輯並將 `error_count` 重置為 0。這使得「連續 3 次錯誤停用」的安全機制失效，出場訊號被無聲吞掉。
+- **正確做法**: 修復 `_close_intent` 的定義。未來若有依賴瞬時條件（只有一根 K 棒成立）的邏輯，必須確保其內部呼叫的函式與變數皆已正確定義，否則單次的異常可能被後續的成功執行掩蓋。
+- **出處**: 模擬單未自動出場的 Bug 調查。
