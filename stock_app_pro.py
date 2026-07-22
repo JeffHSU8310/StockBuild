@@ -2769,7 +2769,7 @@ class StockTradingAppPro(tk.Tk):
     KBARS_CACHE_MAX = 6      # 快取最多保留幾檔商品的原始分K (LRU 淘汰最舊)
 
     def _download_kbars_chunked(self, contract, start_dt, end_dt, chunk_days=90, progress_cb=None,
-                                retries=2, pace_sec=0.35, subsplit_days=30):
+                                retries=2, pace_sec=0.35, subsplit_days=30, abort_cb=None):
         """
         【ADR-046/047 → ADR-048 強化】分段下載歷史K線。
 
@@ -2800,6 +2800,20 @@ class StockTradingAppPro(tk.Tk):
             segs.append((cur, seg_end))
             cur = seg_end + timedelta(days=1)
 
+        # 【ADR-068】除了登出/關閉/回測取消 (_downloads_should_abort),額外接受
+        # 呼叫端傳入的 abort_cb:主圖切商品時用它帶「本次查詢序號是否已過期」,
+        # 讓使用者切走後,舊商品剩下的分段下載立刻停手,不再霸佔 _kbars_lock
+        # 拖慢新商品的搶先出圖 (使用者連點不同標的時的卡頓主因之一)。
+        def _should_abort():
+            if self._downloads_should_abort():
+                return True
+            if abort_cb is not None:
+                try:
+                    return bool(abort_cb())
+                except Exception:
+                    return False
+            return False
+
         usage_logged = [False]
 
         def _log_usage_once():
@@ -2823,7 +2837,7 @@ class StockTradingAppPro(tk.Tk):
             last = None
             for att in range(n_retries + 1):
                 # 【ADR-060】退避等待期間使用者可能已登出/關程式,重試前再確認一次
-                if self._downloads_should_abort():
+                if _should_abort():
                     return None
                 if att > 0:
                     time.sleep(1.5 * att)  # 1.5s → 3s 退避
@@ -2850,10 +2864,11 @@ class StockTradingAppPro(tk.Tk):
             # 【ADR-060】每段開始前先問「現在還該繼續嗎」。使用者登出/關閉程式/
             # 按下強制終止之後,剩下的段一律不要再打 —— 舊版會把整批跑完才停,
             # 登出後照樣送出幾十個必定失敗的請求,日誌被 AuthError 洗版。
-            if self._downloads_should_abort():
+            # 【ADR-068】abort_cb 額外涵蓋「使用者已切到別檔」,舊查詢立即讓路。
+            if _should_abort():
                 aborted = True
                 self.safe_after(0, self.log_message,
-                                f"【分段下載】已停止 (連線已登出或使用者中止),"
+                                f"【分段下載】已停止 (連線登出/使用者中止/已切換其他標的),"
                                 f"剩餘 {len(segs) - i + 1} 段不再嘗試。")
                 break
             if i > 1 and pace_sec > 0:
@@ -3862,6 +3877,7 @@ class StockTradingAppPro(tk.Tk):
 
             if is_taiwan_instrument:
                 self.data_source = "shioaji"
+                _t0 = time.time()  # 【ADR-068】計時起點:量「點下去→出圖」實際耗時,寫進日誌方便定位慢在哪段
                 days = self.SJ_DAYS.get(tf, 180)
                 end_dt = datetime.now(); start_dt = end_dt - timedelta(days=days)
                 if self.asset_type == "future":
@@ -3892,10 +3908,19 @@ class StockTradingAppPro(tk.Tk):
                 if published_from_cache and cache_fresh:
                     return  # 快取新鮮,直接完工——這就是「換週期/切回商品秒開」的路徑
 
-                # ---- 兩段式第一段:首次載入慢商品 (期貨/指數 且 日K以上) 先抓小範圍搶先出圖 ----
+                # ---- 兩段式第一段:先抓小範圍搶先出圖 ----
+                # 【ADR-068】原本只有期貨/指數走快速段,股票沒有——但股票分K
+                # (5分K 起抓 60 天) 要等 6 段分段下載 (~15 秒) 全部跑完才第一次
+                # 出圖,使用者體感「切半天才換圖」。改成股票的「分K」也走快速段:
+                # 先抓 QUICK_DAYS 的小範圍「單次」下載搶先出圖,K 線馬上可看可 hover,
+                # 完整 60 天歷史在同一背景執行緒接著補全 (補完就地換圖,視角不動)。
+                # 股票日K以上維持原樣不加快速段:日K會做 yahoo 延伸,避免快速段+
+                # 完整段各跑一次 yahoo 網路呼叫。
                 quick_len = None
                 slow_asset = self.asset_type in ("future", "index_tw")
-                if (not published_from_cache) and slow_asset and tf in self.QUICK_DAYS:
+                min_tf = tf in ("1分K", "5分K", "15分K", "30分K", "60分K")
+                want_quick = slow_asset or (self.asset_type == "stock" and min_tf)
+                if (not published_from_cache) and want_quick and tf in self.QUICK_DAYS:
                     try:
                         q_days = self.QUICK_DAYS[tf]
                         q_start = end_dt - timedelta(days=q_days)
@@ -3905,11 +3930,20 @@ class StockTradingAppPro(tk.Tk):
                             df_quick = self._resample_sj_df(quick_raw, tf)
                             if _publish(df_quick, full_ui=True):
                                 quick_len = _pub_state['n']  # 【ADR-049】含延伸的實際發布根數
+                                self.safe_after(0, self.log_message, f"⚡ 已搶先出圖 (近 {q_days} 天,可開始看盤/hover),耗時 {time.time()-_t0:.1f} 秒;完整歷史背景補全中...")
                     except Exception as e:
                         if self._looks_like_session_dead(e):
                             self._mark_session_dead()
 
                 # ---- 完整下載 (或 stale 快取的背景刷新) ----
+                # 【ADR-068】已搶先出圖 (快取或快速段) 而使用者又切到別檔時,這一段
+                # 完整歷史 (最耗時的 6+ 段分段下載) 就不必再打了——直接讓路,把
+                # _kbars_lock 與 API 配額留給新商品,新商品才能「馬上出圖」。
+                already_shown = published_from_cache or (quick_len is not None)
+                if already_shown and seq is not None and seq != self._fetch_seq:
+                    return
+                # 這一路查詢是否已過期 (使用者切走) — 傳給分段下載,可在中途停手。
+                _abort_if_superseded = (lambda: seq is not None and seq != self._fetch_seq)
                 self.safe_after(0, self.log_message, f"⚡ 極速引擎：透過永豐金 API 抓取 {stock_name} 歷史 K 線...")
                 try:
                     # 【第二十輪修正 → ADR-046 改版】單次完整下載優先 (正常商品
@@ -3930,7 +3964,7 @@ class StockTradingAppPro(tk.Tk):
                     else:
                         is_min_tf = tf in ["1分K", "5分K", "15分K", "30分K", "60分K"]
                         if is_min_tf and (_t - _f).days > 5:
-                            raw = self._download_kbars_chunked(contract, _f, _t, chunk_days=10, subsplit_days=5)
+                            raw = self._download_kbars_chunked(contract, _f, _t, chunk_days=10, subsplit_days=5, abort_cb=_abort_if_superseded)
                         else:
                             try:
                                 raw = self._download_kbars_raw(contract, _f, _t)
@@ -3939,7 +3973,7 @@ class StockTradingAppPro(tk.Tk):
                                     raise
                                 self.safe_after(0, self.log_message,
                                                 f"【背景補全】完整範圍單次下載失敗 ({type(e1).__name__}: {str(e1)[:100]}),改分段下載補救...")
-                                raw = self._download_kbars_chunked(contract, _f, _t, chunk_days=90)
+                                raw = self._download_kbars_chunked(contract, _f, _t, chunk_days=90, abort_cb=_abort_if_superseded)
                         if raw is None or raw.empty:
                             raise RuntimeError("完整範圍與分段下載皆無資料 (合約可能剛上市或該期間無交易)")
                 except Exception as e:
@@ -3955,6 +3989,12 @@ class StockTradingAppPro(tk.Tk):
                         self._mark_session_dead()
                     raw = pd.DataFrame()
 
+                # 【ADR-068】使用者在完整下載期間切到別檔:分段下載會提早中止並回傳
+                # 部分/空資料。這是「刻意讓路」,不是失敗——安靜結束,不要記誤導的
+                # 「下載失敗/查無資料」訊息,也不要拿殘缺資料去污染快取。
+                if seq is not None and seq != self._fetch_seq:
+                    return
+
                 if raw is None or raw.empty:
                     if not (published_from_cache or quick_len):
                         self.safe_after(0, self.log_message, f"券商 API 查無 {raw_sym} 資料，請確認代碼、連線狀態，或該檔是否已完成合約下載。")
@@ -3966,9 +4006,11 @@ class StockTradingAppPro(tk.Tk):
                 df_full = self._resample_sj_df(raw, tf)
                 prev = quick_len if quick_len is not None else cached_len
                 if prev is not None:
-                    _publish(df_full, full_ui=False, prev_len=prev, note="【背景補全】完整歷史已更新。")
+                    _publish(df_full, full_ui=False, prev_len=prev,
+                             note=f"【背景補全】完整歷史已更新 (共 {len(df_full)} 根,總耗時 {time.time()-_t0:.1f} 秒)。")
                 else:
                     _publish(df_full, full_ui=True)
+                    self.safe_after(0, self.log_message, f"⚡ 完整歷史載入完成 (共 {len(df_full)} 根),耗時 {time.time()-_t0:.1f} 秒。")
                 return
             else:
                 # 美股:自動使用 yfinance
