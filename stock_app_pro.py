@@ -5975,16 +5975,19 @@ class StockTradingAppPro(tk.Tk):
         except Exception:
             return None, False
 
-    def _place_strategy_order(self, strategy, intent, contract, asset_type):
+    def _place_strategy_order(self, strategy, intent, contract, asset_type, exec_price=None):
         """
         實單下單:鏡射 execute_order 的組單參數 (股票=現股整股限價ROD,
-        期貨=限價ROD),價格=訊號K棒收盤價 ± slippage_ticks 檔 (往成交方向讓價)。
-        回傳 (ok, 說明)。
+        期貨=限價ROD),價格 ± slippage_ticks 檔 (往成交方向讓價)。回傳 (ok, 說明)。
+
+        【ADR-075 看A做B】exec_price:實際「要下單的商品 B」的成交基準價;有帶
+        就用它 (看A做B),否則沿用 intent['price'] (一般模式 = 訊號商品自己的價)。
+        contract/asset_type 一律是 B (執行商品),tick/讓價都以 B 計。
         """
         try:
             sym = str(strategy.get('symbol', '')).upper()
             qty = int(intent['qty'])
-            base_px = float(intent['price'])
+            base_px = float(exec_price) if exec_price is not None else float(intent['price'])
             ticks = int(strategy.get('slippage_ticks', 2) or 0)
             tick = tick_rules.get_tick(base_px, asset_type, sym)
             px = base_px + ticks * tick if intent['action'] == '買進' else base_px - ticks * tick
@@ -6110,25 +6113,25 @@ class StockTradingAppPro(tk.Tk):
                                                 cache_sym=w_sym, cache_market=w_mkt)
                 if df is None or df.empty:
                     continue  # 沒資料不算錯誤 (可能休市)
-                # 執行價 = B 的最新已收盤價 (看A做B 時 A≠B;一般模式 exec_close=None,
-                # evaluate_strategy 直接用 A=B 自己的收盤,行為不變)。
-                exec_close = None
+                # 【ADR-075】看A做B:訊號/指標/停損停利全部看 A (df 就是 A);
+                # 「做B」只發生在下單/記帳那一層。b_exec_price = B 的最新已收盤價,
+                # 當實際成交價;非看A做B (A=B) 時 b_exec_price=None,用 A 自己的價。
+                b_exec_price = None
                 if strategy_engine.watch_enabled(s):
                     b_df = self._qt_fetch_closed_bars(s, contract, asset_type)
                     if b_df is None or b_df.empty:
                         continue  # B 沒有可用價格,先不動作 (可能 B 剛好無資料)
-                    exec_close = float(b_df['Close'].iloc[-1])
+                    b_exec_price = float(b_df['Close'].iloc[-1])
                 if s.get('kind') == 'custom':
                     # 【ADR-040】自訂策略:在子行程執行 on_bar (逾時保護),
                     # 取決策後轉成與內建同格式的 intent → 下游 risk_check/下單完全同路。
-                    # on_bar 看 A 的 df;下單價用 B 的 exec_close (看A做B) 或 A 自己。
+                    # on_bar 看 A 的 df;intent 價用 A 收盤 (停損停利以 A 判定),下單另換 B。
                     decision = self._run_custom_in_subprocess(s, df, rt.get('state', 'FLAT'), runtime=rt)
                     # 【ADR-053】反手支援:改用 decision_to_intents,持多遇 SELL 會
                     # 產生 [平多, 反手開空] 兩個 intent,各自照常過 risk_check 與下單。
-                    px_for_intent = exec_close if exec_close is not None else float(df['Close'].iloc[-1])
-                    intents = custom_strategy.decision_to_intents(decision, s, rt, px_for_intent, str(df.index[-1]))
+                    intents = custom_strategy.decision_to_intents(decision, s, rt, float(df['Close'].iloc[-1]), str(df.index[-1]))
                 else:
-                    intents = strategy_engine.evaluate_strategy(s, rt, df, now_ts, today_str, exec_close=exec_close)
+                    intents = strategy_engine.evaluate_strategy(s, rt, df, now_ts, today_str)
                 # 【ADR-065】條件函式拋例外時 eval_conditions 只讓那一條算 False,
                 # 不會中斷整組評估,但也不能完全無聲無息——否則「進場/出場條件
                 # 到了卻沒有動作」時,使用者連錯誤訊息都看不到。
@@ -6147,13 +6150,19 @@ class StockTradingAppPro(tk.Tk):
                     self.safe_after(0, self.log_message,
                                     f"【自動交易-時間窗跳過】策略「{s.get('name')}」: {detail}")
                 for intent in intents:
-                    label = f"策略「{s.get('name')}」{intent['action']} {intent['qty']} {s.get('symbol')} @ {intent['price']:g}"
+                    # 【ADR-075】實際成交價 = B 的最新價 (看A做B);否則 = A 自己的 intent 價。
+                    # intent['price'] (A 的價) 仍保留給 strategy_engine.apply_fill 當
+                    # entry_price → 停損停利以 A 判定;下單/記帳一律用 exec_px (B)。
+                    exec_px = b_exec_price if b_exec_price is not None else float(intent['price'])
+                    _watch_tag = (f" [看{strategy_engine.watch_symbol_of(s)}訊號→做{s.get('symbol')}@{exec_px:g}]"
+                                  if strategy_engine.watch_enabled(s) else "")
+                    label = f"策略「{s.get('name')}」{intent['action']} {intent['qty']} {s.get('symbol')} @ {exec_px:g}{_watch_tag}"
                     ok, reason = strategy_engine.risk_check(s, rt, intent, now_ts)
                     if not ok:
                         self.safe_after(0, self.log_message, f"【自動交易-風控擋單】{label} — {reason}")
                         continue
                     if s.get('mode') == '實單' and self._qt_running:
-                        sent, msg = self._place_strategy_order(s, intent, contract, asset_type)
+                        sent, msg = self._place_strategy_order(s, intent, contract, asset_type, exec_price=exec_px)
                         if sent:
                             strategy_engine.apply_fill(s, rt, intent, now_ts)
                             changed = True
@@ -6168,9 +6177,9 @@ class StockTradingAppPro(tk.Tk):
                             rec = paper_account.apply_fill(
                                 self.paper_acct, datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                                 s.get('market', '台股'), s.get('symbol', ''),
-                                intent['action'], intent['kind'], intent['qty'], intent['price'],
+                                intent['action'], intent['kind'], intent['qty'], exec_px,
                                 trade_type=strategy_engine.trade_type_of(s))
-                            paper_account.mark_price(self.paper_acct, s.get('symbol', ''), intent['price'])
+                            paper_account.mark_price(self.paper_acct, s.get('symbol', ''), exec_px)
                             self._qt_save_paper()
                             pnl_txt = f",此筆已實現 {_fmt_amt_signed(rec['pnl'])}" if intent['kind'] == 'CLOSE' else ""
                             eq = paper_account.equity(self.paper_acct)
@@ -7815,8 +7824,25 @@ class StockTradingAppPro(tk.Tk):
             df = df[(df.index >= pd.Timestamp(start_dt)) & (df.index <= pd.Timestamp(end_dt) + pd.Timedelta(days=1))]
             if df is None or len(df) < 30:
                 status_cb(f"✗ 此期間資料量不足 ({0 if df is None else len(df)} 根)。", "#FF5252"); return
+            # 【ADR-075】看A做B:參數最佳化掃的是「條件參數」,而條件是看 A 的,
+            # 所以要在 A (訊號來源) 的歷史上掃,才會找到對的訊號參數。掃描用的絕對
+            # 損益是「看A做A」近似 (最佳化只需要相對排名),真實看A做B損益請用回測確認。
+            opt_asset = asset_type
+            if strategy_engine.watch_enabled(s):
+                w_contract, w_asset, w_sym, w_mkt = self._qt_resolve_watch(s)
+                if w_contract is None:
+                    status_cb(f"✗ 看A商品解析失敗: {strategy_engine.watch_symbol_of(s)}", "#FF5252"); return
+                w_tf = strategy_engine.watch_timeframe_of(s)
+                a_df = self._qt_bt_load_df(w_contract, w_asset, w_sym, w_mkt, w_tf,
+                                           start_dt, end_dt, session_basis=session_basis, tag="最佳化-看A")
+                if a_df is None or len(a_df) < 30:
+                    status_cb(f"✗ 看A ({w_sym}/{w_tf}) 歷史資料不足,無法最佳化。", "#FF5252"); return
+                df = a_df; opt_asset = w_asset
+                self.safe_after(0, self.log_message,
+                                "【最佳化-看A做B】參數掃描在『看A』訊號商品上進行 (找對的訊號參數);"
+                                "掃描顯示的絕對損益為看A做A近似,真實看A做B損益請用「🔬 回測」確認。")
             try:
-                tick = tick_rules.get_tick(float(df['Close'].iloc[-1]), asset_type, str(s.get('symbol')).upper())
+                tick = tick_rules.get_tick(float(df['Close'].iloc[-1]), opt_asset, str(s.get('symbol')).upper())
             except Exception:
                 tick = None
             slip = int(s.get('slippage_ticks', 2) or 0)
@@ -8365,6 +8391,49 @@ class StockTradingAppPro(tk.Tk):
         tk.Button(btns, text="取消", bg="#2A323D", fg="white", relief="flat",
                   font=('微軟正黑體', 10), padx=16, pady=4, command=dlg.destroy).pack(side=tk.LEFT, padx=6)
 
+    def _qt_bt_load_df(self, contract, asset_type, symbol, market, tf, start_dt, end_dt,
+                       session_basis='all', tag="回測", log=True):
+        """【ADR-075】回測用:下載(快取)+重採樣+期交所/yahoo 延伸+範圍裁切,回傳 df。
+        抽出來讓「看A做B」能分別載入 A (訊號) 與 B (成交) 兩個商品的歷史。"""
+        tf_is_day = tf in ("日K", "周K", "月K")
+        chunk = 365 if tf_is_day else 90
+        bt_key = (f"BT|{market}|{str(symbol).upper()}|{tf}|"
+                  f"{'day' if tf_is_day else 'min'}|{start_dt:%Y%m%d}|{end_dt:%Y%m%d}|{session_basis}")
+        raw = self._bt_download_cache_get(bt_key)
+        if raw is None:
+            def _prog(done, total, s0, s1, n_rows):
+                if log and (done == 1 or done == total or done % 2 == 0):
+                    self.safe_after(0, self.log_message,
+                                    f"【{tag}下載-{symbol}】進度 {done}/{total} 段 ({s0:%Y-%m-%d}~{s1:%Y-%m-%d},{n_rows} 根)...")
+            dl_from, dl_to, note = self._taifex_plan_download(
+                contract, asset_type, tf, start_dt, end_dt, session=session_basis, tag=tag)
+            if note and log:
+                self.safe_after(0, self.log_message, f"【{tag}下載-{symbol}】{note}")
+            if dl_from is None:
+                raw = pd.DataFrame()
+            else:
+                raw = self._download_kbars_chunked(contract, dl_from, dl_to, chunk_days=chunk, progress_cb=_prog)
+                if raw is not None and not raw.empty:
+                    self._bt_download_cache_put(bt_key, raw)
+        df = (self._resample_sj_df(raw, tf, asset_type=asset_type, session_basis=session_basis)
+              if (raw is not None and not raw.empty) else pd.DataFrame())
+        if asset_type == "future" and tf_is_day:
+            df = self._extend_with_taifex(df, tf, contract=contract, session=session_basis)
+        elif asset_type == "stock" and tf_is_day:
+            df = self._extend_with_yahoo(df, tf, sym=symbol)
+            try:
+                from data import dividend_store
+                dividend_store.adjust_dataframe(df, str(symbol))
+            except Exception:
+                pass
+        if df is None or df.empty:
+            return pd.DataFrame()
+        try:
+            df = df[(df.index >= pd.Timestamp(start_dt)) & (df.index <= pd.Timestamp(end_dt) + pd.Timedelta(days=1))]
+        except Exception:
+            pass
+        return df
+
     def _qt_backtest_worker(self, s, start_dt=None, end_dt=None, session_basis='all'):
         try:
             contract, asset_type = self._qt_resolve(s)
@@ -8464,13 +8533,34 @@ class StockTradingAppPro(tk.Tk):
             except Exception:
                 tick = None
             slip = int(s.get('slippage_ticks', 2) or 0)
+            # 【ADR-075 看A做B 回測】訊號看 A、成交看 B。上面載好的 df 是策略自身
+            # (B,執行商品);啟用看A做B 時,另外載入 A (訊號來源) 的歷史當 signal_df,
+            # 把 B 當 exec_df 傳進去。tick/滑價一律用 B (實際成交商品)。
+            signal_df, exec_df = df, None
+            if strategy_engine.watch_enabled(s):
+                w_contract, w_asset, w_sym, w_mkt = self._qt_resolve_watch(s)
+                if w_contract is None:
+                    self.safe_after(0, self.log_message, f"【回測】看A商品解析失敗: {strategy_engine.watch_symbol_of(s)}")
+                    return
+                w_tf = strategy_engine.watch_timeframe_of(s)
+                a_df = self._qt_bt_load_df(w_contract, w_asset, w_sym, w_mkt, w_tf,
+                                           start_dt, end_dt, session_basis=session_basis, tag="回測-看A")
+                if a_df is None or len(a_df) < 30:
+                    self.safe_after(0, self.log_message,
+                                    f"【回測】看A ({w_sym}/{w_tf}) 歷史資料不足 ({0 if a_df is None else len(a_df)} 根),無法回測看A做B。")
+                    return
+                signal_df, exec_df = a_df, df
+                self.safe_after(0, self.log_message,
+                                f"【回測-看A做B】訊號看 {w_sym}/{w_tf} ({len(a_df)} 根),成交做 {s.get('symbol')}/{tf} ({len(df)} 根)。")
             # 【ADR-050】套用真實成本模型 (手續費 + 交易稅);fee_rate 已停用。
-            result = backtest.run_backtest(s, df, slippage_ticks=slip, tick_size=tick,
+            result = backtest.run_backtest(s, signal_df, slippage_ticks=slip, tick_size=tick,
                                            cost_params=self._cost_params(), apply_cost_model=True,
-                                           should_stop=lambda: getattr(self, '_backtest_cancel', False) or self._closing)
+                                           should_stop=lambda: getattr(self, '_backtest_cancel', False) or self._closing,
+                                           exec_df=exec_df)
             if getattr(self, '_backtest_cancel', False):
                 self.safe_after(0, self.log_message, "【回測】已依使用者要求中止,不產生報告。")
                 return
+            # 報告的 K 線圖用「成交商品 B」(df) 顯示,標點才落在實際交易的商品上。
             self.safe_after(0, self._qt_show_backtest_report, s, df, result)
             m = result['metrics']
             self.safe_after(0, self.log_message,

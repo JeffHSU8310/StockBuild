@@ -498,28 +498,25 @@ class TestStrategyEngine(unittest.TestCase):
         s_bad2['watch_symbol'] = '^TWII'; s_bad2['watch_timeframe'] = '3分K'
         self.assertFalse(strategy_engine.validate_strategy(s_bad2)[0])
 
-    def test_exec_close_prices_orders_on_B(self):
-        # 【ADR-074】看A訊號、做B價格:進場價與停損損益都應以 B 的 exec_close 計。
+    def test_evaluate_all_on_A_sl_tp_on_A(self):
+        # 【ADR-075】看A做B (修正語意):訊號/停損停利全部看 A;intent 價 = A 的收盤,
+        # entry_price = A 的價 → 停損停利以 A 判定。B 的成交價由 app 層在下單時替換。
         import time as _t
         s = self._base_strategy()
         rt = strategy_engine.new_runtime()
         df = self._cross_df(up=True)  # A 的訊號 K 棒 (最後一根黃金交叉)
         a_close = float(df['Close'].iloc[-1])
-        b_price = 250.0  # B 的最新收盤,與 A 完全不同
-        intents = strategy_engine.evaluate_strategy(s, rt, df, _t.time(), '2026-07-16', exec_close=b_price)
+        intents = strategy_engine.evaluate_strategy(s, rt, df, _t.time(), '2026-07-16')
         self.assertEqual(len(intents), 1)
         self.assertEqual(intents[0]['kind'], 'OPEN')
-        # 下單價 = B 的價格,不是 A 的
-        self.assertEqual(intents[0]['price'], b_price)
-        self.assertNotEqual(intents[0]['price'], a_close)
+        self.assertEqual(intents[0]['price'], a_close)  # 引擎只認 A 的價
         strategy_engine.apply_fill(s, rt, intents[0], _t.time())
-        self.assertEqual(rt['entry_price'], b_price)
-        # 停損以 B 的價格計:B 跌 2% 觸發停損 (即使 A 的 df 收盤沒動)
-        sl = strategy_engine.evaluate_strategy(s, rt, self._mkdf(list(df['Close']) + [a_close + 1]),
-                                               _t.time(), '2026-07-16', exec_close=b_price * 0.97)
+        self.assertEqual(rt['entry_price'], a_close)
+        # 停損以 A 的價格計:A 跌 2% 觸發停損
+        sl = strategy_engine.evaluate_strategy(s, rt, self._mkdf(list(df['Close']) + [a_close * 0.97]),
+                                               _t.time(), '2026-07-16')
         self.assertEqual(len(sl), 1)
         self.assertIn('停損', sl[0]['reason'])
-        self.assertEqual(sl[0]['price'], b_price * 0.97)
 
     def test_state_machine_entry_sl_tp(self):
         import time as _t
@@ -729,6 +726,28 @@ class TestBacktest(unittest.TestCase):
             self.assertIn(k, r['trades'][0])
         self.assertTrue(any(m['kind'] == 'buy_open' for m in r['markers']))
         self.assertTrue(any(m['kind'] == 'sell_close' for m in r['markers']))
+
+    def test_backtest_watch_ab_exec_df(self):
+        # 【ADR-075】看A做B 回測:A 決定進出場時機,成交價來自 B。
+        closes = [100 - i for i in range(20)] + [80 + i * 3 for i in range(10)] + [107 - i * 2 for i in range(10)]
+        a_df = self._mkdf(closes)              # A:訊號來源
+        b_df = self._mkdf([c * 10 for c in closes])  # B:價格是 A 的 10 倍 (同時間戳)
+        s = self._long_strategy()
+        r_plain = backtest.run_backtest(s, a_df)                 # 看A做A
+        r_watch = backtest.run_backtest(s, a_df, exec_df=b_df)   # 看A做B
+        self.assertEqual(r_watch['metrics']['trades'], r_plain['metrics']['trades'])  # 交易「筆數/時機」相同
+        # 成交價來自 B (約 A 的 10 倍),故第一筆進場價明顯不同、且損益放大約 10 倍
+        self.assertAlmostEqual(r_watch['trades'][0]['entry_price'],
+                               r_plain['trades'][0]['entry_price'] * 10, delta=1e-6)
+        self.assertGreater(abs(r_watch['trades'][0]['pnl']), abs(r_plain['trades'][0]['pnl']))
+
+    def test_backtest_exec_df_none_equals_plain(self):
+        # exec_df=None 與不帶 exec_df 結果一致 (向下相容)。
+        closes = [100 - i for i in range(20)] + [80 + i * 3 for i in range(10)] + [107 - i * 2 for i in range(10)]
+        df = self._mkdf(closes)
+        a = backtest.run_backtest(self._long_strategy(), df)['metrics']['total_pnl']
+        b = backtest.run_backtest(self._long_strategy(), df, exec_df=None)['metrics']['total_pnl']
+        self.assertEqual(a, b)
 
     def test_backtest_equals_live_logic(self):
         # 回測第一個進場點必須等於引擎判定的金叉點「之後下一根」(證明同一套邏輯)。

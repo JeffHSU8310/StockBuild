@@ -690,7 +690,7 @@ def eval_conditions(df, conds, logic='AND', errors=None):
     return any(r for _, r in results), results
 
 
-def evaluate_strategy(strategy, runtime, df_closed, now_ts, today_str, exec_close=None):
+def evaluate_strategy(strategy, runtime, df_closed, now_ts, today_str):
     """
     策略主評估:傳入「只含已收盤K棒」的 df。
     回傳 intents list,每個 intent:
@@ -699,12 +699,12 @@ def evaluate_strategy(strategy, runtime, df_closed, now_ts, today_str, exec_clos
     這裡只產生「意圖」,不下單;呼叫端要先過 risk_check 再執行,
     成交後呼叫 apply_fill 更新狀態。
 
-    【ADR-074 看A做B】exec_close:實際「要下單的商品 (B)」的最新收盤價。
-    df_closed 是「訊號來源 (A)」的 K 棒 —— 進出場條件、指標一律看 A;但下單
-    價格、停損/停利的損益計算都是針對「持有的 B」,所以只要把價格基準 close
-    換成 B 的 exec_close 即可 (函式內所有 close 的用途都是『被交易商品的價格』,
-    條件判斷讀的是 df_closed 而非這個純量)。exec_close 為 None 時 = 看A做A
-    (一般模式),close 就是 A 自己的收盤,行為完全不變。
+    【ADR-075 看A做B (修正語意)】本函式一律「看 A」:進出場條件、指標、
+    **停損/停利** 全部以傳入的 df_closed (訊號來源 A) 計算,intent['price']
+    也是 A 的收盤價 (成為 runtime['entry_price'],讓停損停利以 A 的價格判斷)。
+    「做 B」只發生在下單/記帳那一層:呼叫端把實際成交價換成 B 的價格 (見
+    stock_app_pro._quant_eval_pass / _place_strategy_order)。這樣「停損停利
+    條件看 A、下單看 B」就成立,引擎本身完全不需要知道 B 的存在。
     """
     if df_closed is None or len(df_closed) < 3:
         return []
@@ -720,8 +720,7 @@ def evaluate_strategy(strategy, runtime, df_closed, now_ts, today_str, exec_clos
         return []
     runtime['last_bar_ts'] = bar_ts
 
-    # 【ADR-074】價格基準:看A做B 時用 B 的收盤價當下單價與損益基準;否則用 A 自己。
-    close = float(df_closed['Close'].iloc[-1]) if exec_close is None else float(exec_close)
+    close = float(df_closed['Close'].iloc[-1])
     state = runtime.get('state', 'FLAT')
     intents = []
     # 【ADR-065】條件評估拋例外時 eval_conditions 只讓那一條變 False,不中斷

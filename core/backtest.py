@@ -24,9 +24,16 @@ from . import strategy_engine
 
 def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
                  cost_params=None, apply_cost_model=True, should_stop=None,
-                 settle_open_at_end=True):
+                 settle_open_at_end=True, exec_df=None):
     """
     對單一策略在歷史 df 上回測。
+
+    【ADR-075 看A做B 回測】exec_df:實際「要下單的商品 B」的歷史 K 棒。傳入時:
+      * 訊號、指標、停損/停利 一律看 df (訊號來源 A);
+      * 成交價 (進出場、損益、資金曲線浮動) 一律看 exec_df (B),依時間戳對齊
+        (A 第 i 根的時間 → B 中「>= 該時間」的第一根開盤價成交,同 T+1 模型)。
+      * A 與 B 週期可不同 (如 A 30分K、B 5分K),用 searchsorted 對齊。
+    exec_df=None (預設) → B=A,行為與舊版完全一致 (對齊會取到同一根)。
 
     參數:
       strategy: 策略 dict (與實盤同結構;direction/entry/exit_signals/stop_loss_pct...)
@@ -49,6 +56,23 @@ def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
     """
     if df is None or len(df) < 3:
         return _empty_result()
+
+    # 【ADR-075】看A做B:df=A(訊號), exec_df=B(成交)。未帶就 B=A。
+    _use_watch = exec_df is not None and len(exec_df) > 0
+    _bdf = exec_df if _use_watch else df
+
+    def _exec_at(ts):
+        """回傳對齊到 A 時間 ts 的 B (open, close)。B 中第一根 index>=ts 的那根;
+        超出範圍就取最後一根收盤 (退而求其次,避免無價可成交)。"""
+        try:
+            pos = _bdf.index.searchsorted(ts, side='left')
+            if pos >= len(_bdf):
+                last = float(_bdf['Close'].iloc[-1])
+                return last, last
+            return float(_bdf['Open'].iloc[pos]), float(_bdf['Close'].iloc[pos])
+        except Exception:
+            a = float(df['Open'].iloc[-1]) if len(df) else 0.0
+            return a, a
 
     s = copy.deepcopy(strategy)
     qty = int(s.get('qty', 1) or 1)
@@ -139,13 +163,16 @@ def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
             intents = strategy_engine.evaluate_strategy(s, rt, eval_window, now_ts_eval, today_eval)
             
         # 【ADR-064】強制將所有訊號的預期成交價改為「隔天(今日)開盤價」
+        # 【ADR-075】intent['price'] 用 A 的開盤 (→ apply_fill 的 entry_price,
+        # 停損停利以 A 判定);實際成交價另取 B 對齊到同一時間的開盤 (exec_open)。
         open_px = float(df['Open'].iloc[i])
         for intent in intents:
             intent['price'] = open_px
-            
+        exec_open, exec_close_px = _exec_at(ts) if _use_watch else (open_px, float(df['Close'].iloc[i]))
+
         for intent in intents:
             action = intent['action']
-            fill = _fill_price(intent['price'], action)
+            fill = _fill_price(exec_open, action)  # 【ADR-075】成交在 B 的開盤價
             if intent['kind'] == 'OPEN':
                 strategy_engine.apply_fill(s, rt, intent, now_ts)
                 # 【ADR-053 重大修正】方向必須取自「實際開倉動作」,不能讀
@@ -211,8 +238,9 @@ def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
                                 'kind': 'buy_close' if action == '買進' else 'sell_close'})
                 open_trade = None
         # 記錄權益曲線:已實現 + 目前未平倉浮動損益
+        # 【ADR-075】看A做B 時浮動損益用 B 的收盤 (持有的是 B)。
         floating = 0.0
-        cur_px = float(df['Close'].iloc[i])
+        cur_px = exec_close_px if _use_watch else float(df['Close'].iloc[i])
         if is_bnh:
             # 【ADR-061】累積持有:浮動損益要把「所有已買進的 lot」逐筆算進去,
             # 否則資金曲線只反映最後一筆,長期累積的部位完全看不出來。
@@ -242,7 +270,7 @@ def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
     settled_open = 0
     if settle_open_at_end and is_bnh and bnh_lots and len(df) > 0:
         last_ts = df.index[-1]
-        last_px = float(df['Close'].iloc[-1])
+        last_px = float(_bdf['Close'].iloc[-1])  # 【ADR-075】看A做B 期末以 B 的最後收盤結算
         for lot in bnh_lots:
             lot_qty = int(lot['qty'])
             mult = 1.0 if lot['direction'] == '做多' else -1.0
@@ -278,7 +306,7 @@ def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
 
     if settle_open_at_end and open_trade is not None and len(df) > 0:
         last_ts = df.index[-1]
-        last_px = float(df['Close'].iloc[-1])
+        last_px = float(_bdf['Close'].iloc[-1])  # 【ADR-075】看A做B 期末以 B 的最後收盤結算
         mult = 1.0 if open_trade['direction'] == '做多' else -1.0
         entry_px = open_trade['entry_price']
         gross = (last_px - entry_px) * mult * qty * contract_size
