@@ -200,6 +200,10 @@ class StockTradingAppPro(tk.Tk):
         
         # 串流資料執行緒鎖 (shioaji callback 與 UI worker 分屬不同執行緒)
         self.quote_lock = threading.Lock()
+        # 【切換加速】報價退訂/訂閱的 shioaji 網路呼叫改丟背景執行緒,不再擋住
+        # K 線出圖 (使用者點自選股要「馬上換圖」)。此鎖確保快速連點時多路
+        # 退訂/訂閱不會互相交錯,維持「退舊 → 訂新」的先後順序。
+        self.subscribe_lock = threading.Lock()
         # 盤後備援快照節流 (避免每 0.5 秒狂打 snapshots 吃光每日 API 流量配額)
         self.last_fallback_snap_time = 0
         self.odd_no_stream_warned = False
@@ -3595,6 +3599,52 @@ class StockTradingAppPro(tk.Tk):
         except Exception as e:
             self.log_message(f"【搜尋】載入失敗: {type(e).__name__}: {e}")
 
+    def _resubscribe_quotes_worker(self, prev_contract, contract, asset_type):
+        """【切換加速】退訂舊合約 + 訂閱新合約的 shioaji 網路呼叫,獨立於
+        K 線出圖在背景執行,讓「點自選股 → 主圖馬上換」不用等訂閱來回。
+
+        用 self.subscribe_lock 序列化,確保快速連點時不會多路訂閱交錯
+        (退舊 → 訂新 的先後順序要維持)。每一路訂閱各自 try/except 並記錄
+        成功/失敗 (鐵則 8),不可包成一個大 try 讓失敗無聲無息。
+        """
+        with self.subscribe_lock:
+            try:
+                if prev_contract is not None:
+                    for odd_flag in [True, False]:
+                        try: self.sj_api.quote.unsubscribe(prev_contract, quote_type=sj.constant.QuoteType.Tick, intraday_odd=odd_flag)
+                        except: pass
+                        try: self.sj_api.quote.unsubscribe(prev_contract, quote_type=sj.constant.QuoteType.BidAsk, intraday_odd=odd_flag)
+                        except: pass
+
+                # 【切換加速】快速連點時,若在排隊等鎖期間使用者已經切到別檔
+                # (current_contract 已不是我們這一路要訂的合約),就別再花配額訂
+                # 這個過期合約——退訂已做完,下一路 worker 會接手訂新的。
+                if getattr(self, 'current_contract', None) is not contract:
+                    return
+
+                def _sub(qtype, odd, label):
+                    try:
+                        try:
+                            self.sj_api.quote.subscribe(contract, quote_type=qtype, version=sj.constant.QuoteVersion.v1, intraday_odd=odd)
+                        except TypeError:
+                            # 舊版簽名不吃 version 關鍵字時的相容退路
+                            self.sj_api.quote.subscribe(contract, quote_type=qtype, intraday_odd=odd)
+                        return True
+                    except Exception as sub_e:
+                        self.safe_after(0, self.log_message, f"【訂閱失敗】{label}: {sub_e}")
+                        return False
+
+                ok_t = _sub(sj.constant.QuoteType.Tick, False, "整股Tick")
+                ok_b = _sub(sj.constant.QuoteType.BidAsk, False, "整股五檔")
+                if asset_type == "stock":
+                    ok_ot = _sub(sj.constant.QuoteType.Tick, True, "零股Tick")
+                    ok_ob = _sub(sj.constant.QuoteType.BidAsk, True, "零股五檔")
+                    self.safe_after(0, self.log_message, f"【訂閱結果】整股Tick:{'✓' if ok_t else '✗'} 整股五檔:{'✓' if ok_b else '✗'} 零股Tick:{'✓' if ok_ot else '✗'} 零股五檔:{'✓' if ok_ob else '✗'}")
+                else:
+                    self.safe_after(0, self.log_message, f"【訂閱結果】Tick:{'✓' if ok_t else '✗'} 五檔:{'✓' if ok_b else '✗'}")
+            except Exception as e:
+                self.safe_after(0, self.log_message, f"訂閱報價串流異常: {e}")
+
     def fetch_data_worker(self, raw_sym, tf, seq=None, market="台股"):
         """
         【ADR-011】資料源政策改版:
@@ -3669,19 +3719,17 @@ class StockTradingAppPro(tk.Tk):
 
                 # 【ADR-024】同商品換週期不需要退訂/重訂閱報價,也不清成交明細——
                 # 沿用既有串流,換週期立即有報價,不會白等重新訂閱。
-                prev_code = getattr(getattr(self, 'current_contract', None), 'code', None)
+                prev_contract = getattr(self, 'current_contract', None)
+                prev_code = getattr(prev_contract, 'code', None)
                 new_code = getattr(contract, 'code', None)
                 contract_changed = (prev_code is None) or (prev_code != new_code)
                 if not contract_changed:
                     self.safe_after(0, self.log_message, "【快速切換】同商品換週期,沿用既有報價訂閱。")
                 try:
-                    if contract_changed and getattr(self, 'current_contract', None):
-                        for odd_flag in [True, False]:
-                            try: self.sj_api.quote.unsubscribe(self.current_contract, quote_type=sj.constant.QuoteType.Tick, intraday_odd=odd_flag)
-                            except: pass
-                            try: self.sj_api.quote.unsubscribe(self.current_contract, quote_type=sj.constant.QuoteType.BidAsk, intraday_odd=odd_flag)
-                            except: pass
-
+                    # 【切換加速】換商品時,先「同步」把畫面/狀態需要的東西更新掉
+                    # (這些都是純記憶體操作,很快),再把真正慢的 shioaji 退訂/訂閱
+                    # 網路呼叫丟到背景執行緒。這樣主 worker 可以立刻往下走去讀快取
+                    # 出圖,K 線圖點一下就換,不用再等 4 路訂閱來回。
                     if contract_changed:
                         with self.quote_lock:
                             self.current_contract = contract
@@ -3694,10 +3742,9 @@ class StockTradingAppPro(tk.Tk):
                             self.trade_feed_odd.clear()
                         self.odd_no_stream_warned = False
 
-                    # 【ADR-024】以下 (現沖/參考價/訂閱) 只在換商品時需要;同商品換週期全部跳過。
-                    if contract_changed:
                         # 【ADR-008】擷取現沖狀態 (day_trade) 與參考價 (reference,即昨收/平盤價)。
                         # 這兩個值分別用來畫「現沖/禁現沖」badge,以及成交明細跳動列表的漲跌計算基準。
+                        # (讀的是合約物件上既有屬性,非網路呼叫,留在此同步做。)
                         try:
                             self.current_day_trade = (str(getattr(contract, 'day_trade', '')) in ('Yes', 'DayTrade.Yes', 'DayTrade.Yes: Yes') or getattr(getattr(contract, 'day_trade', None), 'value', '') == 'Yes')
                         except Exception:
@@ -3711,28 +3758,15 @@ class StockTradingAppPro(tk.Tk):
                         self.safe_after(0, lambda: self.daytrade_var.set(bool(self.current_day_trade)))
                         self.safe_after(0, self.update_daytrade_badge)
 
-                        def _sub(qtype, odd, label):
-                            try:
-                                try:
-                                    self.sj_api.quote.subscribe(contract, quote_type=qtype, version=sj.constant.QuoteVersion.v1, intraday_odd=odd)
-                                except TypeError:
-                                    # 舊版簽名不吃 version 關鍵字時的相容退路
-                                    self.sj_api.quote.subscribe(contract, quote_type=qtype, intraday_odd=odd)
-                                return True
-                            except Exception as sub_e:
-                                self.safe_after(0, self.log_message, f"【訂閱失敗】{label}: {sub_e}")
-                                return False
-
-                        ok_t = _sub(sj.constant.QuoteType.Tick, False, "整股Tick")
-                        ok_b = _sub(sj.constant.QuoteType.BidAsk, False, "整股五檔")
-                        if self.asset_type == "stock":
-                            ok_ot = _sub(sj.constant.QuoteType.Tick, True, "零股Tick")
-                            ok_ob = _sub(sj.constant.QuoteType.BidAsk, True, "零股五檔")
-                            self.safe_after(0, self.log_message, f"【訂閱結果】整股Tick:{'✓' if ok_t else '✗'} 整股五檔:{'✓' if ok_b else '✗'} 零股Tick:{'✓' if ok_ot else '✗'} 零股五檔:{'✓' if ok_ob else '✗'}")
-                        else:
-                            self.safe_after(0, self.log_message, f"【訂閱結果】Tick:{'✓' if ok_t else '✗'} 五檔:{'✓' if ok_b else '✗'}")
+                        # 【切換加速】退訂舊合約 + 訂閱新合約 (共 2~4 路 shioaji 網路呼叫)
+                        # 移到背景執行緒,不擋 K 線出圖。asset_type 先在此定住傳進去,
+                        # 避免背景執行緒讀到之後又被別檔覆蓋的值。
+                        threading.Thread(
+                            target=self._resubscribe_quotes_worker,
+                            args=(prev_contract, contract, self.asset_type),
+                            daemon=True).start()
                 except Exception as e:
-                    self.safe_after(0, self.log_message, f"訂閱報價串流異常: {e}")
+                    self.safe_after(0, self.log_message, f"報價訂閱排程異常: {e}")
             else:
                 # 美股:自動使用 yfinance,shioaji 本來就不支援美股。
                 self.asset_type = "us_stock"
