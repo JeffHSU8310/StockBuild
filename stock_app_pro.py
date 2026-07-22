@@ -3238,6 +3238,12 @@ class StockTradingAppPro(tk.Tk):
         sj_df = sj_df.copy()
         if asset_type == "index_tw" and 'Amount' in sj_df.columns:
             sj_df['Volume'] = sj_df['Amount'] / 100000000
+        
+        # 濾除異常價格 (例如 0),避免 K 線圖 Y 軸範圍被拉大導致看起像一條死魚線
+        for col in ['Close', 'Low', 'High', 'Open']:
+            if col in sj_df.columns:
+                sj_df = sj_df[sj_df[col] > 0]
+
         resample_map = {"1分K": '1min', "5分K": '5min', "15分K": '15min', "30分K": '30min',
                         "60分K": '60min', "日K": 'D', "周K": 'W-MON', "月K": 'MS'}
         rule = resample_map.get(tf)
@@ -4099,28 +4105,22 @@ class StockTradingAppPro(tk.Tk):
             #   使用者看到的視窗不會跳動。
             _pub_state = {'n': None}  # 上次實際發布的K棒根數
 
-            # 【ADR-080】ADR-079 讓主圖完全不延伸歷史 (只顯示 SJ_DAYS 原生範圍),
-            # 換來切換/縮放/平移都變快,但代價是長週期指標 (如 MA240) 在日K上幾乎
-            # 顯示不出來、周K/月K 的原生範圍也偏薄。使用者決策:只在「需要深歷史」
-            # 的情境才延伸,且裁到約 3 年 (不是 20 年全灌),在速度與覆蓋率之間
-            # 折衷:
-            #   - 週期是周K/月K:一律延伸 (使用者原話「週K/月K週期時再抓資料」)。
-            #   - 日K 但有開 MA240:也延伸 (ma240_on 由 UI 執行緒讀 tk 變數後傳入,
-            #     見 start_fetch_thread)。
-            #   - 其餘情況 (日K 未開 MA240):維持 ADR-079 的快速路徑,完全不延伸。
-            # 只在「快取命中」與「背景完整段」套用 (這兩條路可能是唯一一次出圖);
-            # 「快速段」(搶先出圖用) 一律不延伸,維持秒開,深歷史由背景補上。
+            # 【ADR-080】max_days 已經限制在 3 年,速度非常快。
+            # 絕對不能略過期交所資料的拼接,因為 _taifex_plan_download 已經把券商下載
+            # 範圍縮減到最近幾天了 (依靠期交所補足);若略過拼接,圖上會只剩下 3 根 K 棒！
             EXT_MAX_DAYS = 1095  # 約 3 年
-            want_deep = tf in ("周K", "月K") or bool(ma240_on)
 
             def _publish(pub_df, full_ui=True, prev_len=None, note="", allow_extend=False):
                 if seq is not None and seq != self._fetch_seq:
                     return False  # 已有更新的查詢,放棄發布
-                if allow_extend and want_deep:
+                if allow_extend:
                     if self.asset_type == "future" and tf in ("日K", "周K", "月K"):
                         pub_df = self._extend_with_taifex(pub_df, tf, max_days=EXT_MAX_DAYS)
                     elif self.asset_type == "stock" and tf in ("日K", "周K", "月K"):
-                        pub_df = self._extend_with_yahoo(pub_df, tf, sym=search_sym, max_days=EXT_MAX_DAYS)
+                        # 台股的 Yahoo 延伸比較慢，維持原本的 want_deep 邏輯 (只有大週期或 MA240 才抓)
+                        want_deep = tf in ("周K", "月K") or bool(ma240_on)
+                        if want_deep:
+                            pub_df = self._extend_with_yahoo(pub_df, tf, sym=search_sym, max_days=EXT_MAX_DAYS)
                 pub_df = pub_df.dropna(subset=['Open', 'High', 'Low', 'Close'])
                 if pub_df.empty:
                     return False
@@ -6409,7 +6409,7 @@ class StockTradingAppPro(tk.Tk):
             _time.sleep(2)
 
     # ---------- 策略編輯器 ----------
-    def _qt_open_custom_editor(self, strategy):
+    def _qt_open_custom_editor(self, strategy, readonly=False):
         """【ADR-040】自訂 Python 策略編輯器:基本參數 + 程式碼區 + 安全警語。"""
         is_new = strategy is None
         if is_new:
@@ -6420,7 +6420,8 @@ class StockTradingAppPro(tk.Tk):
         else:
             s = json.loads(json.dumps(strategy))
         dlg = tk.Toplevel(self)
-        dlg.title("自訂 Python 策略" + ("" if is_new else f" — {s.get('name')}"))
+        title_suffix = " (唯讀 - 策略執行中)" if readonly else ""
+        dlg.title("自訂 Python 策略" + ("" if is_new else f" — {s.get('name')}{title_suffix}"))
         dlg.configure(bg="#1A2026")
         self.center_window(dlg, 760, 700)
         dlg.transient(self)
