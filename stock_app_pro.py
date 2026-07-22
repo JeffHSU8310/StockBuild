@@ -4414,6 +4414,15 @@ class StockTradingAppPro(tk.Tk):
     def draw_chart(self, raw_df):
         try:
             df = self.calculate_custom_indicators(raw_df)
+            for i in range(6):
+                col = f"MA_CUSTOM_{i}"
+                if col in df.columns:
+                    trend_col = f"{col}_TREND"
+                    diff = df[col].diff()
+                    df[trend_col] = '→'
+                    df.loc[diff > 0, trend_col] = '↗'
+                    df.loc[diff < 0, trend_col] = '↘'
+                    df.loc[df[col].isna() | diff.isna(), trend_col] = ''
             self.full_calculated_df = df
             txt_fmt_char = self.timeframe_var.get()
             # 【ADR-082 繪圖效能極速化】限制畫布一次渲染的 K 棒數量上限:
@@ -4594,9 +4603,11 @@ class StockTradingAppPro(tk.Tk):
                     obj = axlist[0].text(main_x, 0.97, '', transform=axlist[0].transAxes, color=c_hex, **main_text_props)
 
                     def _mk_ma_fmt(col=col, label_prefix=label_prefix):
+                        trend_col = f"{col}_TREND"
                         def _fmt(row):
                             if col in row and not np.isnan(row[col]):
-                                return f"{label_prefix}: {row[col]:.2f}"
+                                trend = row.get(trend_col, '')
+                                return f"{label_prefix}: {row[col]:.2f} {trend}".strip()
                             return None
                         return _fmt
                     self.txt_main_segments.append({'obj': obj, 'fmt': _mk_ma_fmt()})
@@ -7050,7 +7061,7 @@ class StockTradingAppPro(tk.Tk):
         title_suffix = " (唯讀 - 策略執行中)" if readonly else ""
         dlg.title("新增策略" if is_new else f"編輯策略 — {s.get('name')}{title_suffix}")
         dlg.configure(bg="#1A2026")
-        self.center_window(dlg, 720, 620)
+        self.center_window(dlg, 800, 700)
         dlg.transient(self)
         try:
             dlg.lift(); dlg.focus_force()
