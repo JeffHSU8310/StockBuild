@@ -438,6 +438,15 @@ def new_strategy():
         # 進入盤中才評估下單 (無需人工開啟);futures_session 決定期貨要不要含夜盤。
         'session_gate': True,         # True=非交易時間不動作 (建議);False=只看K棒邊界不看時段
         'futures_session': 'day_night',  # 'day'=只做日盤 08:45-13:45;'day_night'=含夜盤 15:00-次日05:00
+        # 【ADR-074 看A做B】訊號來源 (A) 與執行商品 (B) 分離。watch_enabled=False 時
+        # A=B (看自己做自己,一般模式)。A 可為指數 (加權/櫃買/台指期等,各項商品皆可);
+        # B 為上面的 symbol/trade_type,不可為加權/櫃買指數 (指數不能下單)。
+        # 週期也分離:條件看 watch_timeframe (A);下單價/邊界節奏依 A 的訊號 K 棒,
+        # 執行價取 B 的最新收盤 (B 的 timeframe)。
+        'watch_enabled': False,
+        'watch_symbol': '',           # A 的商品代碼 (空=沿用 symbol)
+        'watch_trade_type': '指數',    # A 的種類:股票 / 期貨 / 指數
+        'watch_timeframe': '30分K',    # A 的訊號週期
 
         # 【ADR-059】買進後持有不賣 (Buy & Hold):當作比較基準用,只能回測/模擬。
         # 勾選後 validate_strategy 不再要求「至少一種出場方式」。
@@ -512,6 +521,48 @@ def _dca_period_key(ts, interval):
 
 def is_futures(strategy):
     return trade_type_of(strategy) == '期貨'
+
+
+# 【ADR-074 看A做B】A (訊號來源) 可選的種類:比交易種類多一個「指數」。
+WATCH_TRADE_TYPES = ('股票', '期貨', '指數')
+
+
+def looks_like_index_symbol(sym):
+    """代碼看起來像不像指數 (加權/櫃買等)。^ 開頭 (^TWII/^TWOII) 或常見指數代號。"""
+    s = str(sym or '').strip().upper()
+    if not s:
+        return False
+    if s.startswith('^'):
+        return True
+    return s in ('TWII', 'TWOII', 'TSE001', 'OTC101', 'OTC001', 'TSE', 'OTC')
+
+
+def watch_enabled(strategy):
+    """是否啟用「看A做B」。未啟用時 A=B (看自己做自己)。"""
+    return bool(strategy.get('watch_enabled'))
+
+
+def watch_symbol_of(strategy):
+    """A (訊號來源) 的代碼;啟用看A做B 但沒填就退回 symbol。"""
+    if not watch_enabled(strategy):
+        return str(strategy.get('symbol', '')).strip().upper()
+    w = str(strategy.get('watch_symbol', '')).strip().upper()
+    return w or str(strategy.get('symbol', '')).strip().upper()
+
+
+def watch_trade_type_of(strategy):
+    """A 的種類 (股票/期貨/指數);未啟用看A做B 就等於執行種類。"""
+    if not watch_enabled(strategy):
+        return trade_type_of(strategy)
+    tt = strategy.get('watch_trade_type')
+    return tt if tt in WATCH_TRADE_TYPES else '指數'
+
+
+def watch_timeframe_of(strategy):
+    """A 的訊號週期;未啟用或沒填就等於執行週期。"""
+    if not watch_enabled(strategy):
+        return strategy.get('timeframe', '5分K')
+    return strategy.get('watch_timeframe') or strategy.get('timeframe', '5分K')
 
 def new_runtime():
     return {
@@ -592,6 +643,17 @@ def validate_strategy(s):
     if not has_exit:
         return False, ("至少要有一種出場方式 (出場訊號 / 停損 / 停利),否則持倉永遠不會出場。"
                        "若你就是要「買進後持有不賣」來當比較基準,請勾選該選項。")
+    # 【ADR-074 看A做B】驗證:B (執行商品) 不可為指數 (加權/櫃買不能下單);
+    # A (訊號來源) 可為任何商品含指數。啟用看A做B 時 A 的代碼/週期要合法。
+    if looks_like_index_symbol(s.get('symbol', '')):
+        return False, "執行商品 (做B) 不可為指數 (加權/櫃買等)。指數只能當『看A』的訊號來源,不能下單。"
+    if watch_enabled(s):
+        if not str(watch_symbol_of(s)).strip():
+            return False, "已啟用「看A做B」,但『看A』的商品代碼不可空白"
+        if watch_trade_type_of(s) not in WATCH_TRADE_TYPES:
+            return False, f"『看A』的種類僅支援 {'/'.join(WATCH_TRADE_TYPES)}"
+        if watch_timeframe_of(s) not in VALID_TIMEFRAMES:
+            return False, f"『看A』的週期僅支援 {'/'.join(VALID_TIMEFRAMES)}"
     return True, ""
 
 
@@ -628,7 +690,7 @@ def eval_conditions(df, conds, logic='AND', errors=None):
     return any(r for _, r in results), results
 
 
-def evaluate_strategy(strategy, runtime, df_closed, now_ts, today_str):
+def evaluate_strategy(strategy, runtime, df_closed, now_ts, today_str, exec_close=None):
     """
     策略主評估:傳入「只含已收盤K棒」的 df。
     回傳 intents list,每個 intent:
@@ -636,6 +698,13 @@ def evaluate_strategy(strategy, runtime, df_closed, now_ts, today_str):
        'price': float(該根收盤價), 'reason': str}
     這裡只產生「意圖」,不下單;呼叫端要先過 risk_check 再執行,
     成交後呼叫 apply_fill 更新狀態。
+
+    【ADR-074 看A做B】exec_close:實際「要下單的商品 (B)」的最新收盤價。
+    df_closed 是「訊號來源 (A)」的 K 棒 —— 進出場條件、指標一律看 A;但下單
+    價格、停損/停利的損益計算都是針對「持有的 B」,所以只要把價格基準 close
+    換成 B 的 exec_close 即可 (函式內所有 close 的用途都是『被交易商品的價格』,
+    條件判斷讀的是 df_closed 而非這個純量)。exec_close 為 None 時 = 看A做A
+    (一般模式),close 就是 A 自己的收盤,行為完全不變。
     """
     if df_closed is None or len(df_closed) < 3:
         return []
@@ -644,13 +713,15 @@ def evaluate_strategy(strategy, runtime, df_closed, now_ts, today_str):
         runtime['day'] = today_str
         runtime['trades_today'] = 0
         runtime['realized_pnl_today'] = 0.0
-    # 同一根K棒只評估一次 (杜絕重複訊號/重複下單的第一道閘門)
+    # 同一根K棒只評估一次 (杜絕重複訊號/重複下單的第一道閘門)。用 A 的 K 棒時間,
+    # 一根 A 訊號 K 棒只評估一次。
     bar_ts = str(df_closed.index[-1])
     if bar_ts == runtime.get('last_bar_ts'):
         return []
     runtime['last_bar_ts'] = bar_ts
 
-    close = float(df_closed['Close'].iloc[-1])
+    # 【ADR-074】價格基準:看A做B 時用 B 的收盤價當下單價與損益基準;否則用 A 自己。
+    close = float(df_closed['Close'].iloc[-1]) if exec_close is None else float(exec_close)
     state = runtime.get('state', 'FLAT')
     intents = []
     # 【ADR-065】條件評估拋例外時 eval_conditions 只讓那一條變 False,不中斷

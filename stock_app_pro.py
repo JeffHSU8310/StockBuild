@@ -5889,7 +5889,7 @@ class StockTradingAppPro(tk.Tk):
 
     # ---------- Runner:背景評估與下單 ----------
     def _qt_resolve(self, strategy):
-        """解析策略商品合約。回傳 (contract, asset_type) 或 (None, None)。"""
+        """解析策略「執行商品 (B)」合約。回傳 (contract, asset_type) 或 (None, None)。"""
         sym = str(strategy.get('symbol', '')).upper()
         try:
             if strategy.get('market') == '台期貨':
@@ -5900,16 +5900,46 @@ class StockTradingAppPro(tk.Tk):
         except Exception:
             return (None, None)
 
-    def _qt_fetch_closed_bars(self, strategy, contract, asset_type):
+    def _qt_resolve_watch(self, strategy):
+        """【ADR-074 看A做B】解析「訊號來源 (A)」合約。A 可為股票/期貨/指數
+        (加權/櫃買)。回傳 (contract, asset_type, sym, market_tag)。未啟用看A做B
+        時就等於執行商品 B。"""
+        if not strategy_engine.watch_enabled(strategy):
+            c, at = self._qt_resolve(strategy)
+            return c, at, str(strategy.get('symbol', '')).upper(), str(strategy.get('market', '台股'))
+        sym = strategy_engine.watch_symbol_of(strategy)
+        wtt = strategy_engine.watch_trade_type_of(strategy)
+        try:
+            if wtt == '指數' or strategy_engine.looks_like_index_symbol(sym):
+                s = sym.upper()
+                if s in ('^TWOII', 'TWOII', 'OTC101', 'OTC001', 'OTC'):
+                    c = getattr(self.sj_api.Contracts.Indexs.OTC, 'OTC101', None) or getattr(self.sj_api.Contracts.Indexs.OTC, 'OTC001', None)
+                else:  # 預設加權
+                    c = self.sj_api.Contracts.Indexs.TSE.TSE001
+                return (c, 'index_tw', sym, '台股') if c is not None else (None, None, sym, '台股')
+            if wtt == '期貨':
+                c = self._resolve_futures_contract(sym)
+                return (c, 'future', sym, '台期貨') if c is not None else (None, None, sym, '台期貨')
+            c = self.sj_api.Contracts.Stocks.get(sym)
+            return (c, 'stock', sym, '台股') if c is not None else (None, None, sym, '台股')
+        except Exception:
+            return (None, None, sym, '台股')
+
+    def _qt_fetch_closed_bars(self, strategy, contract, asset_type, tf=None, cache_sym=None, cache_market=None):
         """
         取策略用的「已收盤」K棒:下載(或快取)原始分K → 依週期重採樣 →
         剔除最後一根 (可能未完成)。回傳 df (可能為空)。
+
+        【ADR-074】tf / cache_sym / cache_market 可覆寫,用來抓「訊號來源 A」的
+        K棒 (A 的週期、A 的代碼);不帶時就抓策略本身 (執行商品 B) 的設定。
         """
-        tf = strategy.get('timeframe', '5分K')
+        tf = tf or strategy.get('timeframe', '5分K')
         days = self.QT_TF_DAYS.get(tf, 7)
         end_dt = datetime.now()
         start_dt = end_dt - timedelta(days=days)
-        key = f"QT|{strategy.get('market')}|{str(strategy.get('symbol')).upper()}"
+        _sym = (cache_sym or str(strategy.get('symbol'))).upper()
+        _mkt = cache_market or strategy.get('market')
+        key = f"QT|{_mkt}|{_sym}|{tf}"
         raw, fresh = self._kbars_cache_get(key, start_dt)
         if raw is None or not fresh:
             raw = self._download_kbars_raw(contract, start_dt, end_dt)
@@ -6047,8 +6077,9 @@ class StockTradingAppPro(tk.Tk):
                 else:
                     self._qt_note_session_open(s, tt, include_night)
             # 【ADR-041】邊界感知:只有該策略週期的K棒剛收盤才評估 (測試/手動觸發不受限)
+            # 【ADR-074】看A做B 時,訊號來自 A,節奏依 A 的週期 (watch_timeframe)。
             if not _forced:
-                tf_mins = {'1分K': 1, '5分K': 5, '15分K': 15, '30分K': 30, '60分K': 60}.get(s.get('timeframe'))
+                tf_mins = {'1分K': 1, '5分K': 5, '15分K': 15, '30分K': 30, '60分K': 60}.get(strategy_engine.watch_timeframe_of(s))
                 now_dt = datetime.now()
                 if tf_mins:
                     boundary = now_dt.replace(second=0, microsecond=0)
@@ -6066,21 +6097,38 @@ class StockTradingAppPro(tk.Tk):
                     continue
                 self._qt_last_boundary[s['id']] = boundary_key
             try:
+                # 【ADR-074 看A做B】B (執行商品):下單、損益都用它;A (訊號來源):
+                # 條件/指標看它 (可為指數;看A做B 關閉時 A=B)。
                 contract, asset_type = self._qt_resolve(s)
                 if contract is None:
-                    raise RuntimeError(f"合約解析失敗: {s.get('symbol')}")
-                df = self._qt_fetch_closed_bars(s, contract, asset_type)
+                    raise RuntimeError(f"執行商品(做B)合約解析失敗: {s.get('symbol')}")
+                w_contract, w_asset, w_sym, w_mkt = self._qt_resolve_watch(s)
+                if w_contract is None:
+                    raise RuntimeError(f"訊號來源(看A)合約解析失敗: {strategy_engine.watch_symbol_of(s)}")
+                w_tf = strategy_engine.watch_timeframe_of(s)
+                df = self._qt_fetch_closed_bars(s, w_contract, w_asset, tf=w_tf,
+                                                cache_sym=w_sym, cache_market=w_mkt)
                 if df is None or df.empty:
                     continue  # 沒資料不算錯誤 (可能休市)
+                # 執行價 = B 的最新已收盤價 (看A做B 時 A≠B;一般模式 exec_close=None,
+                # evaluate_strategy 直接用 A=B 自己的收盤,行為不變)。
+                exec_close = None
+                if strategy_engine.watch_enabled(s):
+                    b_df = self._qt_fetch_closed_bars(s, contract, asset_type)
+                    if b_df is None or b_df.empty:
+                        continue  # B 沒有可用價格,先不動作 (可能 B 剛好無資料)
+                    exec_close = float(b_df['Close'].iloc[-1])
                 if s.get('kind') == 'custom':
                     # 【ADR-040】自訂策略:在子行程執行 on_bar (逾時保護),
                     # 取決策後轉成與內建同格式的 intent → 下游 risk_check/下單完全同路。
+                    # on_bar 看 A 的 df;下單價用 B 的 exec_close (看A做B) 或 A 自己。
                     decision = self._run_custom_in_subprocess(s, df, rt.get('state', 'FLAT'), runtime=rt)
                     # 【ADR-053】反手支援:改用 decision_to_intents,持多遇 SELL 會
                     # 產生 [平多, 反手開空] 兩個 intent,各自照常過 risk_check 與下單。
-                    intents = custom_strategy.decision_to_intents(decision, s, rt, float(df['Close'].iloc[-1]), str(df.index[-1]))
+                    px_for_intent = exec_close if exec_close is not None else float(df['Close'].iloc[-1])
+                    intents = custom_strategy.decision_to_intents(decision, s, rt, px_for_intent, str(df.index[-1]))
                 else:
-                    intents = strategy_engine.evaluate_strategy(s, rt, df, now_ts, today_str)
+                    intents = strategy_engine.evaluate_strategy(s, rt, df, now_ts, today_str, exec_close=exec_close)
                 # 【ADR-065】條件函式拋例外時 eval_conditions 只讓那一條算 False,
                 # 不會中斷整組評估,但也不能完全無聲無息——否則「進場/出場條件
                 # 到了卻沒有動作」時,使用者連錯誤訊息都看不到。
@@ -6332,6 +6380,8 @@ class StockTradingAppPro(tk.Tk):
         _lbl(top, '特定進場時間').grid(row=6, column=0, sticky='w', pady=(6, 0))
         e_sp_en = _ent(top, s.get('specific_entry_time', ''), 8); e_sp_en.grid(row=6, column=1, padx=4, pady=(6, 0))
         tk.Label(top, text="(格式: HH:MM 或 HH:MM:SS)", bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8)).grid(row=6, column=2, columnspan=2, sticky='w', pady=(6, 0))
+        # 【ADR-074】自訂 Python 策略也能看A做B:on_bar 看 A 的 K 棒,下單到 B。
+        watch_ui = self._qt_build_watch_panel(dlg, s)
 
         def _open_param_editor():
             """【ADR-055】參數編輯視窗:用表格增刪改參數,不必手打逗號字串,
@@ -6437,6 +6487,7 @@ class StockTradingAppPro(tk.Tk):
             s['mode'] = cb_mode.get()
             s['custom_params'] = _parse_params()
             s['source_code'] = txt.get('1.0', 'end-1c')
+            s.update(watch_ui['get']())  # 【ADR-074】看A做B 設定
             # 自訂策略的進出場由程式碼決定,填佔位讓內建 validate 的欄位檢查通過
             s['entry'] = s.get('entry') or [{'type': 'ma_cross_up', 'params': {}}]
             s['exit_signals'] = s.get('exit_signals') or []
@@ -6449,6 +6500,14 @@ class StockTradingAppPro(tk.Tk):
                 return False, "商品代碼不可空白"
             if strat['qty'] <= 0:
                 return False, "數量必須為正整數"
+            # 【ADR-074】B (執行商品) 不可為指數;看A做B 時 A 的代碼/週期要合法。
+            if strategy_engine.looks_like_index_symbol(strat.get('symbol', '')):
+                return False, "執行商品 (做B) 不可為指數 (加權/櫃買等,不能下單)。指數只能當『看A』。"
+            if strategy_engine.watch_enabled(strat):
+                if not str(strategy_engine.watch_symbol_of(strat)).strip():
+                    return False, "已啟用「看A做B」,但『看A』的商品代碼不可空白"
+                if strategy_engine.watch_timeframe_of(strat) not in strategy_engine.VALID_TIMEFRAMES:
+                    return False, "『看A』的週期不合法"
             # 【ADR-045】改用 AST 靜態檢查 (core/custom_strategy.validate_source),
             # 絕不在主行程 exec 使用者程式碼:舊版 exec 檢查 (1) 與「策略在獨立
             # 子行程執行」的安全承諾矛盾,頂層 while True 會凍死 GUI;(2) 使用者
@@ -6794,6 +6853,61 @@ class StockTradingAppPro(tk.Tk):
             self.safe_after(0, self.log_message, f"【自訂策略-試跑】❌ 執行失敗: {e}")
             _notify(f"❌ 執行失敗: {e}", False)
 
+    def _qt_build_watch_panel(self, parent, s):
+        """【ADR-074】建立「看A做B」設定面板 (內建/自訂策略編輯器共用)。
+        回傳 {'get': callable} —— 呼叫 get() 拿到 {watch_enabled/watch_symbol/
+        watch_trade_type/watch_timeframe} 併進策略。"""
+        wf = tk.Frame(parent, bg="#12181F"); wf.pack(fill=tk.X, padx=12, pady=(8, 0))
+        var_watch = tk.BooleanVar(value=bool(s.get('watch_enabled', False)))
+        row0 = tk.Frame(wf, bg="#12181F"); row0.pack(fill=tk.X, pady=(4, 0))
+        tk.Checkbutton(row0, text="👁 看A做B (用另一個商品的訊號來下單這一檔)", variable=var_watch,
+                       bg="#12181F", fg="#29B6F6", selectcolor="#2A323D", activebackground="#12181F",
+                       font=('微軟正黑體', 9, 'bold')).pack(side=tk.LEFT)
+        tk.Label(row0, text="上方『商品代碼』= 做B (實際下單);指數(加權/櫃買)不能做B,只能當看A。",
+                 bg="#12181F", fg="#8A99AD", font=('微軟正黑體', 8)).pack(side=tk.LEFT, padx=(8, 0))
+        rowA = tk.Frame(wf, bg="#12181F"); rowA.pack(fill=tk.X, pady=(2, 4))
+        tk.Label(rowA, text="　看A 商品代碼", bg="#12181F", fg="white", font=('微軟正黑體', 9)).pack(side=tk.LEFT)
+        e_wsym = tk.Entry(rowA, width=12, bg="#2A323D", fg="white", justify="center")
+        e_wsym.insert(0, s.get('watch_symbol', '')); e_wsym.pack(side=tk.LEFT, padx=4)
+        tk.Label(rowA, text="種類", bg="#12181F", fg="white", font=('微軟正黑體', 9)).pack(side=tk.LEFT, padx=(8, 0))
+        cb_wtt = ttk.Combobox(rowA, values=list(strategy_engine.WATCH_TRADE_TYPES), width=6,
+                              state='readonly', style="BlackText.TCombobox")
+        cb_wtt.set(s.get('watch_trade_type', '指數')); cb_wtt.pack(side=tk.LEFT, padx=4)
+        tk.Label(rowA, text="看A週期", bg="#12181F", fg="white", font=('微軟正黑體', 9)).pack(side=tk.LEFT, padx=(8, 0))
+        cb_wtf = ttk.Combobox(rowA, values=list(strategy_engine.VALID_TIMEFRAMES), width=6,
+                              state='readonly', style="BlackText.TCombobox")
+        cb_wtf.set(s.get('watch_timeframe', '30分K')); cb_wtf.pack(side=tk.LEFT, padx=4)
+        tk.Label(rowA, text="(訊號/指標看A這個週期;下單價與停損停利用做B的最新價)",
+                 bg="#12181F", fg="#8A99AD", font=('微軟正黑體', 8)).pack(side=tk.LEFT, padx=(8, 0))
+        lbl_wname = tk.Label(wf, text="", bg="#12181F", fg="#00E676", font=('微軟正黑體', 8))
+        lbl_wname.pack(anchor='w', padx=4, pady=(0, 4))
+        def _wlook(*_a):
+            if not var_watch.get():
+                lbl_wname.config(text=""); return
+            wsym = e_wsym.get().strip()
+            if cb_wtt.get() == '指數':
+                lbl_wname.config(text=(f"✓ 看A(指數):{wsym}" if wsym
+                                       else "請填看A的指數代碼 (加權^TWII / 櫃買^TWOII)"),
+                                 fg="#00E676" if wsym else "#FF5252")
+                return
+            nm, ok = self._resolve_strategy_symbol_name(cb_wtt.get(), wsym)
+            if ok:
+                lbl_wname.config(text=f"✓ 看A:{nm}", fg="#00E676")
+            elif wsym:
+                lbl_wname.config(text="✗ 看A 查無此代碼 (需先登入;種類要選對)", fg="#FF5252")
+            else:
+                lbl_wname.config(text="")
+        e_wsym.bind('<KeyRelease>', _wlook); e_wsym.bind('<FocusOut>', _wlook)
+        cb_wtt.bind('<<ComboboxSelected>>', _wlook)
+        var_watch.trace_add('write', lambda *_a: _wlook())
+        _wlook()
+        return {'get': lambda: {
+            'watch_enabled': bool(var_watch.get()),
+            'watch_symbol': e_wsym.get().strip().upper(),
+            'watch_trade_type': cb_wtt.get(),
+            'watch_timeframe': cb_wtf.get(),
+        }}
+
     def _qt_open_editor(self, strategy):
         """新增/編輯策略對話框:基本參數 + 條件建構器 (進場AND / 出場OR)。"""
         is_new = strategy is None
@@ -6955,6 +7069,9 @@ class StockTradingAppPro(tk.Tk):
         _lbl(top, "模式").grid(row=3, column=4, sticky='w', padx=(10, 0), pady=(6, 0))
         cb_mode = ttk.Combobox(top, values=['模擬', '實單'], width=7, state='readonly', style="BlackText.TCombobox")
         cb_mode.set(s.get('mode', '模擬')); cb_mode.grid(row=3, column=5, padx=4, pady=(6, 0))
+
+        # --- 【ADR-074】看A做B ---
+        watch_ui = self._qt_build_watch_panel(dlg, s)
 
         # --- 條件建構器 ---
         conds_frame = tk.Frame(dlg, bg="#1A2026"); conds_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(8, 0))
@@ -7189,6 +7306,8 @@ class StockTradingAppPro(tk.Tk):
             # 【ADR-070】交易時段閘門設定
             s['futures_session'] = 'day' if cb_fut_sess.get() == '只做日盤' else 'day_night'
             s['session_gate'] = bool(var_sess_gate.get())
+            # 【ADR-074】看A做B 設定
+            s.update(watch_ui['get']())
             try: s['cooldown_sec'] = float(e_cool.get().strip())
             except (TypeError, ValueError): s['cooldown_sec'] = 300
             s['mode'] = cb_mode.get()

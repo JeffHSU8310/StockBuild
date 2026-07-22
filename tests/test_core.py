@@ -470,6 +470,57 @@ class TestStrategyEngine(unittest.TestCase):
         s5 = dict(s); s5['entry'] = []
         self.assertFalse(strategy_engine.validate_strategy(s5)[0])
 
+    def test_watch_ab_helpers_and_validation(self):
+        # 【ADR-074】指數判斷
+        self.assertTrue(strategy_engine.looks_like_index_symbol('^TWII'))
+        self.assertTrue(strategy_engine.looks_like_index_symbol('TWOII'))
+        self.assertFalse(strategy_engine.looks_like_index_symbol('2330'))
+        self.assertFalse(strategy_engine.looks_like_index_symbol('TXF'))
+        # 未啟用看A做B:A=B
+        s = self._base_strategy()
+        self.assertFalse(strategy_engine.watch_enabled(s))
+        self.assertEqual(strategy_engine.watch_symbol_of(s), '2330')
+        self.assertEqual(strategy_engine.watch_timeframe_of(s), s['timeframe'])
+        # 啟用看A做B:看加權(^TWII)的30分K,做2330的5分K
+        s.update({'watch_enabled': True, 'watch_symbol': '^TWII',
+                  'watch_trade_type': '指數', 'watch_timeframe': '30分K', 'timeframe': '5分K'})
+        self.assertEqual(strategy_engine.watch_symbol_of(s), '^TWII')
+        self.assertEqual(strategy_engine.watch_trade_type_of(s), '指數')
+        self.assertEqual(strategy_engine.watch_timeframe_of(s), '30分K')
+        self.assertTrue(strategy_engine.validate_strategy(s)[0])
+        # B 不可為指數
+        s_bad = self._base_strategy(); s_bad['symbol'] = '^TWII'
+        self.assertFalse(strategy_engine.validate_strategy(s_bad)[0])
+        # 啟用看A做B 但 A 代碼空白 → 擋下
+        s_bad2 = self._base_strategy()
+        s_bad2.update({'watch_enabled': True, 'watch_symbol': '', 'watch_trade_type': '指數'})
+        # watch_symbol 空會退回 symbol(2330),仍算合法;明確測「A 週期非法」
+        s_bad2['watch_symbol'] = '^TWII'; s_bad2['watch_timeframe'] = '3分K'
+        self.assertFalse(strategy_engine.validate_strategy(s_bad2)[0])
+
+    def test_exec_close_prices_orders_on_B(self):
+        # 【ADR-074】看A訊號、做B價格:進場價與停損損益都應以 B 的 exec_close 計。
+        import time as _t
+        s = self._base_strategy()
+        rt = strategy_engine.new_runtime()
+        df = self._cross_df(up=True)  # A 的訊號 K 棒 (最後一根黃金交叉)
+        a_close = float(df['Close'].iloc[-1])
+        b_price = 250.0  # B 的最新收盤,與 A 完全不同
+        intents = strategy_engine.evaluate_strategy(s, rt, df, _t.time(), '2026-07-16', exec_close=b_price)
+        self.assertEqual(len(intents), 1)
+        self.assertEqual(intents[0]['kind'], 'OPEN')
+        # 下單價 = B 的價格,不是 A 的
+        self.assertEqual(intents[0]['price'], b_price)
+        self.assertNotEqual(intents[0]['price'], a_close)
+        strategy_engine.apply_fill(s, rt, intents[0], _t.time())
+        self.assertEqual(rt['entry_price'], b_price)
+        # 停損以 B 的價格計:B 跌 2% 觸發停損 (即使 A 的 df 收盤沒動)
+        sl = strategy_engine.evaluate_strategy(s, rt, self._mkdf(list(df['Close']) + [a_close + 1]),
+                                               _t.time(), '2026-07-16', exec_close=b_price * 0.97)
+        self.assertEqual(len(sl), 1)
+        self.assertIn('停損', sl[0]['reason'])
+        self.assertEqual(sl[0]['price'], b_price * 0.97)
+
     def test_state_machine_entry_sl_tp(self):
         import time as _t
         s = self._base_strategy(); rt = strategy_engine.new_runtime()
