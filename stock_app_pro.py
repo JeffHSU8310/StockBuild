@@ -2882,7 +2882,14 @@ class StockTradingAppPro(tk.Tk):
             self.odd_no_stream_warned = False
             self.last_fallback_snap_time = 0
         market = self.market_mode.get()  # 在 UI 執行緒讀取 tk 變數,傳給 worker
-        threading.Thread(target=self.fetch_data_worker, args=(raw_sym, tf, seq, market), daemon=True).start()
+        # 【ADR-080】MA240 是否開啟也要在 UI 執行緒讀 tk 變數 (self.ma_shows/
+        # self.ma_periods),傳給 worker 決定主圖要不要延伸深歷史 (見 _publish)。
+        try:
+            ma240_on = any(self.ma_shows[i].get() and str(self.ma_periods[i].get()).strip() == '240'
+                          for i in range(len(self.ma_shows)))
+        except Exception:
+            ma240_on = False
+        threading.Thread(target=self.fetch_data_worker, args=(raw_sym, tf, seq, market, ma240_on), daemon=True).start()
 
     def trigger_redraw(self):
         if self.current_df is not None and self.axlist is not None:
@@ -3376,17 +3383,23 @@ class StockTradingAppPro(tk.Tk):
             self.safe_after(0, self.log_message, f"【{tag}下載】期交所涵蓋判斷失敗,改為全段下載: {e}")
             return start_dt, end_dt, ""
 
-    def _extend_with_yahoo(self, pub_df, tf, sym=None):
-        """對於股票/ETF，若 shioaji 資料不夠長，向 yfinance 請求深層歷史補齊。"""
+    def _extend_with_yahoo(self, pub_df, tf, sym=None, max_days=None):
+        """對於股票/ETF，若 shioaji 資料不夠長，向 yfinance 請求深層歷史補齊。
+
+        【ADR-080】max_days:選填,合併完成後只保留「最後一根往前 max_days 天」
+        的範圍。回測/最佳化呼叫這個函式時不帶這個參數 (None=不裁切,維持原本
+        的完整深度,不受影響);主圖 (_publish) 只在需要深歷史時 (MA240 開啟
+        或週期為周K/月K) 才呼叫,且固定帶 max_days 裁到約 3 年,避免把 20 年
+        全部攤開在圖上拖慢渲染/縮放 (ADR-079 的教訓)。"""
         try:
             if pub_df is None or pub_df.empty: return pub_df
             sym = sym or getattr(self, 'current_symbol', '')
             if not sym or not sym[0].isdigit(): return pub_df
-            
+
             yf_params = {"日K": ("20y", "1d"), "周K": ("20y", "1wk"), "月K": ("20y", "1mo")}
             if tf not in yf_params: return pub_df
             period, interval = yf_params[tf]
-            
+
             import yfinance as yf
             df_yf = pd.DataFrame()
             for suffix in [".TW", ".TWO"]:
@@ -3394,25 +3407,28 @@ class StockTradingAppPro(tk.Tk):
                 if not df_yf.empty:
                     break
             if df_yf.empty: return pub_df
-            
+
             df_yf.index = pd.to_datetime(df_yf.index)
             if df_yf.index.tz is not None: df_yf.index = df_yf.index.tz_localize(None)
-            
+
             earliest_sj = pub_df.index[0]
             df_yf = df_yf[df_yf.index < earliest_sj]
             if df_yf.empty: return pub_df
-            
+
             df_yf = df_yf[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
             # Convert yfinance Volume (Shares) to Shioaji Volume (Lots) for Taiwan stocks
             df_yf['Volume'] = df_yf['Volume'] / 1000
             merged = pd.concat([df_yf, pub_df]).sort_index()
             merged = merged[~merged.index.duplicated(keep='last')]
+            if max_days is not None and not merged.empty:
+                cutoff = merged.index[-1] - pd.Timedelta(days=int(max_days))
+                merged = merged[merged.index >= cutoff]
             return merged
         except Exception as e:
             self.safe_after(0, self.log_message, f"【深層歷史】由 yfinance 補齊失敗: {e}")
             return pub_df
 
-    def _extend_with_taifex(self, pub_df, tf, contract=None, session='all'):
+    def _extend_with_taifex(self, pub_df, tf, contract=None, session='all', max_days=None):
         """把期交所官方日K往前接在 shioaji 聚合結果之前。
 
         只延伸 R1 (近月連續) 合約:期交所序列是「每日近月」建構的連續日K,
@@ -3451,6 +3467,12 @@ class StockTradingAppPro(tk.Tk):
                 self.safe_after(0, self.log_message,
                                 f"【期交所歷史】{tx_id} 已用官方每日行情往前延伸至 {out.index[0]:%Y-%m-%d}"
                                 f" (盤別:{'只用日盤' if session == 'day' else '近全'};重疊日期以 shioaji 為準)。")
+            # 【ADR-080】max_days:主圖只需要「一段」深歷史 (MA240/周K/月K 的情境),
+            # 不需要期交所全 series (可能長達 20+ 年);裁到最近 max_days 天。
+            # 回測/最佳化呼叫時不帶這個參數,拿到的仍是完整延伸序列,不受影響。
+            if max_days is not None and not out.empty:
+                cutoff = out.index[-1] - pd.Timedelta(days=int(max_days))
+                out = out[out.index >= cutoff]
             return out
         except Exception as e:
             self.safe_after(0, self.log_message, f"【期交所歷史】延伸失敗 (不影響原圖): {e}")
@@ -3939,7 +3961,7 @@ class StockTradingAppPro(tk.Tk):
             except Exception as e:
                 self.safe_after(0, self.log_message, f"訂閱報價串流異常: {e}")
 
-    def fetch_data_worker(self, raw_sym, tf, seq=None, market="台股"):
+    def fetch_data_worker(self, raw_sym, tf, seq=None, market="台股", ma240_on=False):
         """
         【ADR-011】資料源政策改版:
           - 台股 (股票/ETF/指數/期貨) 一律使用 shioaji，不再有 yfinance/FinMind 備援。
@@ -3950,11 +3972,11 @@ class StockTradingAppPro(tk.Tk):
         # 否則會 (1) 併發呼叫 kbars 干擾下載、(2) 把新商品資料合併進舊商品 df。
         self._fetch_in_progress = True
         try:
-            self._fetch_data_worker_impl(raw_sym, tf, seq, market)
+            self._fetch_data_worker_impl(raw_sym, tf, seq, market, ma240_on)
         finally:
             self._fetch_in_progress = False
 
-    def _fetch_data_worker_impl(self, raw_sym, tf, seq=None, market="台股"):
+    def _fetch_data_worker_impl(self, raw_sym, tf, seq=None, market="台股", ma240_on=False):
         try:
             yf_params = {"1分K": ("5d", "1m"), "5分K": ("30d", "5m"), "15分K": ("30d", "15m"), "30分K": ("30d", "30m"), "60分K": ("90d", "60m"), "日K": ("10y", "1d"), "周K": ("10y", "1wk"), "月K": ("10y", "1mo")}
             period, interval = yf_params.get(tf, ("1y", "1d"))
@@ -4077,20 +4099,28 @@ class StockTradingAppPro(tk.Tk):
             #   使用者看到的視窗不會跳動。
             _pub_state = {'n': None}  # 上次實際發布的K棒根數
 
-            def _publish(pub_df, full_ui=True, prev_len=None, note=""):
+            # 【ADR-080】ADR-079 讓主圖完全不延伸歷史 (只顯示 SJ_DAYS 原生範圍),
+            # 換來切換/縮放/平移都變快,但代價是長週期指標 (如 MA240) 在日K上幾乎
+            # 顯示不出來、周K/月K 的原生範圍也偏薄。使用者決策:只在「需要深歷史」
+            # 的情境才延伸,且裁到約 3 年 (不是 20 年全灌),在速度與覆蓋率之間
+            # 折衷:
+            #   - 週期是周K/月K:一律延伸 (使用者原話「週K/月K週期時再抓資料」)。
+            #   - 日K 但有開 MA240:也延伸 (ma240_on 由 UI 執行緒讀 tk 變數後傳入,
+            #     見 start_fetch_thread)。
+            #   - 其餘情況 (日K 未開 MA240):維持 ADR-079 的快速路徑,完全不延伸。
+            # 只在「快取命中」與「背景完整段」套用 (這兩條路可能是唯一一次出圖);
+            # 「快速段」(搶先出圖用) 一律不延伸,維持秒開,深歷史由背景補上。
+            EXT_MAX_DAYS = 1095  # 約 3 年
+            want_deep = tf in ("周K", "月K") or bool(ma240_on)
+
+            def _publish(pub_df, full_ui=True, prev_len=None, note="", allow_extend=False):
                 if seq is not None and seq != self._fetch_seq:
                     return False  # 已有更新的查詢,放棄發布
-                # 【ADR-079 (取代 ADR-078 的 extend 參數)】主圖 (即時看盤) 不再做
-                # 期交所/yahoo 歷史延伸。這一步以前對日/周/月K 一律無條件延伸整段
-                # 歷史 (yahoo 20年/期交所全series,上千~上萬根),即使是「快速段」
-                # 也被灌爆,延伸+matplotlib 渲染要 900~1700ms,是切換慢、以及圖表
-                # 載滿多年資料後縮放/平移每一幀都要重繪上千根K棒而卡頓的根本原因。
-                # 使用者決策:一般看盤只需要券商 API (shioaji) 原生提供的時間範圍
-                # (SJ_DAYS:日K 365天/周K 1095天/月K 1825天),深度歷史只有「回測」
-                # 「參數最佳化」需要——這兩個功能本來就各自獨立下載資料
-                # (_qt_backtest_worker/_qt_optimize_worker → _qt_bt_load_df,見那邊
-                # 呼叫 _extend_with_taifex/_extend_with_yahoo),完全不經過這個
-                # _publish,不受本次改動影響,回測/最佳化的歷史深度不變。
+                if allow_extend and want_deep:
+                    if self.asset_type == "future" and tf in ("日K", "周K", "月K"):
+                        pub_df = self._extend_with_taifex(pub_df, tf, max_days=EXT_MAX_DAYS)
+                    elif self.asset_type == "stock" and tf in ("日K", "周K", "月K"):
+                        pub_df = self._extend_with_yahoo(pub_df, tf, sym=search_sym, max_days=EXT_MAX_DAYS)
                 pub_df = pub_df.dropna(subset=['Open', 'High', 'Low', 'Close'])
                 if pub_df.empty:
                     return False
@@ -4181,7 +4211,10 @@ class StockTradingAppPro(tk.Tk):
                 if cached_raw is not None and not cached_raw.empty:
                     try:
                         df_cached = self._resample_sj_df(cached_raw, tf)
-                        if _publish(df_cached, full_ui=True):
+                        # 【ADR-080】快取命中且新鮮時會直接 return (下面 cache_fresh 分支),
+                        # 這是唯一一次出圖,若 want_deep 成立必須在這裡就延伸,不能靠後面
+                        # 的完整段補 (那段在 cache_fresh 時根本不會執行)。
+                        if _publish(df_cached, full_ui=True, allow_extend=True):
                             published_from_cache = True
                             cached_len = _pub_state['n']
                     except Exception:
@@ -4291,11 +4324,14 @@ class StockTradingAppPro(tk.Tk):
                 self._kbars_cache_put(cache_key, start_dt, raw, tf)
                 df_full = self._resample_sj_df(raw, tf)
                 prev = quick_len if quick_len is not None else cached_len
+                # 【ADR-080】完整段 (背景補全) allow_extend=True:want_deep 成立時
+                # (MA240 開啟或周K/月K) 在這裡延伸並裁到約 3 年;不成立就是 ADR-079
+                # 的純 SJ_DAYS 原生範圍,行為不變。
                 if prev is not None:
-                    _publish(df_full, full_ui=False, prev_len=prev,
+                    _publish(df_full, full_ui=False, prev_len=prev, allow_extend=True,
                              note=f"【背景補全】完整歷史已更新 (共 {len(df_full)} 根,總耗時 {time.time()-_t0:.1f} 秒)。")
                 else:
-                    _publish(df_full, full_ui=True)
+                    _publish(df_full, full_ui=True, allow_extend=True)
                     self.safe_after(0, self.log_message, f"⚡ 完整歷史載入完成 (共 {len(df_full)} 根),耗時 {time.time()-_t0:.1f} 秒。")
                 return
             else:
