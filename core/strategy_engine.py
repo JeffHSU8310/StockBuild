@@ -434,6 +434,11 @@ def new_strategy():
         'daily_loss_limit': 0.0,      # 每日虧損熔斷 (價差×數量, 0=停用)
         'mode': '模擬',               # 模擬 / 實單
         'enabled': False,
+        # 【ADR-070】交易時段閘門:session_gate=True 時,非交易時間自動待命,
+        # 進入盤中才評估下單 (無需人工開啟);futures_session 決定期貨要不要含夜盤。
+        'session_gate': True,         # True=非交易時間不動作 (建議);False=只看K棒邊界不看時段
+        'futures_session': 'day_night',  # 'day'=只做日盤 08:45-13:45;'day_night'=含夜盤 15:00-次日05:00
+
         # 【ADR-059】買進後持有不賣 (Buy & Hold):當作比較基準用,只能回測/模擬。
         # 勾選後 validate_strategy 不再要求「至少一種出場方式」。
         'buy_and_hold': False,

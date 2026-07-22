@@ -36,6 +36,7 @@ from core import ai_helper
 from core import optimizer
 from core import paper_account
 from core import taifex_daily
+from core import market_session
 from data import config_store
 from data import taifex_store
 
@@ -218,6 +219,11 @@ class StockTradingAppPro(tk.Tk):
         # process_broker_login 的說明)。
         self._login_in_progress = False
         self._login_watchdog_id = None
+        # 【ADR-071】斷線自動重連:登入成功時把「這次登入用的憑證」暫存在記憶體
+        # (只在 RAM,不寫磁碟),供斷線後背景重連使用;_reconnecting 防止同時
+        # 跑多個重連工作。auto_reconnect_var (勾選開關) 在 create_widgets 才建立。
+        self._login_creds_mem = None   # dict(api_key/secret_key/pid/ca_path/ca_pw) or None
+        self._reconnecting = False
         # 【第十七輪修正】kbars 串接鎖:手動查詢/主圖自動更新/量化 runner 三個
         # 執行緒共用同一條 shioaji 連線,「同時」呼叫 kbars 會互相干擾 (使用者
         # 實例:切換商品瞬間自動更新也在抓 → 背景補全下載失敗、K線圖異常)。
@@ -850,6 +856,15 @@ class StockTradingAppPro(tk.Tk):
         self.lbl_api_status.pack(side=tk.RIGHT, padx=(5, 15), pady=5)
         self.btn_login = tk.Button(market_panel, text="🔒 登入券商實盤 API", bg="#FF9100", fg="black", font=("微軟正黑體", 9, "bold"), relief="flat", command=self.toggle_login)
         self.btn_login.pack(side=tk.RIGHT, padx=5, pady=5)
+        # 【ADR-071】斷線自動重連開關:勾選後,偵測到券商連線中斷會自動用「本次
+        # 登入時輸入的憑證」在背景重試登入 (退避間隔),交易時段內尤其重要,讓
+        # 「早上開一次、整天不用管」成立。憑證密碼只留在記憶體、不寫進磁碟。
+        self.auto_reconnect_var = tk.BooleanVar(value=False)
+        self.chk_auto_reconnect = tk.Checkbutton(
+            market_panel, text="🔄 斷線自動重連", variable=self.auto_reconnect_var,
+            bg="#0D1115", fg="#8A99AD", selectcolor="#2A323D", activebackground="#0D1115",
+            font=('微軟正黑體', 9), command=self._on_auto_reconnect_toggle)
+        self.chk_auto_reconnect.pack(side=tk.RIGHT, padx=5, pady=5)
 
         self.lbl_twii = tk.Label(market_panel, text="加權指數: 等待連線API...", bg="#0D1115", fg="#FFCA28", font=('微軟正黑體', 10, 'bold'), cursor="hand2")
         self.lbl_twii.pack(side=tk.LEFT, padx=15, pady=5)
@@ -1395,6 +1410,81 @@ class StockTradingAppPro(tk.Tk):
                          "生效)。系統已嘗試釋放舊連線；請確認官網/App 已登出後，回來這裡重新點擊"
                          "「登入券商實盤 API」(重新登入會建立全新連線)。若立即重登仍失敗，"
                          "請等約 1-2 分鐘讓券商端釋放舊連線後再試。")
+        # 【ADR-071】斷線自動重連:開關開著、且記憶體裡有本次登入用的憑證,就在
+        # 背景自動重試登入,不用人工。券商端釋放舊 session 需要時間,故用退避間隔。
+        try:
+            if getattr(self, 'auto_reconnect_var', None) and self.auto_reconnect_var.get() \
+                    and self._login_creds_mem and not self._reconnecting:
+                self._reconnecting = True
+                threading.Thread(target=self._reconnect_worker, daemon=True).start()
+        except Exception:
+            pass
+
+    def _on_auto_reconnect_toggle(self):
+        """【ADR-071】使用者切換「斷線自動重連」開關時的提示與狀態更新。"""
+        on = bool(self.auto_reconnect_var.get())
+        try:
+            self.chk_auto_reconnect.config(fg="#00E676" if on else "#8A99AD")
+        except Exception:
+            pass
+        if on:
+            if not self._login_creds_mem:
+                self.log_message("【自動重連】已開啟,但目前尚未登入 (或本次尚未輸入憑證);"
+                                 "請先登入一次券商 API,之後若斷線就會用這次的憑證自動重連。"
+                                 "憑證密碼只留在記憶體、不會寫進磁碟;程式整個關掉再開需要再登入一次。")
+            else:
+                self.log_message("【自動重連】已開啟:偵測到斷線會自動用本次登入的憑證在背景重試"
+                                 "連線 (退避間隔,交易時段內尤其會積極重連),不需要人工重新登入。")
+        else:
+            self.log_message("【自動重連】已關閉:斷線後不會自動重連,需要你手動按「登入券商實盤 API」。")
+
+    def _reconnect_worker(self):
+        """【ADR-071】斷線後背景自動重連。退避間隔重試;成功、使用者關閉開關、
+        程式關閉、或已在其他路徑重新登入,都會結束。為避免半夜全休市時空轉,
+        全市場休市時改用長間隔慢慢等 (仍會定期試,以防券商端提早恢復)。"""
+        import time as _time
+        backoffs = [15, 30, 60, 120, 300]  # 秒:逐步拉長,最長 5 分鐘一次
+        attempt = 0
+        try:
+            while True:
+                if getattr(self, '_closing', False):
+                    return
+                # 開關被關掉、已經重新登入成功、或憑證被清掉 → 收工
+                if not (getattr(self, 'auto_reconnect_var', None) and self.auto_reconnect_var.get()):
+                    self.safe_after(0, self.log_message, "【自動重連】開關已關閉,停止重連。")
+                    return
+                if self.api_logged_in:
+                    return  # 已由其他路徑 (或上一輪) 連上
+                creds = self._login_creds_mem
+                if not creds:
+                    self.safe_after(0, self.log_message, "【自動重連】找不到可用憑證 (可能已手動登出),停止重連。")
+                    return
+                if self._login_in_progress:
+                    _time.sleep(5); continue  # 有登入流程在跑,等它
+
+                # 全市場 (台股 + 期貨日夜盤) 都休市時,重連沒有急迫性 → 長間隔慢等
+                any_open = market_session.is_stock_open() or market_session.is_futures_open()
+                wait = backoffs[min(attempt, len(backoffs) - 1)] if any_open else 300
+                attempt += 1
+                self.safe_after(0, self.log_message,
+                                f"【自動重連】第 {attempt} 次嘗試重新連線券商 API"
+                                f"{'' if any_open else ' (目前全市場休市,改為每 5 分鐘試一次)'}...")
+                self._login_in_progress = True
+                try:
+                    self._start_login_watchdog()
+                except Exception:
+                    pass
+                try:
+                    self.process_broker_login(creds['api_key'], creds['secret_key'],
+                                              creds['pid'], creds['ca_path'], creds['ca_pw'])
+                except Exception as e:
+                    self.safe_after(0, self.log_message, f"【自動重連】本次嘗試失敗: {type(e).__name__}: {e}")
+                if self.api_logged_in:
+                    self.safe_after(0, self.log_message, "【自動重連】✅ 已重新連線成功,自動交易將自行恢復運作。")
+                    return
+                _time.sleep(wait)
+        finally:
+            self._reconnecting = False
 
     def toggle_login(self):
         if self._login_in_progress:
@@ -1405,9 +1495,14 @@ class StockTradingAppPro(tk.Tk):
             return
         if self.api_logged_in:
             self.api_logged_in = False
+            # 【ADR-071】手動登出 = 明確不想連線,清掉記憶體憑證,避免自動重連把
+            # 剛登出的連線又接回去 (使用者主動登出的意圖優先於自動重連)。
+            self._login_creds_mem = None
             self.lbl_api_status.config(text="🔴 券商未連線", fg="#FF5252")
             self.btn_login.config(text="🔒 登入券商實盤 API", bg="#FF9100", fg="black")
-            self.log_message("【系統】已中斷券商實盤連線。")
+            self.log_message("【系統】已中斷券商實盤連線。" +
+                             ("(自動重連已開啟,但手動登出不會自動重連;要恢復請再登入一次。)"
+                              if getattr(self, 'auto_reconnect_var', None) and self.auto_reconnect_var.get() else ""))
             if HAS_SJ:
                 # 【第十二輪修正】背景執行緒+限時,避免「已登入時按登出」也卡住主執行緒。
                 try:
@@ -1663,6 +1758,10 @@ class StockTradingAppPro(tk.Tk):
                 self.safe_after(0, self.log_message, f"委託回報callback初始化異常: {cb_e}")
 
             self.api_logged_in = True
+            # 【ADR-071】登入成功 → 把這次的憑證暫存在記憶體 (只 RAM,不落地),
+            # 供「斷線自動重連」使用。這是達成「開一次、整天不用管」的關鍵材料。
+            self._login_creds_mem = {'api_key': api_key, 'secret_key': secret_key,
+                                     'pid': pid, 'ca_path': ca_path, 'ca_pw': ca_pw}
             self.safe_after(0, lambda: self.btn_login.config(text="🔓 登出券商 API", bg="#FF1744", fg="white"))
             self.safe_after(0, lambda: self.lbl_api_status.config(text="🟢 券商 API 已連線 (實盤模式)", fg="#00E676"))
             self.safe_after(0, self.log_message, "【登入成功】連線建立完成，合約下載完畢，實盤功能已啟用！")
@@ -5720,6 +5819,33 @@ class StockTradingAppPro(tk.Tk):
         except Exception as e:
             return False, f"{type(e).__name__}: {e}"
 
+    def _qt_log_session_closed(self, s, trade_type, include_night):
+        """【ADR-070】策略因休市被跳過時記錄——但只在「開盤→休市」轉換那一刻記
+        一次,不要每 2 秒洗版。用 _qt_session_state 記住每檔上次的開/收狀態。"""
+        if not hasattr(self, '_qt_session_state'):
+            self._qt_session_state = {}
+        prev = self._qt_session_state.get(s['id'])
+        if prev != 'closed':
+            self._qt_session_state[s['id']] = 'closed'
+            # prev 為 None 代表 runner 剛啟動就處於休市:也提示一次,讓使用者知道
+            # 「現在非交易時間,策略待命中,開盤會自動接手」,不是程式沒反應。
+            self.safe_after(0, self.log_message,
+                            f"【自動交易-待命】策略「{s.get('name')}」目前非交易時間 "
+                            f"({trade_type}{'含夜盤' if (trade_type == '期貨' and include_night) else ''}),"
+                            f"暫不評估;進入交易時段會自動開始運作,無需人工介入。")
+
+    def _qt_note_session_open(self, s, trade_type, include_night):
+        """【ADR-070】策略從休市進入盤中時記一次,讓使用者看到「已自動接手」。"""
+        if not hasattr(self, '_qt_session_state'):
+            self._qt_session_state = {}
+        prev = self._qt_session_state.get(s['id'])
+        if prev == 'closed':
+            label = market_session.session_label(trade_type, include_night=include_night)
+            self.safe_after(0, self.log_message,
+                            f"【自動交易-開盤】策略「{s.get('name')}」已進入交易時段 ({label}),"
+                            f"開始自動評估與下單。")
+        self._qt_session_state[s['id']] = 'open'
+
     def _quant_eval_pass(self, now_ts=None, today_str=None):
         """跑一輪全部策略的評估 (抽成獨立方法方便離線測試)。在背景執行緒執行。
         【ADR-041】明確傳入 now_ts/today_str (測試/手動觸發) 時跳過邊界閘門強制評估;
@@ -5741,6 +5867,19 @@ class StockTradingAppPro(tk.Tk):
             if not s.get('enabled'):
                 continue
             rt = self._qt_runtime(s['id'])
+            # 【ADR-070】交易時段閘門:非交易時間就完全不評估這檔策略,交易時間才
+            # 自己運作。手動觸發 (_forced) 或這檔明確關閉閘門 (session_gate=False)
+            # 才略過此檢查。期貨可依 futures_session ('day'/'day_night') 決定夜盤要
+            # 不要做。收盤→開盤是自然銜接:runner 每 2 秒醒著,時鐘一進盤中,這裡
+            # 就會放行,不需要任何人工重開;總開關 _qt_running 全程維持不動。
+            if (not _forced) and s.get('session_gate', True):
+                tt = strategy_engine.trade_type_of(s)
+                include_night = (s.get('futures_session', 'day_night') != 'day')
+                if not market_session.is_market_open(tt, include_night=include_night):
+                    self._qt_log_session_closed(s, tt, include_night)
+                    continue
+                else:
+                    self._qt_note_session_open(s, tt, include_night)
             # 【ADR-041】邊界感知:只有該策略週期的K棒剛收盤才評估 (測試/手動觸發不受限)
             if not _forced:
                 tf_mins = {'1分K': 1, '5分K': 5, '15分K': 15, '30分K': 30, '60分K': 60}.get(s.get('timeframe'))
@@ -6555,6 +6694,17 @@ class StockTradingAppPro(tk.Tk):
         e_tp = _ent(top, s.get('take_profit_pct', 0.0), 6); e_tp.grid(row=2, column=3, padx=4, pady=(6, 0))
         _lbl(top, "讓價檔數").grid(row=2, column=4, sticky='w', padx=(10, 0), pady=(6, 0))
         e_slip = _ent(top, s.get('slippage_ticks', 2), 6); e_slip.grid(row=2, column=5, padx=4, pady=(6, 0))
+        # 【ADR-070】交易時段閘門:期貨可選「只做日盤」或「日盤+夜盤」;
+        # session_gate 打勾 = 非交易時間自動待命 (預設)。取消勾選才會 24 小時
+        # 只要 K 棒邊界到就評估 (一般不建議,除非你很清楚在做什麼)。
+        _lbl(top, "期貨時段").grid(row=4, column=0, sticky='w', pady=(6, 0))
+        cb_fut_sess = ttk.Combobox(top, values=['日盤+夜盤', '只做日盤'], width=9, state='readonly', style="BlackText.TCombobox")
+        cb_fut_sess.set('只做日盤' if s.get('futures_session') == 'day' else '日盤+夜盤')
+        cb_fut_sess.grid(row=4, column=1, padx=4, pady=(6, 0), sticky='w')
+        var_sess_gate = tk.BooleanVar(value=bool(s.get('session_gate', True)))
+        tk.Checkbutton(top, text="非交易時間自動待命 (建議)", variable=var_sess_gate,
+                       bg="#1A2026", fg="#8A99AD", selectcolor="#2A323D", activebackground="#1A2026",
+                       font=('微軟正黑體', 8)).grid(row=4, column=2, columnspan=4, sticky='w', padx=(10, 0), pady=(6, 0))
         # 【ADR-043 第6項】絕對停損/停利 (股票=元,期貨=點;0=停用,與% 任一先到就出場)
         _lbl(top, "停損(元/點)").grid(row=6, column=0, sticky='w', pady=(6, 0))
         e_sl_abs = _ent(top, s.get('stop_loss_abs', 0.0), 6); e_sl_abs.grid(row=6, column=1, padx=4, pady=(6, 0))
@@ -6870,6 +7020,9 @@ class StockTradingAppPro(tk.Tk):
             s['exit_time_start'] = e_ex_st.get().strip()
             s['exit_time_end'] = e_ex_ed.get().strip()
             s['specific_entry_time'] = e_sp_en.get().strip()
+            # 【ADR-070】交易時段閘門設定
+            s['futures_session'] = 'day' if cb_fut_sess.get() == '只做日盤' else 'day_night'
+            s['session_gate'] = bool(var_sess_gate.get())
             try: s['cooldown_sec'] = float(e_cool.get().strip())
             except (TypeError, ValueError): s['cooldown_sec'] = 300
             s['mode'] = cb_mode.get()

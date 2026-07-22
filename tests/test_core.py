@@ -25,6 +25,7 @@ import numpy as np
 
 from core import tick_rules
 from core import futures_session
+from core import market_session
 from core import order_rules
 from core import indicators
 from core import strategy_engine
@@ -2520,6 +2521,72 @@ class TestTaifexDaily(unittest.TestCase):
             back = taifex_store.load_daily(tmp, 'TX')
             self.assertEqual(len(back), len(hist))
             self.assertEqual(back.loc[pd.Timestamp('2026-07-10'), 'Close'], 46281)
+
+
+class TestMarketSession(unittest.TestCase):
+    """【ADR-070】交易時段判斷 (自動交易的開/收盤閘門)。用固定 datetime 驗邊界。"""
+    # 2026-07-13 是週一,2026-07-18 週六,2026-07-19 週日。
+
+    def _dt(self, y, mo, d, h, mi):
+        from datetime import datetime as _datetime
+        return _datetime(y, mo, d, h, mi)
+
+    def test_stock_open_hours(self):
+        # 週一 09:00 開、13:30 收 (含邊界),盤前/盤後關
+        self.assertFalse(market_session.is_stock_open(self._dt(2026, 7, 13, 8, 59)))
+        self.assertTrue(market_session.is_stock_open(self._dt(2026, 7, 13, 9, 0)))
+        self.assertTrue(market_session.is_stock_open(self._dt(2026, 7, 13, 13, 30)))
+        self.assertFalse(market_session.is_stock_open(self._dt(2026, 7, 13, 13, 31)))
+
+    def test_stock_closed_on_weekend(self):
+        self.assertFalse(market_session.is_stock_open(self._dt(2026, 7, 18, 10, 0)))  # 週六
+        self.assertFalse(market_session.is_stock_open(self._dt(2026, 7, 19, 10, 0)))  # 週日
+
+    def test_futures_day_session(self):
+        self.assertFalse(market_session.is_futures_day_open(self._dt(2026, 7, 13, 8, 44)))
+        self.assertTrue(market_session.is_futures_day_open(self._dt(2026, 7, 13, 8, 45)))
+        self.assertTrue(market_session.is_futures_day_open(self._dt(2026, 7, 13, 13, 45)))
+        self.assertFalse(market_session.is_futures_day_open(self._dt(2026, 7, 13, 13, 46)))
+
+    def test_futures_night_evening_part(self):
+        # 週一傍晚 15:00 起開盤
+        self.assertFalse(market_session.is_futures_night_open(self._dt(2026, 7, 13, 14, 59)))
+        self.assertTrue(market_session.is_futures_night_open(self._dt(2026, 7, 13, 15, 0)))
+        self.assertTrue(market_session.is_futures_night_open(self._dt(2026, 7, 13, 23, 30)))
+
+    def test_futures_night_morning_part(self):
+        # 週二凌晨 04:59 仍在 (屬週一夜盤),05:00 收
+        self.assertTrue(market_session.is_futures_night_open(self._dt(2026, 7, 14, 4, 59)))
+        self.assertFalse(market_session.is_futures_night_open(self._dt(2026, 7, 14, 5, 0)))
+
+    def test_friday_night_runs_into_saturday(self):
+        # 週五 23:00 開;週六 04:00 仍屬週五夜盤;週六 15:00 不開盤
+        self.assertTrue(market_session.is_futures_night_open(self._dt(2026, 7, 17, 23, 0)))
+        self.assertTrue(market_session.is_futures_night_open(self._dt(2026, 7, 18, 4, 0)))
+        self.assertFalse(market_session.is_futures_night_open(self._dt(2026, 7, 18, 15, 0)))
+
+    def test_monday_predawn_has_no_night(self):
+        # 週一凌晨不屬任何夜盤 (前一天週日沒開)
+        self.assertFalse(market_session.is_futures_night_open(self._dt(2026, 7, 13, 3, 0)))
+
+    def test_is_market_open_dispatch(self):
+        day = self._dt(2026, 7, 13, 10, 0)   # 週一上午:兩市場都開
+        self.assertTrue(market_session.is_market_open('股票', day))
+        self.assertTrue(market_session.is_market_open('零股', day))
+        self.assertTrue(market_session.is_market_open('期貨', day))
+        night = self._dt(2026, 7, 13, 22, 0)  # 週一晚上:只有期貨夜盤
+        self.assertFalse(market_session.is_market_open('股票', night))
+        self.assertTrue(market_session.is_market_open('期貨', night))
+        # include_night=False → 夜盤不算開
+        self.assertFalse(market_session.is_market_open('期貨', night, include_night=False))
+        # 未知種類保守回 False
+        self.assertFalse(market_session.is_market_open('比特幣', day))
+
+    def test_session_label(self):
+        self.assertEqual(market_session.session_label('期貨', self._dt(2026, 7, 13, 10, 0)), '期貨日盤')
+        self.assertEqual(market_session.session_label('期貨', self._dt(2026, 7, 13, 22, 0)), '期貨夜盤')
+        self.assertEqual(market_session.session_label('期貨', self._dt(2026, 7, 13, 22, 0), include_night=False), '休市')
+        self.assertEqual(market_session.session_label('股票', self._dt(2026, 7, 13, 22, 0)), '休市')
 
 
 if __name__ == "__main__":
