@@ -2525,6 +2525,19 @@ class TestTaifexDaily(unittest.TestCase):
         self.assertEqual(bar2['Open'], 46300)
         self.assertEqual(bar2['Volume'], 80000)
 
+    def test_month_rank_r1_and_r2_build(self):
+        """【ADR-081】驗證近一 (month_rank=1) 與次月 (month_rank=2) 連續合約建立。"""
+        csv = ("交易日期,契約,到期月份(週別),開盤價,最高價,最低價,收盤價,漲跌價,漲跌%,成交量,"
+               "結算價,未沖銷契約數,最後最佳買價,最後最佳賣價,歷史最高價,歷史最低價,"
+               "是否因訊息面暫停交易,交易時段,價差對單式委託成交量\n"
+               "2026/07/10,TX,202607,45900,46495,45701,46281,633,1.39,90000,-,-,-,-,-,-,,一般,0\n"
+               "2026/07/10,TX,202608,45500,46000,45300,45800,500,1.10,15000,-,-,-,-,-,-,,一般,0\n")
+        rows = taifex_daily.parse_csv_text(csv)
+        r1 = taifex_daily.build_front_month_daily(rows, 'TX', session='all', month_rank=1)
+        r2 = taifex_daily.build_front_month_daily(rows, 'TX', session='all', month_rank=2)
+        self.assertEqual(r1.iloc[0]['Close'], 46281)
+        self.assertEqual(r2.iloc[0]['Close'], 45800)
+
     def test_parse_big5_bytes_and_zip(self):
         raw = self.CSV.encode('cp950')
         rows = taifex_daily.extract_rows_from_bytes(raw, 'x.csv')

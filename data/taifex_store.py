@@ -14,27 +14,30 @@ SUBDIR = "taifex_daily"
 _COLS = ['Open', 'High', 'Low', 'Close', 'Volume']
 
 
-def store_path(base_dir, taifex_prod, session='all'):
-    """【ADR-058】兩種盤別口徑各存一個檔:
-        TX.csv      = 近全 (含夜盤,session='all')
-        TX_day.csv  = 只有日盤 (session='day')
-    分開存而不是存一個檔多幾欄,是為了讓既有的 TX.csv 完全不受影響
-    (使用者已經匯入的資料不會失效),新口徑只是「多一個檔」。"""
+def store_path(base_dir, taifex_prod, session='all', month_rank=1):
+    """【ADR-058/ADR-081】兩種盤別口徑及不同連續月份 (R1/R2/R3) 分開儲存:
+        TX.csv        = 近一連續 (R1), 近全 (session='all')
+        TX_day.csv    = 近一連續 (R1), 只有日盤 (session='day')
+        TX_R2.csv     = 次月連續 (R2), 近全 (session='all')
+        TX_R2_day.csv = 次月連續 (R2), 只有日盤 (session='day')
+    """
     name = str(taifex_prod).strip().upper()
+    rank = int(month_rank)
+    if rank > 1:
+        name += f"_R{rank}"
     if str(session) == 'day':
         name += '_day'
     return os.path.join(base_dir, SUBDIR, f"{name}.csv")
 
 
-def has_daily(base_dir, taifex_prod, session='all'):
-    """該商品/口徑的本地檔案是否存在 (用來提示使用者需不需要重新匯入)。"""
-    return os.path.exists(store_path(base_dir, taifex_prod, session))
+def has_daily(base_dir, taifex_prod, session='all', month_rank=1):
+    """該商品/口徑/連續月份的本地檔案是否存在。"""
+    return os.path.exists(store_path(base_dir, taifex_prod, session, month_rank=month_rank))
 
 
-def load_daily(base_dir, taifex_prod, session='all'):
-    """載入某商品的期交所日K;檔案不存在或壞掉回傳空 DataFrame (不拋例外,
-    呼叫端把「沒有匯入過」與「檔案毀損」都當成沒有延伸資料可用)。"""
-    path = store_path(base_dir, taifex_prod, session)
+def load_daily(base_dir, taifex_prod, session='all', month_rank=1):
+    """載入某商品的期交所日K (支援 R1/R2/R3)。"""
+    path = store_path(base_dir, taifex_prod, session, month_rank=month_rank)
     if not os.path.exists(path):
         return pd.DataFrame(columns=_COLS)
     try:
@@ -47,9 +50,9 @@ def load_daily(base_dir, taifex_prod, session='all'):
         return pd.DataFrame(columns=_COLS)
 
 
-def save_daily(base_dir, taifex_prod, df, session='all'):
-    """寫入某商品的期交所日K (整檔覆蓋)。回傳實際寫入路徑。"""
-    path = store_path(base_dir, taifex_prod, session)
+def save_daily(base_dir, taifex_prod, df, session='all', month_rank=1):
+    """寫入某商品的期交所日K (支援 R1/R2/R3, 整檔覆蓋)。回傳實際寫入路徑。"""
+    path = store_path(base_dir, taifex_prod, session, month_rank=month_rank)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     out = df[[c for c in _COLS if c in df.columns]].sort_index()
     out.to_csv(path, index_label='Date')

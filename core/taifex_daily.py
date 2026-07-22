@@ -167,26 +167,25 @@ def extract_rows_from_bytes(b, filename=''):
     return parse_csv_text(decode_csv_bytes(b))
 
 
-def build_front_month_daily(rows, taifex_prod, session='all'):
-    """由行情列建構「前月連續、近全合併」日K DataFrame (index=Timestamp,
+def build_front_month_daily(rows, taifex_prod, session='all', month_rank=1):
+    """由行情列建構「連續月份 (R1/R2/R3)、近全或只日盤」日K DataFrame (index=Timestamp,
     欄位 Open/High/Low/Close/Volume,與 _resample_sj_df 期貨日K同構)。
 
     規則:
       - 只取 契約 == taifex_prod 且 到期月份為純 6 碼 (排除週契約/價差單)。
-      - 每個交易日的近月 = 該日出現的最小月份。
+      - 每個交易日的標的月份 = 該日出現的第 month_rank 小的月份:
+        * month_rank=1: 近月連續 (R1)
+        * month_rank=2: 次月連續 (R2)
+        * month_rank=3: 遠月連續 (R3)
       - 一般列連收盤價都沒有的日子 (整日無成交) 跳過。
 
-    【ADR-058】session 參數:
+    【ADR-058/ADR-081】session 與 month_rank 參數:
       * 'all' (預設,近全合併):Open=盤後(夜盤)開盤,無則一般;Close=一般收盤,
-        無則盤後;High/Low 取兩時段極值;Volume 兩時段加總。與 ADR-007 的
-        交易日定義一致。
+        無則盤後;High/Low 取兩時段極值;Volume 兩時段加總。
       * 'day' (只取日盤):完全忽略「盤後」列,只用「一般」列。
-        存在理由:期交所夜盤 2017-05-15 才上線,在那之前根本沒有盤後列,
-        所以 'all' 序列的定義會在 2017-05-15 中途改變 (實測臺指期隔夜跳空
-        中位數從 0.38% 掉到 0.064%,差 5.9 倍)。要做橫跨該日的長期回測時,
-        用 'day' 才有前後一致的口徑。
     """
     taifex_prod = str(taifex_prod).strip().upper()
+    month_rank = max(1, int(month_rank))
     by_day = {}
     for r in rows:
         if r['prod'] != taifex_prod or not _PURE_MONTH_RE.match(r['month']):
@@ -196,11 +195,14 @@ def build_front_month_daily(rows, taifex_prod, session='all'):
     recs = []
     for d in sorted(by_day):
         day_rows = by_day[d]
-        front = min(r['month'] for r in day_rows)
-        reg = next((r for r in day_rows if r['month'] == front and r['session'] == '一般'), None)
-        aft = next((r for r in day_rows if r['month'] == front and r['session'] == '盤後'), None)
+        unique_months = sorted(list(set(r['month'] for r in day_rows)))
+        if not unique_months:
+            continue
+        target_month = unique_months[min(month_rank - 1, len(unique_months) - 1)]
+        reg = next((r for r in day_rows if r['month'] == target_month and r['session'] == '一般'), None)
+        aft = next((r for r in day_rows if r['month'] == target_month and r['session'] == '盤後'), None)
         if str(session) == 'day':
-            aft = None   # 【ADR-058】只取日盤:盤後列直接不看
+            aft = None   # 只取日盤
         close = (reg and reg['close']) or (aft and aft['close'])
         if close is None:
             continue

@@ -2597,8 +2597,6 @@ class StockTradingAppPro(tk.Tk):
         quotes = {}
         if not hasattr(self, '_wl_us_names'):
             self._wl_us_names = {}
-        for sym in us_syms:
-            try:
                 t = yf.Ticker(sym)
                 # 【第十五輪修正】漲跌基準改用「未還原 (auto_adjust=False) 日K」的
                 # 最後兩個收盤價:fast_info.previous_close 的口徑不穩 (可能拿到
@@ -2629,6 +2627,111 @@ class StockTradingAppPro(tk.Tk):
             except Exception:
                 continue
         return quotes
+
+    def _month_rank_of(self, contract):
+        """【ADR-081】判斷期貨合約對應的連續月份等級:
+        - R2 / 次月合約 (如 TXFR2, MXFR2) → 2 (次月連續)
+        - R3 / 遠月合約 (如 TXFR3) → 3 (遠月連續)
+        - 其餘 (如 TXFR1, TXF, 股票期貨, 特定月份合約) → 1 (近一連續)
+        """
+        if not contract:
+            return 1
+        sym = str(getattr(contract, 'symbol', '') or getattr(contract, 'code', '') or '').upper()
+        if 'R2' in sym:
+            return 2
+        if 'R3' in sym:
+            return 3
+        return 1
+
+    def _taifex_load_hist(self, tx_id, session='all', month_rank=1):
+        """讀取某期交所商品/盤別/連續月份的本地日K (經記憶體快取)。沒匯入過回傳空 df。
+        【ADR-058/ADR-081】快取 key 加上盤別與連續月份等級 (R1/R2)。
+        """
+        rank = int(month_rank)
+        key = (tx_id, str(session), rank)
+        hist = self._taifex_mem_cache.get(key)
+        if hist is None:
+            path = taifex_store.store_path(self.TAIFEX_BASE_DIR, tx_id, session=session, month_rank=rank)
+            hist = taifex_store.load_daily(self.TAIFEX_BASE_DIR, tx_id, session=session, month_rank=rank)
+            self._taifex_mem_cache[key] = hist
+            sess_txt = '只用日盤' if session == 'day' else '近全'
+            rank_txt = f"R{rank}" if rank > 1 else "R1近月"
+            if hist is None or hist.empty:
+                self.safe_after(0, self.log_message,
+                                f"【期交所歷史】✗ 找不到 {tx_id} ({rank_txt},{sess_txt}) 的本地資料。"
+                                f"我找的路徑是:{path} —— 請確認檔案就在這裡 "
+                                f"(用「📥 期交所歷史」匯入會自動存到正確位置)。")
+            else:
+                self.safe_after(0, self.log_message,
+                                f"【期交所歷史】✓ 已讀取 {tx_id} ({rank_txt},{sess_txt}) {len(hist):,} 根,"
+                                f"涵蓋 {hist.index[0]:%Y-%m-%d} ~ {hist.index[-1]:%Y-%m-%d}。"
+                                f"(檔案:{path})")
+        return hist
+
+    def show_taifex_status(self):
+        """【ADR-060/ADR-081】一次列出所有期交所商品的本地資料狀態 (含 R1 近月與 R2 次月連續)。"""
+        lines = [f"期交所歷史資料夾:{os.path.join(self.TAIFEX_BASE_DIR, taifex_store.SUBDIR)}", ""]
+        any_found = False
+        for tx_id in sorted(set(taifex_daily.PRODUCT_MAP.values())):
+            for rank, rlabel in ((1, 'R1近月'), (2, 'R2次月')):
+                for sess, label in (('all', '近全'), ('day', '日盤')):
+                    path = taifex_store.store_path(self.TAIFEX_BASE_DIR, tx_id, session=sess, month_rank=rank)
+                    if os.path.exists(path):
+                        df = taifex_store.load_daily(self.TAIFEX_BASE_DIR, tx_id, session=sess, month_rank=rank)
+                        if df is not None and not df.empty:
+                            any_found = True
+                            lines.append(f"✓ {tx_id} {rlabel} ({label}):{len(df):,} 根,"
+                                         f"{df.index[0]:%Y-%m-%d} ~ {df.index[-1]:%Y-%m-%d}")
+                        else:
+                            lines.append(f"⚠ {tx_id} {rlabel} ({label}):檔案存在但讀不出內容 → {path}")
+                    else:
+                        lines.append(f"✗ {tx_id} {rlabel} ({label}):無檔案 → {os.path.basename(path)}")
+        if not any_found:
+            lines += ["", "目前一份都沒有。請按「📥 期交所歷史」下載或匯入,",
+                      "系統會自動存到上面那個資料夾 (不需要你手動搬檔案)。"]
+        else:
+            lines += ["", "回測/最佳化時,只要期交所資料涵蓋了你選的期間,",
+                      "就會完全略過券商下載 (日誌會出現「完全略過券商下載」)。",
+                      "只有「只用日盤」那份存在,才能在回測選「只用日盤」口徑。"]
+        msg = "\n".join(lines)
+        for ln in lines:
+            if ln.strip():
+                self.log_message(f"【期交所狀態】{ln}")
+        messagebox.showinfo("期交所歷史資料狀態", msg, parent=self)
+
+    def _taifex_prod_of(self, contract):
+        if not contract:
+            return None
+        sym = getattr(contract, 'symbol', '') or getattr(contract, 'code', '') or ''
+        return taifex_daily.PRODUCT_MAP.get(fut_catalog.product_code(sym))
+
+    def _taifex_plan_download(self, contract, asset_type, tf, start_dt, end_dt, session='all', tag="回測"):
+        """【ADR-060/ADR-081】主圖與回測通用:判斷這段歷史是否「已經被期交所本地資料完整涵蓋」。"""
+        try:
+            if asset_type != "future" or tf not in ("日K", "周K", "月K"):
+                return start_dt, end_dt, ""
+            tx_id = self._taifex_prod_of(contract)
+            if not tx_id:
+                return start_dt, end_dt, ""
+            rank = self._month_rank_of(contract)
+            hist = self._taifex_load_hist(tx_id, session=session, month_rank=rank)
+            if (hist is None or hist.empty) and session == 'day':
+                hist = self._taifex_load_hist(tx_id, session='all', month_rank=rank)
+            if hist is None or hist.empty:
+                return start_dt, end_dt, ""
+            covered_until, need_from = taifex_daily.split_coverage(hist, start_dt, end_dt)
+            if need_from is None:
+                return None, None, (f"期交所本地歷史已完整涵蓋 {start_dt:%Y-%m-%d}~{end_dt:%Y-%m-%d},"
+                                    f"完全略過券商下載 (不會再被流量管制擋)。")
+            if pd.Timestamp(need_from) > pd.Timestamp(start_dt):
+                days_saved = (pd.Timestamp(need_from) - pd.Timestamp(start_dt)).days
+                return need_from, end_dt, (f"期交所本地歷史已涵蓋到 {covered_until:%Y-%m-%d},"
+                                           f"券商只需補 {need_from:%Y-%m-%d} 之後 "
+                                           f"(省下約 {days_saved} 天、大幅降低被流量管制的機會)。")
+            return start_dt, end_dt, ""
+        except Exception as e:
+            self.safe_after(0, self.log_message, f"【{tag}下載】期交所涵蓋判斷失敗,改為全段下載: {e}")
+            return start_dt, end_dt, ""
 
     def _wl_ensure_stream_subs(self):
         """【第十六輪 第2項】確保目前群組的期貨/指數都已訂閱 tick 串流。
