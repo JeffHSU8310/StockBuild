@@ -2597,6 +2597,8 @@ class StockTradingAppPro(tk.Tk):
         quotes = {}
         if not hasattr(self, '_wl_us_names'):
             self._wl_us_names = {}
+        for sym in us_syms:
+            try:
                 t = yf.Ticker(sym)
                 # 【第十五輪修正】漲跌基準改用「未還原 (auto_adjust=False) 日K」的
                 # 最後兩個收盤價:fast_info.previous_close 的口徑不穩 (可能拿到
