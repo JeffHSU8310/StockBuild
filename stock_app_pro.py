@@ -3729,6 +3729,16 @@ class StockTradingAppPro(tk.Tk):
             return '期貨'
         return '股票'
 
+    def _watch_trade_type_for_symbol(self, sym):
+        """【ADR-077】判斷「看A」商品的種類:指數/期貨/股票 (比 B 多一個指數)。
+        指數優先 (^TWII/^TWOII 等),其餘沿用 _trade_type_for_symbol。"""
+        sym = (sym or '').strip().upper()
+        if not sym:
+            return '指數'
+        if strategy_engine.looks_like_index_symbol(sym):
+            return '指數'
+        return self._trade_type_for_symbol(sym)
+
     def _log_futures_candidates(self, raw):
         """
         【ADR-028】台期貨模式查無代號時,列出可用/相近的期貨商品代號,
@@ -5305,16 +5315,20 @@ class StockTradingAppPro(tk.Tk):
         self.entry_symbol.delete(0, tk.END)
         self.entry_symbol.insert(0, sym)
         self.start_fetch_thread()
-        # 【策略編輯器帶入】若「新增/編輯策略」對話框正開著,點自選股同時把
-        # 商品代碼帶進對話框,交易種類 (股票/期貨) 也一併自動判斷,不用手key。
+        # 【策略編輯器帶入 / ADR-077】若策略編輯器開著,點自選股把代碼帶進「目前
+        # 作用中的欄位」——做B (執行商品) 或看A (訊號來源),由最後點過的欄位決定
+        # (見 _qt_editor_symbol_target 的設定)。種類也一併自動判斷:做B→股票/期貨,
+        # 看A→指數/期貨/股票 (看A可為指數)。
         target = getattr(self, '_qt_editor_symbol_target', None)
         if target is not None:
             try:
-                dlg_ref, e_sym_ref, cb_tt_ref, lookup_cb = target
+                dlg_ref, e_sym_ref, cb_tt_ref, lookup_cb, kind = target
                 if dlg_ref.winfo_exists():
                     e_sym_ref.delete(0, tk.END)
                     e_sym_ref.insert(0, sym)
-                    cb_tt_ref.set(self._trade_type_for_symbol(sym))
+                    tt = (self._watch_trade_type_for_symbol(sym) if kind == 'A'
+                          else self._trade_type_for_symbol(sym))
+                    cb_tt_ref.set(tt)
                     if lookup_cb:
                         lookup_cb()
             except Exception:
@@ -6401,8 +6415,10 @@ class StockTradingAppPro(tk.Tk):
                 lbl_cname.config(text="")
         e_sym.bind('<KeyRelease>', _clook); e_sym.bind('<FocusOut>', _clook)
         cb_tt.bind('<<ComboboxSelected>>', _clook)
-        # 【策略編輯器帶入】同 _qt_open_editor:記住欄位讓點自選股可以帶入。
-        self._qt_editor_symbol_target = (dlg, e_sym, cb_tt, _clook)
+        # 【策略編輯器帶入 / ADR-077】同 _qt_open_editor:記住做B 欄位,點進 B 也切回 B。
+        _bt = (dlg, e_sym, cb_tt, _clook, 'B')
+        self._qt_editor_symbol_target = _bt
+        e_sym.bind('<FocusIn>', lambda *_a: setattr(self, '_qt_editor_symbol_target', _bt), add='+')
         _lbl(top, "週期").grid(row=1, column=0, sticky='w', pady=(6, 0))
         cb_tf = ttk.Combobox(top, values=list(strategy_engine.VALID_TIMEFRAMES), width=7, state='readonly', style="BlackText.TCombobox")
         cb_tf.set(s.get('timeframe', '5分K')); cb_tf.grid(row=1, column=1, padx=4, pady=(6, 0))
@@ -6915,7 +6931,7 @@ class StockTradingAppPro(tk.Tk):
         tk.Label(row0, text="上方『商品代碼』= 做B (實際下單);指數(加權/櫃買)不能做B,只能當看A。",
                  bg="#12181F", fg="#8A99AD", font=('微軟正黑體', 8)).pack(side=tk.LEFT, padx=(8, 0))
         rowA = tk.Frame(wf, bg="#12181F"); rowA.pack(fill=tk.X, pady=(2, 4))
-        tk.Label(rowA, text="　看A 商品代碼", bg="#12181F", fg="white", font=('微軟正黑體', 9)).pack(side=tk.LEFT)
+        tk.Label(rowA, text="　看A 商品代碼", bg="#12181F", fg="#29B6F6", font=('微軟正黑體', 9)).pack(side=tk.LEFT)
         e_wsym = tk.Entry(rowA, width=12, bg="#2A323D", fg="white", justify="center")
         e_wsym.insert(0, s.get('watch_symbol', '')); e_wsym.pack(side=tk.LEFT, padx=4)
         tk.Label(rowA, text="種類", bg="#12181F", fg="white", font=('微軟正黑體', 9)).pack(side=tk.LEFT, padx=(8, 0))
@@ -6926,7 +6942,7 @@ class StockTradingAppPro(tk.Tk):
         cb_wtf = ttk.Combobox(rowA, values=list(strategy_engine.VALID_TIMEFRAMES), width=6,
                               state='readonly', style="BlackText.TCombobox")
         cb_wtf.set(s.get('watch_timeframe', '30分K')); cb_wtf.pack(side=tk.LEFT, padx=4)
-        tk.Label(rowA, text="(訊號/指標看A這個週期;下單價與停損停利用做B的最新價)",
+        tk.Label(rowA, text="(點一下此欄再點左側自選股即可帶入A並自動判斷指數/期貨/股票;訊號看A週期,下單看B最新價)",
                  bg="#12181F", fg="#8A99AD", font=('微軟正黑體', 8)).pack(side=tk.LEFT, padx=(8, 0))
         lbl_wname = tk.Label(wf, text="", bg="#12181F", fg="#00E676", font=('微軟正黑體', 8))
         lbl_wname.pack(anchor='w', padx=4, pady=(0, 4))
@@ -6949,6 +6965,14 @@ class StockTradingAppPro(tk.Tk):
         e_wsym.bind('<KeyRelease>', _wlook); e_wsym.bind('<FocusOut>', _wlook)
         cb_wtt.bind('<<ComboboxSelected>>', _wlook)
         var_watch.trace_add('write', lambda *_a: _wlook())
+        # 【ADR-077】看A 商品代碼也支援「點自選股帶入」:點進這個欄位 (或勾了看A做B)
+        # 就把它設為作用中目標,之後點左側自選股會帶入 A 並自動判斷 指數/期貨/股票。
+        _at = (parent, e_wsym, cb_wtt, _wlook, 'A')
+        def _activate_A(*_a):
+            self._qt_editor_symbol_target = _at
+        e_wsym.bind('<FocusIn>', _activate_A, add='+')
+        # 勾選「看A做B」的當下,順手把作用中目標切到 A,方便馬上點自選股帶 A。
+        var_watch.trace_add('write', lambda *_a: (_activate_A() if var_watch.get() else None))
         _wlook()
         return {'get': lambda: {
             'watch_enabled': bool(var_watch.get()),
@@ -7005,9 +7029,11 @@ class StockTradingAppPro(tk.Tk):
         e_sym.bind('<KeyRelease>', _lookup_name)
         e_sym.bind('<FocusOut>', _lookup_name)
         cb_tt.bind('<<ComboboxSelected>>', _lookup_name)
-        # 【策略編輯器帶入】記住這個對話框的商品代碼/交易種類欄位,讓
-        # on_watchlist_select 點自選股時可以直接寫回來 (見該函式的說明)。
-        self._qt_editor_symbol_target = (dlg, e_sym, cb_tt, _lookup_name)
+        # 【策略編輯器帶入 / ADR-077】記住做B (執行商品) 欄位。點自選股會帶進
+        # 「目前作用中」的欄位;做B 是預設,點進 B 的代碼框也會切回 B。
+        _bt = (dlg, e_sym, cb_tt, _lookup_name, 'B')
+        self._qt_editor_symbol_target = _bt
+        e_sym.bind('<FocusIn>', lambda *_a: setattr(self, '_qt_editor_symbol_target', _bt), add='+')
         _lbl(top, "週期").grid(row=1, column=0, sticky='w', pady=(6, 0))
         cb_tf = ttk.Combobox(top, values=list(strategy_engine.VALID_TIMEFRAMES), width=7, state='readonly', style="BlackText.TCombobox")
         cb_tf.set(s.get('timeframe', '5分K')); cb_tf.grid(row=1, column=1, padx=4, pady=(6, 0))
