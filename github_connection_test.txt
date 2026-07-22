@@ -1,0 +1,7 @@
+GitHub Connection Test File
+===========================
+Project: StockBuild (JeffHSU8310/StockBuild)
+Test Date: 2026-07-22
+Status: Connection verified successfully.
+
+This is a temporary test file created for user verification.
