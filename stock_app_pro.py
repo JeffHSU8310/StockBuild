@@ -291,7 +291,8 @@ class StockTradingAppPro(tk.Tk):
         self.press_x_pixel = None
         self.press_xlim = None
         self.saved_xlim = None
-        
+        self._view_is_auto_default = True  # 追蹤當前圖表視角是否為系統預設值
+
         self.current_fig = None
         self.current_canvas = None
         
@@ -2875,7 +2876,8 @@ class StockTradingAppPro(tk.Tk):
             self.log_message(f"【搜尋】以中文名稱搜尋「{raw_sym}」...")
             threading.Thread(target=self._symbol_search_worker, args=(raw_sym,), daemon=True).start()
             return
-        self.saved_xlim = None 
+        self.saved_xlim = None
+        self._view_is_auto_default = True  # 新查詢時重置為系統預設視角
         tf = self.timeframe_var.get()
         # 【ADR-024】每次查詢遞增序號;舊 worker 發布前會檢查,過期就放棄。
         self._fetch_seq += 1
@@ -3108,6 +3110,7 @@ class StockTradingAppPro(tk.Tk):
             return False
 
         usage_logged = [False]
+        last_err = {'e': None}  # 【ADR-083】共用容器讓 nested _try_seg 與外層迴圈都能存取最後一次異常
 
         def _log_usage_once():
             if usage_logged[0]:
@@ -3127,7 +3130,6 @@ class StockTradingAppPro(tk.Tk):
 
         def _try_seg(s0, s1, n_retries):
             """單一區段:含退避重試。回傳 df 或 None (失敗);session dead 上拋。"""
-            last = None
             for att in range(n_retries + 1):
                 # 【ADR-060】退避等待期間使用者可能已登出/關程式,重試前再確認一次
                 if _should_abort():
@@ -3139,14 +3141,14 @@ class StockTradingAppPro(tk.Tk):
                 except Exception as e:
                     if self._looks_like_session_dead(e):
                         raise
-                    last = e
-            if last is not None:
+                    last_err['e'] = e
+            if last_err['e'] is not None:
                 _log_usage_once()
-                err_str = str(last)
+                err_str = str(last_err['e'])
                 if "ServerError: kbars: request" in err_str:
                     err_brief = "券商該期間尚無資料或商品未上市"
                 else:
-                    err_brief = f"{type(last).__name__}: {err_str[:60]}"
+                    err_brief = f"{type(last_err['e']).__name__}: {err_str[:60]}"
                 self.safe_after(0, self.log_message,
                                 f"【分段下載】{s0:%Y-%m-%d}~{s1:%Y-%m-%d} ({err_brief})。")
             return None
@@ -3169,7 +3171,7 @@ class StockTradingAppPro(tk.Tk):
             n_rows = 0
             part = _try_seg(s0, s1, retries)
             if part is None and (s1 - s0).days > subsplit_days:
-                if last is not None and "ServerError: kbars: request" in str(last):
+                if last_err['e'] is not None and "ServerError: kbars: request" in str(last_err['e']):
                     fail_segs += 1
                     continue
                 self.safe_after(0, self.log_message,
@@ -4170,12 +4172,19 @@ class StockTradingAppPro(tk.Tk):
                             self.last_hover_idx = -1
                         elif prev_len is not None and self.axlist:
                             # 背景補全:歷史K是「往前面加」,positional x 索引整體右移。
-                            # 讀取目前視角並平移相同根數,視覺上完全不動。
+                            # ADR-083:區分「系統預設視角」與「使用者手調視角」:
+                            # - 預設視角(_view_is_auto_default=True):新資料進來時重算視角寬度
+                            # - 手調視角(_view_is_auto_default=False):保留使用者選擇的位置
                             try:
                                 added = len(pub_df) - prev_len
                                 if added > 0:
-                                    x0, x1 = self.axlist[0].get_xlim()
-                                    self.saved_xlim = (x0 + added, x1 + added)
+                                    if self._view_is_auto_default:
+                                        # 使用者還沒手調過,重置 saved_xlim 讓 draw_chart 用實際根數重新計算視角
+                                        self.saved_xlim = None
+                                    else:
+                                        # 使用者已手調過,保留位置平移
+                                        x0, x1 = self.axlist[0].get_xlim()
+                                        self.saved_xlim = (x0 + added, x1 + added)
                             except Exception:
                                 pass
                         if note:
@@ -4690,6 +4699,7 @@ class StockTradingAppPro(tk.Tk):
 
     def on_scroll_zoom(self, event):
         if event.inaxes is None or not self.axlist: return
+        self._view_is_auto_default = False  # 使用者手動縮放,標記為非預設視角
         ax = self.axlist[0]; xmin, xmax = ax.get_xlim(); range_x = xmax - xmin
         factor = 0.85 if event.button == 'up' else 1.15; new_range = range_x * factor
         max_range = len(self.plot_df) + 20
@@ -4818,6 +4828,7 @@ class StockTradingAppPro(tk.Tk):
 
     def on_mouse_move(self, event):
         if self.is_panning and self.press_x_pixel is not None and event.inaxes == self.pan_axes:
+            self._view_is_auto_default = False  # 使用者手動平移,標記為非預設視角
             ax = self.pan_axes; dx_pixel = event.x - self.press_x_pixel
             bbox = ax.get_window_extent(); xmin, xmax = self.press_xlim
             dx_data = (dx_pixel / bbox.width) * (xmax - xmin)
