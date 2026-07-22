@@ -41,6 +41,7 @@ from core import paper_account
 from core import taifex_daily
 from core import market_session
 from core import secure_store
+from core import chukuangren_band
 from data import config_store
 from data import taifex_store
 
@@ -5773,6 +5774,9 @@ class StockTradingAppPro(tk.Tk):
                 rt = self._qt_runtime(s['id'])
                 if s.get('kind') == 'custom':
                     conds = "🐍 自訂 Python (on_bar)"
+                elif s.get('kind') == chukuangren_band.KIND:
+                    conds = (f"🎯 楚狂人之終極波段 (看{strategy_engine.watch_symbol_of(s)},"
+                            f"X={s.get('ck_x', 0):g})")
                 else:
                     conds = "; ".join(strategy_engine.condition_label(c) for c in s.get('entry', [])) or '--'
                 pos = '--'
@@ -5803,7 +5807,12 @@ class StockTradingAppPro(tk.Tk):
                 sym_disp = f"{s.get('symbol','')} ({tt})"
                 sym_name = self._wl_display_name(s.get('symbol','')) if s.get('symbol','') else ''
                 # 【ADR-045】自訂策略的方向由 on_bar 程式碼決定,direction 只是佔位
-                dir_disp = '程式決定' if s.get('kind') == 'custom' else s.get('direction', '')
+                if s.get('kind') == 'custom':
+                    dir_disp = '程式決定'
+                elif s.get('kind') == chukuangren_band.KIND:
+                    dir_disp = '多空自動判斷'
+                else:
+                    dir_disp = s.get('direction', '')
                 prepared.append((s['id'], (s.get('name',''), sym_disp, sym_name, s.get('timeframe',''),
                                             dir_disp, conds, s.get('mode','模擬'), status, running_disp,
                                             rt.get('trades_today', 0), pos, unreal_pnl_str), tag))
@@ -5899,7 +5908,12 @@ class StockTradingAppPro(tk.Tk):
         box = tk.Listbox(dlg, bg="#12161A", fg="white", height=7, font=('微軟正黑體', 10))
         box.pack(fill=tk.X, padx=14)
         for s in enabled:
-            dir_disp = '程式決定' if s.get('kind') == 'custom' else s.get('direction')
+            if s.get('kind') == 'custom':
+                dir_disp = '程式決定'
+            elif s.get('kind') == chukuangren_band.KIND:
+                dir_disp = '多空自動判斷'
+            else:
+                dir_disp = s.get('direction')
             box.insert(tk.END, f"[{s.get('mode')}] {s.get('name')} — {s.get('symbol')} {s.get('timeframe')} {dir_disp} x{s.get('qty')}")
         if live:
             tk.Label(dlg, text=f"⚠ 注意:有 {len(live)} 個「實單」策略,啟動後將自動送出真實委託,無人工確認!",
@@ -5942,7 +5956,7 @@ class StockTradingAppPro(tk.Tk):
         dlg = tk.Toplevel(self)
         dlg.title("新增策略 — 選擇類型")
         dlg.configure(bg="#1A2026")
-        self.center_window(dlg, 460, 200)
+        self.center_window(dlg, 460, 260)
         dlg.transient(self)
         try:
             dlg.lift(); dlg.focus_force(); dlg.grab_set()
@@ -5954,12 +5968,17 @@ class StockTradingAppPro(tk.Tk):
             dlg.destroy(); self._qt_open_editor(None)
         def _custom():
             dlg.destroy(); self._qt_open_custom_editor(None)
+        def _chukuangren():
+            dlg.destroy(); self._qt_open_chukuangren_editor(None)
         tk.Button(dlg, text="🧩 內建條件策略 (下拉選條件,免寫程式)", bg="#29B6F6", fg="black",
                   relief="flat", font=('微軟正黑體', 10, 'bold'), padx=10, pady=6,
                   command=_builtin).pack(fill=tk.X, padx=30, pady=4)
         tk.Button(dlg, text="🐍 自訂 Python 策略 (自己寫 on_bar)", bg="#AB47BC", fg="white",
                   relief="flat", font=('微軟正黑體', 10, 'bold'), padx=10, pady=6,
                   command=_custom).pack(fill=tk.X, padx=30, pady=4)
+        tk.Button(dlg, text="🎯 楚狂人之終極波段 (看大盤,做自選商品)", bg="#FF7043", fg="black",
+                  relief="flat", font=('微軟正黑體', 10, 'bold'), padx=10, pady=6,
+                  command=_chukuangren).pack(fill=tk.X, padx=30, pady=4)
 
     def _qt_edit_strategy(self):
         s = self._qt_selected()
@@ -5971,6 +5990,8 @@ class StockTradingAppPro(tk.Tk):
             self.log_message(f"【自動交易】「{s.get('name')}」為啟動中，進入唯讀檢視模式。若要修改請先停用。")
         if s.get('kind') == 'custom':
             self._qt_open_custom_editor(s, readonly=readonly)
+        elif s.get('kind') == chukuangren_band.KIND:
+            self._qt_open_chukuangren_editor(s, readonly=readonly)
         else:
             self._qt_open_editor(s, readonly=readonly)
 
@@ -5997,6 +6018,11 @@ class StockTradingAppPro(tk.Tk):
             if s.get('kind') == 'custom':
                 if not s.get('source_code') or s.get('qty', 0) <= 0:
                     self.log_message(f"【自動交易】自訂策略「{s.get('name')}」設定不完整,無法啟用。")
+                    return
+            elif s.get('kind') == chukuangren_band.KIND:
+                ok, msg = chukuangren_band.validate(s)
+                if not ok:
+                    self.log_message(f"【自動交易】策略「{s.get('name')}」無法啟用: {msg}")
                     return
             else:
                 ok, msg = strategy_engine.validate_strategy(s)
@@ -6226,33 +6252,66 @@ class StockTradingAppPro(tk.Tk):
                 contract, asset_type = self._qt_resolve(s)
                 if contract is None:
                     raise RuntimeError(f"執行商品(做B)合約解析失敗: {s.get('symbol')}")
-                w_contract, w_asset, w_sym, w_mkt = self._qt_resolve_watch(s)
-                if w_contract is None:
-                    raise RuntimeError(f"訊號來源(看A)合約解析失敗: {strategy_engine.watch_symbol_of(s)}")
-                w_tf = strategy_engine.watch_timeframe_of(s)
-                df = self._qt_fetch_closed_bars(s, w_contract, w_asset, tf=w_tf,
-                                                cache_sym=w_sym, cache_market=w_mkt)
-                if df is None or df.empty:
-                    continue  # 沒資料不算錯誤 (可能休市)
-                # 【ADR-075】看A做B:訊號/指標/停損停利全部看 A (df 就是 A);
-                # 「做B」只發生在下單/記帳那一層。b_exec_price = B 的最新已收盤價,
-                # 當實際成交價;非看A做B (A=B) 時 b_exec_price=None,用 A 自己的價。
-                b_exec_price = None
-                if strategy_engine.watch_enabled(s):
-                    b_df = self._qt_fetch_closed_bars(s, contract, asset_type)
-                    if b_df is None or b_df.empty:
-                        continue  # B 沒有可用價格,先不動作 (可能 B 剛好無資料)
-                    b_exec_price = float(b_df['Close'].iloc[-1])
-                if s.get('kind') == 'custom':
-                    # 【ADR-040】自訂策略:在子行程執行 on_bar (逾時保護),
-                    # 取決策後轉成與內建同格式的 intent → 下游 risk_check/下單完全同路。
-                    # on_bar 看 A 的 df;intent 價用 A 收盤 (停損停利以 A 判定),下單另換 B。
-                    decision = self._run_custom_in_subprocess(s, df, rt.get('state', 'FLAT'), runtime=rt)
-                    # 【ADR-053】反手支援:改用 decision_to_intents,持多遇 SELL 會
-                    # 產生 [平多, 反手開空] 兩個 intent,各自照常過 risk_check 與下單。
-                    intents = custom_strategy.decision_to_intents(decision, s, rt, float(df['Close'].iloc[-1]), str(df.index[-1]))
+
+                if s.get('kind') == chukuangren_band.KIND:
+                    # 【新ADR 楚狂人之終極波段】獨立分派:A固定用日K做突破/停損/停利
+                    # 訊號判斷,5分K做「隔天中午12:00」二次確認;B的執行價同樣在
+                    # 確認當下用5分K取得,不沿用一般看A做B的「B最新收盤K棒」。
+                    w_contract, w_asset, w_sym, w_mkt = self._qt_resolve_watch(s)
+                    if w_contract is None:
+                        raise RuntimeError(f"看盤商品(看A)合約解析失敗: {strategy_engine.watch_symbol_of(s)}")
+                    daily_df = self._qt_fetch_closed_bars(s, w_contract, w_asset, tf='日K',
+                                                          cache_sym=w_sym, cache_market=w_mkt)
+                    if daily_df is None or daily_df.empty:
+                        continue  # 沒資料不算錯誤 (可能休市/剛登入還沒建立快取)
+                    params = chukuangren_band.params_of(s)
+                    chukuangren_band.on_daily_close(params, rt, daily_df)
+                    intents = []
+                    b_exec_price = None
+                    now_dt = datetime.now()
+                    today_key = now_dt.strftime('%Y-%m-%d')
+                    # 隔天中午確認視窗:12:00~12:04 (跟這個策略5分K的邊界評估頻率對齊)
+                    in_noon_window = _forced or (now_dt.hour == 12 and now_dt.minute < 5)
+                    if in_noon_window and (rt.get('pending_entry') or rt.get('pending_exit')) \
+                            and rt.get('last_confirm_date') != today_key:
+                        intraday_df = self._qt_fetch_closed_bars(s, w_contract, w_asset, tf='5分K',
+                                                                 cache_sym=w_sym, cache_market=w_mkt)
+                        if intraday_df is not None and not intraday_df.empty:
+                            confirm_price = float(intraday_df['Close'].iloc[-1])
+                            intents = chukuangren_band.on_noon_check(
+                                params, rt, confirm_price, today_key, qty=int(s.get('qty', 1)))
+                            if intents:
+                                b_intraday_df = self._qt_fetch_closed_bars(s, contract, asset_type, tf='5分K')
+                                if b_intraday_df is not None and not b_intraday_df.empty:
+                                    b_exec_price = float(b_intraday_df['Close'].iloc[-1])
                 else:
-                    intents = strategy_engine.evaluate_strategy(s, rt, df, now_ts, today_str)
+                    w_contract, w_asset, w_sym, w_mkt = self._qt_resolve_watch(s)
+                    if w_contract is None:
+                        raise RuntimeError(f"訊號來源(看A)合約解析失敗: {strategy_engine.watch_symbol_of(s)}")
+                    w_tf = strategy_engine.watch_timeframe_of(s)
+                    df = self._qt_fetch_closed_bars(s, w_contract, w_asset, tf=w_tf,
+                                                    cache_sym=w_sym, cache_market=w_mkt)
+                    if df is None or df.empty:
+                        continue  # 沒資料不算錯誤 (可能休市)
+                    # 【ADR-075】看A做B:訊號/指標/停損停利全部看 A (df 就是 A);
+                    # 「做B」只發生在下單/記帳那一層。b_exec_price = B 的最新已收盤價,
+                    # 當實際成交價;非看A做B (A=B) 時 b_exec_price=None,用 A 自己的價。
+                    b_exec_price = None
+                    if strategy_engine.watch_enabled(s):
+                        b_df = self._qt_fetch_closed_bars(s, contract, asset_type)
+                        if b_df is None or b_df.empty:
+                            continue  # B 沒有可用價格,先不動作 (可能 B 剛好無資料)
+                        b_exec_price = float(b_df['Close'].iloc[-1])
+                    if s.get('kind') == 'custom':
+                        # 【ADR-040】自訂策略:在子行程執行 on_bar (逾時保護),
+                        # 取決策後轉成與內建同格式的 intent → 下游 risk_check/下單完全同路。
+                        # on_bar 看 A 的 df;intent 價用 A 收盤 (停損停利以 A 判定),下單另換 B。
+                        decision = self._run_custom_in_subprocess(s, df, rt.get('state', 'FLAT'), runtime=rt)
+                        # 【ADR-053】反手支援:改用 decision_to_intents,持多遇 SELL 會
+                        # 產生 [平多, 反手開空] 兩個 intent,各自照常過 risk_check 與下單。
+                        intents = custom_strategy.decision_to_intents(decision, s, rt, float(df['Close'].iloc[-1]), str(df.index[-1]))
+                    else:
+                        intents = strategy_engine.evaluate_strategy(s, rt, df, now_ts, today_str)
                 # 【ADR-065】條件函式拋例外時 eval_conditions 只讓那一條算 False,
                 # 不會中斷整組評估,但也不能完全無聲無息——否則「進場/出場條件
                 # 到了卻沒有動作」時,使用者連錯誤訊息都看不到。
@@ -6989,6 +7048,164 @@ class StockTradingAppPro(tk.Tk):
         except Exception as e:
             self.safe_after(0, self.log_message, f"【自訂策略-試跑】❌ 執行失敗: {e}")
             _notify(f"❌ 執行失敗: {e}", False)
+
+    def _qt_open_chukuangren_editor(self, strategy, readonly=False):
+        """【新ADR】「楚狂人之終極波段」專屬編輯器:看加權指數(A)訊號,做自選商品(B),
+        含隔天中午12:00二次確認的進出場/停損/點數移動停利→SMA20移動停利。
+        獨立編輯器 (不沿用 _qt_open_editor 的條件組合UI),因為這個策略的邏輯是
+        寫死的狀態機 (core/chukuangren_band.py),不是 AND/OR 條件拼出來的。"""
+        is_new = strategy is None
+        s = chukuangren_band.default_strategy() if is_new else json.loads(json.dumps(strategy))
+        dlg = tk.Toplevel(self)
+        title_suffix = " (唯讀 - 策略執行中)" if readonly else ""
+        dlg.title("楚狂人之終極波段" + ("" if is_new else f" — {s.get('name')}{title_suffix}"))
+        dlg.configure(bg="#1A2026")
+        self.center_window(dlg, 640, 640)
+        dlg.transient(self)
+        try:
+            dlg.lift(); dlg.focus_force()
+        except Exception:
+            pass
+        tk.Label(dlg, text=("看加權指數走勢決定進出場方向,實際下單另一個你自選的商品 (股票/期貨)。"
+                            "進場/停損/停利訊號一律「隔天中午12:00 (5分K收盤價) 二次確認」才會真正下單，"
+                            "當天觸發只是「待確認」，隔天不成立就作廢、繼續等下一次訊號。"),
+                 bg="#12181F", fg="#FFCA28", font=('微軟正黑體', 9), wraplength=600,
+                 justify='left').pack(fill=tk.X, padx=10, pady=(10, 4))
+
+        def _lbl(p, t): return tk.Label(p, text=t, bg="#1A2026", fg="white", font=('微軟正黑體', 9))
+        def _ent(p, v, w=10):
+            e = tk.Entry(p, width=w, bg="#2A323D", fg="white", justify="center"); e.insert(0, str(v)); return e
+
+        top = tk.Frame(dlg, bg="#1A2026"); top.pack(fill=tk.X, padx=12, pady=2)
+        _lbl(top, "策略名稱").grid(row=0, column=0, sticky='w')
+        e_name = _ent(top, s.get('name', chukuangren_band.STRATEGY_NAME), 20); e_name.grid(row=0, column=1, padx=4, columnspan=2, sticky='w')
+
+        _lbl(top, "執行商品(做B)").grid(row=1, column=0, sticky='w', pady=(8, 0))
+        e_sym = _ent(top, s.get('symbol', ''), 10); e_sym.grid(row=1, column=1, padx=4, pady=(8, 0))
+        _lbl(top, "交易種類").grid(row=1, column=2, sticky='w', padx=(8, 0), pady=(8, 0))
+        cb_tt = ttk.Combobox(top, values=list(strategy_engine.TRADE_TYPES), width=7, state='readonly', style="BlackText.TCombobox")
+        cb_tt.set(strategy_engine.trade_type_of(s)); cb_tt.grid(row=1, column=3, padx=4, pady=(8, 0))
+        _lbl(top, "數量").grid(row=1, column=4, sticky='w', padx=(8, 0), pady=(8, 0))
+        e_qty = _ent(top, s.get('qty', 1), 6); e_qty.grid(row=1, column=5, padx=4, pady=(8, 0))
+        tk.Label(top, text="← 也可直接點左側自選股帶入(自動判斷股票/期貨)", bg="#1A2026",
+                 fg="#8A99AD", font=('微軟正黑體', 8)).grid(row=2, column=0, columnspan=6, sticky='w')
+        lbl_cname = tk.Label(top, text="", bg="#1A2026", fg="#29B6F6", font=('微軟正黑體', 9, 'bold'))
+        lbl_cname.grid(row=3, column=0, columnspan=6, sticky='w', pady=(2, 0))
+        def _clook(*_a):
+            name, ok = self._resolve_strategy_symbol_name(cb_tt.get(), e_sym.get())
+            if ok:
+                lbl_cname.config(text=f"✓ 已確認商品:{name}", fg="#00E676")
+            elif e_sym.get().strip():
+                lbl_cname.config(text="✗ 查無此代碼 (需先登入)", fg="#FF5252")
+            else:
+                lbl_cname.config(text="")
+        e_sym.bind('<KeyRelease>', _clook); e_sym.bind('<FocusOut>', _clook)
+        cb_tt.bind('<<ComboboxSelected>>', _clook)
+        _bt = (dlg, e_sym, cb_tt, _clook, 'B')
+        self._qt_editor_symbol_target = _bt
+        e_sym.bind('<FocusIn>', lambda *_a: setattr(self, '_qt_editor_symbol_target', _bt), add='+')
+
+        _lbl(top, "模式").grid(row=4, column=0, sticky='w', pady=(8, 0))
+        cb_mode = ttk.Combobox(top, values=['模擬', '實單'], width=7, state='readonly', style="BlackText.TCombobox")
+        cb_mode.set(s.get('mode', '模擬')); cb_mode.grid(row=4, column=1, padx=4, pady=(8, 0), sticky='w')
+
+        watch_fr = tk.Frame(dlg, bg="#12181F"); watch_fr.pack(fill=tk.X, padx=12, pady=(8, 4))
+        tk.Label(watch_fr, text="看盤(A) — 固定看指數,決定進出場方向 (不下單)", bg="#12181F",
+                 fg="#29B6F6", font=('微軟正黑體', 9, 'bold')).grid(row=0, column=0, columnspan=4, sticky='w', pady=(4, 2))
+        tk.Label(watch_fr, text="指數代碼", bg="#12181F", fg="white", font=('微軟正黑體', 9)).grid(row=1, column=0, sticky='w', padx=(4, 0))
+        e_wsym = tk.Entry(watch_fr, width=10, bg="#2A323D", fg="white", justify="center")
+        e_wsym.insert(0, s.get('watch_symbol', '') or '^TWII'); e_wsym.grid(row=1, column=1, padx=4)
+        tk.Label(watch_fr, text="(預設加權^TWII,可改櫃買^TWOII等指數;點左側自選股點指數可帶入)",
+                 bg="#12181F", fg="#8A99AD", font=('微軟正黑體', 8)).grid(row=1, column=2, columnspan=2, sticky='w', padx=(6, 0))
+        # 【ADR-077 相容】on_watchlist_select 點自選股帶入時,固定會呼叫 cb_tt_ref.set(tt) ——
+        # 本策略的看A固定是指數,不需要讓使用者改,但仍要給一個真的 Combobox 承接這個呼叫,
+        # 不然點自選股會在 cb_tt_ref.set(tt) 那行拋例外 (被外層 except 悄悄吞掉,但label不會更新)。
+        cb_wtt_a = ttk.Combobox(watch_fr, values=['指數'], width=6, state='readonly', style="BlackText.TCombobox")
+        cb_wtt_a.set('指數')  # 不 grid 顯示,純粹承接 _qt_editor_symbol_target 的 set() 呼叫
+        _at = (dlg, e_wsym, cb_wtt_a, lambda *_a: None, 'A')
+        e_wsym.bind('<FocusIn>', lambda *_a: setattr(self, '_qt_editor_symbol_target', _at), add='+')
+
+        param_fr = tk.Frame(dlg, bg="#1A2026"); param_fr.pack(fill=tk.X, padx=12, pady=(6, 4))
+        tk.Label(param_fr, text="參數 (加權指數點位/點數,依你的判斷自行設定)", bg="#1A2026",
+                 fg="#FFCA28", font=('微軟正黑體', 9, 'bold')).grid(row=0, column=0, columnspan=4, sticky='w', pady=(0, 4))
+        param_entries = {}
+        for i, k in enumerate(chukuangren_band.PARAM_KEYS):
+            r = 1 + i // 2
+            c = (i % 2) * 2
+            _lbl(param_fr, chukuangren_band.PARAM_LABELS[k]).grid(row=r, column=c, sticky='w', pady=2)
+            e = _ent(param_fr, s.get(f'ck_{k}', 0.0), 10)
+            e.grid(row=r, column=c + 1, padx=(4, 16), pady=2, sticky='w')
+            param_entries[k] = e
+
+        def _collect():
+            s['kind'] = chukuangren_band.KIND
+            s['name'] = e_name.get().strip() or chukuangren_band.STRATEGY_NAME
+            s['symbol'] = e_sym.get().strip().upper()
+            s['trade_type'] = cb_tt.get()
+            s['market'] = '台期貨' if cb_tt.get() == '期貨' else '台股'
+            s['direction'] = '做多'  # 佔位:實際多空由訊號動態決定,本欄位對此策略無作用
+            try:
+                s['qty'] = int(e_qty.get().strip())
+            except (TypeError, ValueError):
+                s['qty'] = 0
+            s['mode'] = cb_mode.get()
+            s['watch_enabled'] = True
+            s['watch_symbol'] = e_wsym.get().strip().upper() or '^TWII'
+            s['watch_trade_type'] = '指數'
+            s['watch_timeframe'] = '5分K'
+            for k in chukuangren_band.PARAM_KEYS:
+                try:
+                    s[f'ck_{k}'] = float(param_entries[k].get().strip())
+                except (TypeError, ValueError):
+                    s[f'ck_{k}'] = 0.0
+            s['entry'] = s.get('entry') or []
+            s['exit_signals'] = s.get('exit_signals') or []
+            return s
+
+        lbl_status = tk.Label(dlg, text="", bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 9),
+                              wraplength=600, justify='left', anchor='w')
+        lbl_status.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(0, 4))
+
+        def _set_status(msg, color="#8A99AD"):
+            try:
+                if dlg.winfo_exists():
+                    lbl_status.config(text=msg, fg=color)
+            except Exception:
+                pass
+
+        def _save():
+            strat = _collect()
+            ok, msg = chukuangren_band.validate(strat)
+            if not ok:
+                _set_status(f"✗ 儲存失敗:\n{msg}", "#FF5252")
+                self.log_message(f"【楚狂人之終極波段】儲存失敗: {msg}")
+                return
+            if strat['mode'] == '實單' and is_new:
+                strat['mode'] = '模擬'
+                self.log_message("【自動交易-安全】新策略一律先以「模擬」模式儲存;請先觀察模擬訊號合理後,再編輯改為實單。")
+            if is_new:
+                strat['enabled'] = False
+                self.strategies.append(strat)
+                self.strategy_runtimes[strat['id']] = strategy_engine.new_runtime()
+            else:
+                for i, x in enumerate(self.strategies):
+                    if x['id'] == strat['id']:
+                        self.strategies[i] = strat; break
+            self._qt_save(); self._qt_save_state(); self._qt_refresh_tree()
+            self.log_message(f"【楚狂人之終極波段】「{strat['name']}」已儲存 ({strat['mode']}),已加入「量化交易」分頁清單。")
+            messagebox.showinfo("儲存成功", f"策略「{strat['name']}」已儲存 ({strat['mode']} 模式)。", parent=self)
+            dlg.destroy()
+
+        _clook()
+        foot = tk.Frame(dlg, bg="#1A2026"); foot.pack(side=tk.BOTTOM, pady=8)
+        if readonly:
+            tk.Button(foot, text="唯讀無法儲存", bg="#2A323D", fg="#8A99AD", relief="flat", state=tk.DISABLED,
+                      font=('微軟正黑體', 11, 'bold'), padx=18, pady=4).pack(side=tk.LEFT, padx=6)
+        else:
+            tk.Button(foot, text="儲存策略", bg="#29B6F6", fg="black", relief="flat",
+                      font=('微軟正黑體', 11, 'bold'), padx=18, pady=4, command=_save).pack(side=tk.LEFT, padx=6)
+        tk.Button(foot, text="關閉" if readonly else "取消", bg="#2A323D", fg="white", relief="flat",
+                  font=('微軟正黑體', 11), padx=18, pady=4, command=dlg.destroy).pack(side=tk.LEFT, padx=6)
 
     def _qt_build_watch_panel(self, parent, s):
         """【ADR-074】建立「看A做B」設定面板 (內建/自訂策略編輯器共用)。
@@ -8044,6 +8261,13 @@ class StockTradingAppPro(tk.Tk):
             if not s.get('source_code') or s.get('qty', 0) <= 0:
                 self.log_message(f"【回測】自訂策略「{s.get('name')}」設定不完整,無法回測。")
                 return
+        elif s.get('kind') == chukuangren_band.KIND:
+            # 【新ADR】v1 尚未支援回測/最佳化:隔天中午12點二次確認的雙時間週期
+            # (日K訊號 + 5分K確認) 狀態機無法套進現有單一 df 的回測迴圈,需要
+            # 另外設計才能支援;先誠實告知,只支援模擬/實單監控。
+            self.log_message(f"【回測】「{s.get('name')}」(楚狂人之終極波段) 目前尚未支援回測/最佳化,"
+                             "僅支援模擬/實單監控 (雙時間週期的狀態機需要另外設計回測邏輯)。")
+            return
         else:
             ok, msg = strategy_engine.validate_strategy(s)
             if not ok:
@@ -8095,7 +8319,9 @@ class StockTradingAppPro(tk.Tk):
             vars_sel[st['id']] = v
             kind = ('長抱' if st.get('bnh_mode') == 'single' else
                     '加碼' if st.get('bnh_mode') == 'accumulate' else
-                    '定期定額') if st.get('buy_and_hold') else ('自訂' if st.get('kind') == 'custom' else '條件')
+                    '定期定額') if st.get('buy_and_hold') else (
+                    '自訂' if st.get('kind') == 'custom' else
+                    '楚狂人(不支援回測)' if st.get('kind') == chukuangren_band.KIND else '條件')
             tk.Checkbutton(chk_frame, variable=v, bg="#12161A", fg="#E6EDF3", selectcolor="#2A323D",
                            font=('微軟正黑體', 9), activebackground="#12161A",
                            text=f"{st.get('name','')}  [{st.get('symbol','')} {st.get('timeframe','')} / {kind}]"
@@ -8227,7 +8453,12 @@ class StockTradingAppPro(tk.Tk):
                 mode = ('單筆長抱' if st.get('bnh_mode') == 'single' else
                         '累積加碼' if st.get('bnh_mode') == 'accumulate' else
                         '定期定額') if st.get('buy_and_hold') else (
-                        '自訂Python' if st.get('kind') == 'custom' else '條件策略')
+                        '自訂Python' if st.get('kind') == 'custom' else
+                        '楚狂人波段' if st.get('kind') == chukuangren_band.KIND else '條件策略')
+                if st.get('kind') == chukuangren_band.KIND:
+                    rows.append({'name': st.get('name'), 'mode': mode, 'ok': False,
+                                 'err': '尚未支援回測 (僅支援模擬/實單監控)'})
+                    continue
                 status_cb(f"⏳ ({i}/{len(strats)}) 回測「{st.get('name')}」...{warn}", "#FFCA28")
                 try:
                     df = self._qt_prepare_df(st, start_dt, end_dt, session_basis)
