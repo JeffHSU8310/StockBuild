@@ -23,8 +23,34 @@ core.market_session — 台股 / 台期貨「交易時段」判斷 (單一真相
 from datetime import datetime, timedelta
 
 # 時刻以「當日 0 點起算的分鐘數」表示,邊界比較才不會被 time 物件比較搞混。
-STOCK_OPEN_MIN = 9 * 60          # 09:00
+STOCK_OPEN_MIN = 9 * 60          # 09:00 (整股)
 STOCK_CLOSE_MIN = 13 * 60 + 30   # 13:30
+
+# 【ADR-072】盤中零股開盤時刻「可設定」,預設 09:10 (現制);未來交易所改成
+# 09:00 時,使用者自己在設定切一下即可,不必改程式。收盤與整股同為 13:30。
+# 這是模組層級的「可變設定」,由 GUI 讀持久化設定後呼叫 set_odd_lot_open_minute()
+# 覆寫;純函式本身仍可離線測試 (測試會顯式帶入 dt,不依賴這個全域值的預設)。
+ODD_LOT_OPEN_MIN = 9 * 60 + 10   # 09:10 (預設)
+
+
+def set_odd_lot_open_minute(minute):
+    """設定盤中零股開盤時刻 (0 點起算的分鐘數)。GUI 載入使用者設定後呼叫。"""
+    global ODD_LOT_OPEN_MIN
+    try:
+        m = int(minute)
+        if 0 <= m < 24 * 60:
+            ODD_LOT_OPEN_MIN = m
+    except (TypeError, ValueError):
+        pass
+
+
+def set_odd_lot_open_hhmm(hhmm):
+    """以 'HH:MM' 字串設定盤中零股開盤時刻;格式不對就不動作。"""
+    try:
+        parts = str(hhmm).strip().split(':')
+        set_odd_lot_open_minute(int(parts[0]) * 60 + int(parts[1]))
+    except (TypeError, ValueError, IndexError):
+        pass
 
 FUT_DAY_OPEN_MIN = 8 * 60 + 45   # 08:45
 FUT_DAY_CLOSE_MIN = 13 * 60 + 45 # 13:45
@@ -52,13 +78,25 @@ def _is_holiday(dt):
 
 
 def is_stock_open(dt=None):
-    """台股 (股票/零股) 是否在盤中。週一~週五 09:00~13:30。"""
+    """台股整股是否在盤中。週一~週五 09:00~13:30。"""
     if dt is None:
         dt = datetime.now()
     if _is_holiday(dt) or not _is_weekday(dt):
         return False
     m = _minutes(dt)
     return STOCK_OPEN_MIN <= m <= STOCK_CLOSE_MIN
+
+
+def is_odd_lot_open(dt=None, open_minute=None):
+    """盤中零股是否在盤中。週一~週五,開盤 = ODD_LOT_OPEN_MIN (預設 09:10,可設定)
+    ~ 13:30。open_minute 顯式帶入時優先 (方便單元測試固定邊界)。"""
+    if dt is None:
+        dt = datetime.now()
+    if _is_holiday(dt) or not _is_weekday(dt):
+        return False
+    m = _minutes(dt)
+    o = ODD_LOT_OPEN_MIN if open_minute is None else int(open_minute)
+    return o <= m <= STOCK_CLOSE_MIN
 
 
 def is_futures_day_open(dt=None):
@@ -106,7 +144,9 @@ def is_market_open(trade_type, dt=None, include_night=True):
     trade_type: '股票'/'零股' → 台股;'期貨' → 台期貨 (含/不含夜盤看 include_night)。
     未知種類保守回 False (寧可不動作,也不要在不確定時亂送單)。
     """
-    if trade_type in ('股票', '零股'):
+    if trade_type == '零股':
+        return is_odd_lot_open(dt)
+    if trade_type == '股票':
         return is_stock_open(dt)
     if trade_type == '期貨':
         return is_futures_open(dt, include_night=include_night)
@@ -117,7 +157,9 @@ def session_label(trade_type, dt=None, include_night=True):
     """回傳目前所屬盤別的中文標籤 (給日誌用);休市回 '休市'。"""
     if dt is None:
         dt = datetime.now()
-    if trade_type in ('股票', '零股'):
+    if trade_type == '零股':
+        return '零股盤中' if is_odd_lot_open(dt) else '休市'
+    if trade_type == '股票':
         return '台股盤中' if is_stock_open(dt) else '休市'
     if trade_type == '期貨':
         if is_futures_day_open(dt):

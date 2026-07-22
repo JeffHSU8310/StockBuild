@@ -165,3 +165,39 @@ def save_ai_config(path: str, api_key: str, model: str):
     with open(path, 'w', encoding='utf-8') as f:
         json.dump({'api_key': str(api_key or ''), 'model': str(model or '')},
                   f, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# 【ADR-072】一般 App 設定 (通用鍵值,例如盤中零股開盤時刻、自動重連/自動登入
+# 偏好等)。用一份 JSON 存放,讀不到/壞掉一律回傳預設,絕不因設定檔壞掉就當掉。
+# ---------------------------------------------------------------------------
+DEFAULT_APP_SETTINGS = {
+    'odd_lot_open': '09:10',       # 盤中零股開盤時刻 (現制 09:10;未來改 09:00 自己切)
+    'auto_reconnect': False,       # 斷線自動重連開關 (記憶體憑證)
+    'remember_creds': False,       # 記住憑證並開機自動登入 (加密存本機)
+}
+
+
+def load_app_settings(path: str) -> dict:
+    settings = dict(DEFAULT_APP_SETTINGS)
+    if os.path.exists(path):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                saved = json.load(f)
+            if isinstance(saved, dict):
+                for k in DEFAULT_APP_SETTINGS:
+                    if k in saved:
+                        settings[k] = saved[k]
+        except Exception:
+            pass
+    return settings
+
+
+def save_app_settings(path: str, settings: dict):
+    try:
+        merged = dict(DEFAULT_APP_SETTINGS)
+        merged.update({k: settings[k] for k in settings if k in DEFAULT_APP_SETTINGS})
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(merged, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass

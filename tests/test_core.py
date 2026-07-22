@@ -2569,6 +2569,26 @@ class TestMarketSession(unittest.TestCase):
         # 週一凌晨不屬任何夜盤 (前一天週日沒開)
         self.assertFalse(market_session.is_futures_night_open(self._dt(2026, 7, 13, 3, 0)))
 
+    def test_odd_lot_open_default_0910(self):
+        # 預設盤中零股 09:10 才開:09:00 整股開、零股還沒開;09:10 零股才開
+        self.assertTrue(market_session.is_stock_open(self._dt(2026, 7, 13, 9, 0)))
+        self.assertFalse(market_session.is_odd_lot_open(self._dt(2026, 7, 13, 9, 0)))
+        self.assertFalse(market_session.is_odd_lot_open(self._dt(2026, 7, 13, 9, 9)))
+        self.assertTrue(market_session.is_odd_lot_open(self._dt(2026, 7, 13, 9, 10)))
+        self.assertTrue(market_session.is_odd_lot_open(self._dt(2026, 7, 13, 13, 30)))
+        self.assertFalse(market_session.is_odd_lot_open(self._dt(2026, 7, 13, 13, 31)))
+
+    def test_odd_lot_open_configurable(self):
+        # 顯式帶入 09:00 → 零股 09:00 就開 (未來交易所改制的情境)
+        self.assertTrue(market_session.is_odd_lot_open(self._dt(2026, 7, 13, 9, 0), open_minute=9 * 60))
+        # set_odd_lot_open_hhmm 改全域預設,再改回來不影響其他測試
+        try:
+            market_session.set_odd_lot_open_hhmm('09:00')
+            self.assertTrue(market_session.is_odd_lot_open(self._dt(2026, 7, 13, 9, 0)))
+        finally:
+            market_session.set_odd_lot_open_minute(9 * 60 + 10)
+        self.assertFalse(market_session.is_odd_lot_open(self._dt(2026, 7, 13, 9, 0)))
+
     def test_is_market_open_dispatch(self):
         day = self._dt(2026, 7, 13, 10, 0)   # 週一上午:兩市場都開
         self.assertTrue(market_session.is_market_open('股票', day))

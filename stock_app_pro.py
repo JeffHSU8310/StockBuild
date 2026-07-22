@@ -213,6 +213,13 @@ class StockTradingAppPro(tk.Tk):
         
         self.config_file = app_path("broker_config.json")
         self.wl_file = app_path("watchlists.json")
+        # 【ADR-072】一般 App 設定 (零股開盤時刻、自動重連/自動登入偏好)。
+        self.app_settings_file = app_path("app_settings.json")
+        self.app_settings = config_store.load_app_settings(self.app_settings_file)
+        # 套用盤中零股開盤時刻到 market_session (預設 09:10,可設定)。
+        market_session.set_odd_lot_open_hhmm(self.app_settings.get('odd_lot_open', '09:10'))
+        # 【ADR-071/073】加密憑證存放檔 (只在勾選「記住憑證」時才會有內容)。
+        self.secure_creds_file = app_path("broker_secure.json")
         # 【第十二輪修正】登入進行中旗標:防止使用者在「畫面看起來沒反應」時
         # 誤以為沒點到而連續點擊,同時觸發第二個 process_broker_login 背景執行緒
         # 去搶同一組 shioaji 資源——這只會讓 GIL 爭用更嚴重、凍結更久 (見下方
@@ -859,12 +866,23 @@ class StockTradingAppPro(tk.Tk):
         # 【ADR-071】斷線自動重連開關:勾選後,偵測到券商連線中斷會自動用「本次
         # 登入時輸入的憑證」在背景重試登入 (退避間隔),交易時段內尤其重要,讓
         # 「早上開一次、整天不用管」成立。憑證密碼只留在記憶體、不寫進磁碟。
-        self.auto_reconnect_var = tk.BooleanVar(value=False)
+        # 開關的初始值從 app_settings 還原 (上次勾選的偏好會被記住)。
+        self.auto_reconnect_var = tk.BooleanVar(value=bool(self.app_settings.get('auto_reconnect', False)))
         self.chk_auto_reconnect = tk.Checkbutton(
             market_panel, text="🔄 斷線自動重連", variable=self.auto_reconnect_var,
-            bg="#0D1115", fg="#8A99AD", selectcolor="#2A323D", activebackground="#0D1115",
+            bg="#0D1115", fg=("#00E676" if self.auto_reconnect_var.get() else "#8A99AD"),
+            selectcolor="#2A323D", activebackground="#0D1115",
             font=('微軟正黑體', 9), command=self._on_auto_reconnect_toggle)
         self.chk_auto_reconnect.pack(side=tk.RIGHT, padx=5, pady=5)
+        # 【ADR-072】盤中零股開盤時刻選擇 (預設 09:10;未來交易所改 09:00 自己切)。
+        tk.Label(market_panel, text="零股開盤", bg="#0D1115", fg="#8A99AD",
+                 font=('微軟正黑體', 9)).pack(side=tk.RIGHT, padx=(8, 2), pady=5)
+        self.odd_open_var = tk.StringVar(value=self.app_settings.get('odd_lot_open', '09:10'))
+        self.cb_odd_open = ttk.Combobox(market_panel, values=['09:10', '09:00'], width=6,
+                                        state='readonly', style="BlackText.TCombobox",
+                                        textvariable=self.odd_open_var)
+        self.cb_odd_open.pack(side=tk.RIGHT, padx=(0, 4), pady=5)
+        self.cb_odd_open.bind('<<ComboboxSelected>>', self._on_odd_open_changed)
 
         self.lbl_twii = tk.Label(market_panel, text="加權指數: 等待連線API...", bg="#0D1115", fg="#FFCA28", font=('微軟正黑體', 10, 'bold'), cursor="hand2")
         self.lbl_twii.pack(side=tk.LEFT, padx=15, pady=5)
@@ -1420,6 +1438,26 @@ class StockTradingAppPro(tk.Tk):
         except Exception:
             pass
 
+    def _save_app_settings(self):
+        """【ADR-072】把目前的 App 設定寫回持久化檔 (零股開盤時刻、自動重連等)。"""
+        try:
+            self.app_settings['odd_lot_open'] = self.odd_open_var.get()
+            self.app_settings['auto_reconnect'] = bool(self.auto_reconnect_var.get())
+            if getattr(self, 'remember_creds_var', None) is not None:
+                self.app_settings['remember_creds'] = bool(self.remember_creds_var.get())
+            config_store.save_app_settings(self.app_settings_file, self.app_settings)
+        except Exception:
+            pass
+
+    def _on_odd_open_changed(self, event=None):
+        """【ADR-072】使用者切換盤中零股開盤時刻:即時套用到 market_session 並存檔。"""
+        hhmm = self.odd_open_var.get()
+        market_session.set_odd_lot_open_hhmm(hhmm)
+        self._save_app_settings()
+        self.log_message(f"【設定】盤中零股開盤時刻已設為 {hhmm}"
+                         f"{'(現制)' if hhmm == '09:10' else '(未來改制)'};"
+                         "自動交易的零股策略會依此判斷開盤與否。")
+
     def _on_auto_reconnect_toggle(self):
         """【ADR-071】使用者切換「斷線自動重連」開關時的提示與狀態更新。"""
         on = bool(self.auto_reconnect_var.get())
@@ -1427,6 +1465,7 @@ class StockTradingAppPro(tk.Tk):
             self.chk_auto_reconnect.config(fg="#00E676" if on else "#8A99AD")
         except Exception:
             pass
+        self._save_app_settings()
         if on:
             if not self._login_creds_mem:
                 self.log_message("【自動重連】已開啟,但目前尚未登入 (或本次尚未輸入憑證);"
