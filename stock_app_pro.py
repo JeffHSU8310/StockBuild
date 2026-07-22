@@ -4077,17 +4077,23 @@ class StockTradingAppPro(tk.Tk):
             #   使用者看到的視窗不會跳動。
             _pub_state = {'n': None}  # 【ADR-049】上次實際發布的K棒根數 (含期交所延伸)
 
-            def _publish(pub_df, full_ui=True, prev_len=None, note=""):
+            def _publish(pub_df, full_ui=True, prev_len=None, note="", extend=True):
                 if seq is not None and seq != self._fetch_seq:
                     return False  # 已有更新的查詢,放棄發布
-                # 【ADR-049】期貨 R1 連續合約的日/周/月K,用期交所官方日行情往前
-                # 延伸更長歷史 (只補 shioaji 涵蓋不到的更早日期,重疊處 shioaji 權威)。
-                # 放在 _publish 統一入口:快取/快速段/完整段三條路徑都同樣延伸,
-                # prev_len 平移邏輯不受影響 (兩次發布延伸的根數相同,差值仍正確)。
-                if self.asset_type == "future" and tf in ("日K", "周K", "月K"):
-                    pub_df = self._extend_with_taifex(pub_df, tf)
-                elif self.asset_type == "stock" and tf in ("日K", "周K", "月K"):
-                    pub_df = self._extend_with_yahoo(pub_df, tf, sym=search_sym)
+                # 【ADR-078 修正 ADR-068/069 的迴歸】期貨 R1 連續合約/股票的日/周/月K,
+                # 用期交所官方日行情/yahoo 往前延伸更長歷史。這一步以前是「快取/快速段/
+                # 完整段三條路徑都跑」,結果快速段 (本來只想先出「近 7 天」搶快) 也被
+                # 硬塞進上千~上萬根的完整歷史 (yahoo 20年/期交所全series),延伸+渲染
+                # 都要 900~1700ms,快速段完全沒有比較快 (使用者回報「切換還是很慢」
+                # 的直接原因)。改成 extend 參數:預設 True (快取段/完整段仍延伸,這兩
+                # 條路可能是「唯一一次出圖」,必須有完整歷史);快速段呼叫時傳
+                # extend=False,只出「這一小段的原始 K 棒」,真正做到秒開,完整歷史
+                # 由緊接著的背景完整段補上 (使用者感覺不到差異,因為完整段幾秒後就到)。
+                if extend:
+                    if self.asset_type == "future" and tf in ("日K", "周K", "月K"):
+                        pub_df = self._extend_with_taifex(pub_df, tf)
+                    elif self.asset_type == "stock" and tf in ("日K", "周K", "月K"):
+                        pub_df = self._extend_with_yahoo(pub_df, tf, sym=search_sym)
                 pub_df = pub_df.dropna(subset=['Open', 'High', 'Low', 'Close'])
                 if pub_df.empty:
                     return False
@@ -4192,11 +4198,16 @@ class StockTradingAppPro(tk.Tk):
                 # 馬上可看可 hover,完整歷史在同一背景執行緒接著補全 (補完就地換圖,
                 # 視角不動)。
                 #   ADR-068:股票的「分K」加入快速段 (原本只有期貨/指數有)。
-                #   ADR-069:股票的「日/周/月K」也加入。日K以上原本沒快速段、又抓
-                #     365 天 1 分 K 回來重採樣 (~15 秒),是日K切換慢的主因;其實深
-                #     歷史是 _publish 裡的 yahoo/期交所延伸補的,shioaji 只要供最近
-                #     幾根,故用很小的 QUICK_DAYS 就能搶先出「完整」日K圖。代價是
-                #     快速段+完整段各跑一次 yahoo 延伸,但第二次在背景、不擋出圖。
+                #   ADR-069:股票的「日/周/月K」也加入。
+                #   【ADR-078 修正】ADR-069 以為「快速段+完整段各跑一次 yahoo/期交所
+                #     延伸,第二次在背景、不擋出圖」沒關係,但漏算了:_publish 對
+                #     日/周/月K 一律做延伸,快速段的 7 天小窗立刻被灌回幾千~上萬根
+                #     的完整歷史 (yahoo 20年/期交所全series),延伸+matplotlib 渲染
+                #     都要 900~1700ms——快速段完全沒有比較快 (使用者實測:切換還是
+                #     很慢,日誌顯示「搶先出圖」那次繪圖渲染就有 6900+ 根K棒)。
+                #     改成呼叫 _publish(..., extend=False):快速段只出「這一小段的
+                #     原始K棒」(通常幾十~兩百根,渲染近乎瞬間),完整歷史由緊接著
+                #     的背景完整段補上 (那段仍 extend=True)。
                 quick_len = None
                 want_quick = self.asset_type in ("future", "index_tw", "stock")
                 if (not published_from_cache) and want_quick and tf in self.QUICK_DAYS:
@@ -4207,7 +4218,7 @@ class StockTradingAppPro(tk.Tk):
                         quick_raw = self._download_kbars_raw(contract, q_start, end_dt)
                         if quick_raw is not None and not quick_raw.empty:
                             df_quick = self._resample_sj_df(quick_raw, tf)
-                            if _publish(df_quick, full_ui=True):
+                            if _publish(df_quick, full_ui=True, extend=False):
                                 quick_len = _pub_state['n']  # 【ADR-049】含延伸的實際發布根數
                                 self.safe_after(0, self.log_message, f"⚡ 已搶先出圖 (近 {q_days} 天,可開始看盤/hover),耗時 {time.time()-_t0:.1f} 秒;完整歷史背景補全中...")
                     except Exception as e:
