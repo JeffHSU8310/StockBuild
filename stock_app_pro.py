@@ -2041,8 +2041,8 @@ class StockTradingAppPro(tk.Tk):
                   command=dlg.destroy).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
 
     # ================= 【ADR-057】量化交易面板 (分頁精簡版 + 獨立視窗完整版) =================
-    QT_COLS = ("name", "symbol", "tf", "direction", "conds", "mode", "status", "running", "today", "pos", "unreal")
-    QT_HEADINGS = {"name": "策略名稱", "symbol": "商品", "tf": "週期", "direction": "方向",
+    QT_COLS = ("name", "symbol", "symbol_name", "tf", "direction", "conds", "mode", "status", "running", "today", "pos", "unreal")
+    QT_HEADINGS = {"name": "策略名稱", "symbol": "商品代號", "symbol_name": "商品名稱", "tf": "週期", "direction": "方向",
                    "conds": "進場條件", "mode": "模式", "status": "狀態", "running": "運轉狀態",
                    "today": "今日次數", "pos": "持倉", "unreal": "未實現損益"}
 
@@ -2111,9 +2111,9 @@ class StockTradingAppPro(tk.Tk):
         tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=4, pady=2)
         tree = ttk.Treeview(tree_frame, columns=self.QT_COLS, show="headings",
                             height=tree_height, style='Trades.Treeview')
-        widths = ({"name": 110, "symbol": 70, "tf": 55, "direction": 50, "conds": 240,
+        widths = ({"name": 110, "symbol": 70, "symbol_name": 100, "tf": 55, "direction": 50, "conds": 240,
                    "mode": 50, "status": 70, "running": 80, "today": 65, "pos": 90, "unreal": 75} if compact else
-                  {"name": 180, "symbol": 120, "tf": 70, "direction": 80, "conds": 460,
+                  {"name": 180, "symbol": 120, "symbol_name": 150, "tf": 70, "direction": 80, "conds": 460,
                    "mode": 70, "status": 80, "running": 100, "today": 80, "pos": 140, "unreal": 90})
         for c in self.QT_COLS:
             tree.heading(c, text=self.QT_HEADINGS[c])
@@ -2645,95 +2645,7 @@ class StockTradingAppPro(tk.Tk):
             return 3
         return 1
 
-    def _taifex_load_hist(self, tx_id, session='all', month_rank=1):
-        """讀取某期交所商品/盤別/連續月份的本地日K (經記憶體快取)。沒匯入過回傳空 df。
-        【ADR-058/ADR-081】快取 key 加上盤別與連續月份等級 (R1/R2)。
-        """
-        rank = int(month_rank)
-        key = (tx_id, str(session), rank)
-        hist = self._taifex_mem_cache.get(key)
-        if hist is None:
-            path = taifex_store.store_path(self.TAIFEX_BASE_DIR, tx_id, session=session, month_rank=rank)
-            hist = taifex_store.load_daily(self.TAIFEX_BASE_DIR, tx_id, session=session, month_rank=rank)
-            self._taifex_mem_cache[key] = hist
-            sess_txt = '只用日盤' if session == 'day' else '近全'
-            rank_txt = f"R{rank}" if rank > 1 else "R1近月"
-            if hist is None or hist.empty:
-                self.safe_after(0, self.log_message,
-                                f"【期交所歷史】✗ 找不到 {tx_id} ({rank_txt},{sess_txt}) 的本地資料。"
-                                f"我找的路徑是:{path} —— 請確認檔案就在這裡 "
-                                f"(用「📥 期交所歷史」匯入會自動存到正確位置)。")
-            else:
-                self.safe_after(0, self.log_message,
-                                f"【期交所歷史】✓ 已讀取 {tx_id} ({rank_txt},{sess_txt}) {len(hist):,} 根,"
-                                f"涵蓋 {hist.index[0]:%Y-%m-%d} ~ {hist.index[-1]:%Y-%m-%d}。"
-                                f"(檔案:{path})")
-        return hist
 
-    def show_taifex_status(self):
-        """【ADR-060/ADR-081】一次列出所有期交所商品的本地資料狀態 (含 R1 近月與 R2 次月連續)。"""
-        lines = [f"期交所歷史資料夾:{os.path.join(self.TAIFEX_BASE_DIR, taifex_store.SUBDIR)}", ""]
-        any_found = False
-        for tx_id in sorted(set(taifex_daily.PRODUCT_MAP.values())):
-            for rank, rlabel in ((1, 'R1近月'), (2, 'R2次月')):
-                for sess, label in (('all', '近全'), ('day', '日盤')):
-                    path = taifex_store.store_path(self.TAIFEX_BASE_DIR, tx_id, session=sess, month_rank=rank)
-                    if os.path.exists(path):
-                        df = taifex_store.load_daily(self.TAIFEX_BASE_DIR, tx_id, session=sess, month_rank=rank)
-                        if df is not None and not df.empty:
-                            any_found = True
-                            lines.append(f"✓ {tx_id} {rlabel} ({label}):{len(df):,} 根,"
-                                         f"{df.index[0]:%Y-%m-%d} ~ {df.index[-1]:%Y-%m-%d}")
-                        else:
-                            lines.append(f"⚠ {tx_id} {rlabel} ({label}):檔案存在但讀不出內容 → {path}")
-                    else:
-                        lines.append(f"✗ {tx_id} {rlabel} ({label}):無檔案 → {os.path.basename(path)}")
-        if not any_found:
-            lines += ["", "目前一份都沒有。請按「📥 期交所歷史」下載或匯入,",
-                      "系統會自動存到上面那個資料夾 (不需要你手動搬檔案)。"]
-        else:
-            lines += ["", "回測/最佳化時,只要期交所資料涵蓋了你選的期間,",
-                      "就會完全略過券商下載 (日誌會出現「完全略過券商下載」)。",
-                      "只有「只用日盤」那份存在,才能在回測選「只用日盤」口徑。"]
-        msg = "\n".join(lines)
-        for ln in lines:
-            if ln.strip():
-                self.log_message(f"【期交所狀態】{ln}")
-        messagebox.showinfo("期交所歷史資料狀態", msg, parent=self)
-
-    def _taifex_prod_of(self, contract):
-        if not contract:
-            return None
-        sym = getattr(contract, 'symbol', '') or getattr(contract, 'code', '') or ''
-        return taifex_daily.PRODUCT_MAP.get(fut_catalog.product_code(sym))
-
-    def _taifex_plan_download(self, contract, asset_type, tf, start_dt, end_dt, session='all', tag="回測"):
-        """【ADR-060/ADR-081】主圖與回測通用:判斷這段歷史是否「已經被期交所本地資料完整涵蓋」。"""
-        try:
-            if asset_type != "future" or tf not in ("日K", "周K", "月K"):
-                return start_dt, end_dt, ""
-            tx_id = self._taifex_prod_of(contract)
-            if not tx_id:
-                return start_dt, end_dt, ""
-            rank = self._month_rank_of(contract)
-            hist = self._taifex_load_hist(tx_id, session=session, month_rank=rank)
-            if (hist is None or hist.empty) and session == 'day':
-                hist = self._taifex_load_hist(tx_id, session='all', month_rank=rank)
-            if hist is None or hist.empty:
-                return start_dt, end_dt, ""
-            covered_until, need_from = taifex_daily.split_coverage(hist, start_dt, end_dt)
-            if need_from is None:
-                return None, None, (f"期交所本地歷史已完整涵蓋 {start_dt:%Y-%m-%d}~{end_dt:%Y-%m-%d},"
-                                    f"完全略過券商下載 (不會再被流量管制擋)。")
-            if pd.Timestamp(need_from) > pd.Timestamp(start_dt):
-                days_saved = (pd.Timestamp(need_from) - pd.Timestamp(start_dt)).days
-                return need_from, end_dt, (f"期交所本地歷史已涵蓋到 {covered_until:%Y-%m-%d},"
-                                           f"券商只需補 {need_from:%Y-%m-%d} 之後 "
-                                           f"(省下約 {days_saved} 天、大幅降低被流量管制的機會)。")
-            return start_dt, end_dt, ""
-        except Exception as e:
-            self.safe_after(0, self.log_message, f"【{tag}下載】期交所涵蓋判斷失敗,改為全段下載: {e}")
-            return start_dt, end_dt, ""
 
     def _wl_ensure_stream_subs(self):
         """【第十六輪 第2項】確保目前群組的期貨/指數都已訂閱 tick 串流。
@@ -3377,53 +3289,49 @@ class StockTradingAppPro(tk.Tk):
     TAIFEX_PROD_LABELS = {'TX': '臺股期貨 TX', 'MTX': '小型臺指 MTX', 'TMF': '微型臺指 TMF',
                           'TE': '電子期貨 TE', 'TF': '金融期貨 TF'}
 
-    def _taifex_load_hist(self, tx_id, session='all'):
-        """讀取某期交所商品/盤別的本地日K (經記憶體快取)。沒匯入過回傳空 df。
-        【ADR-058】快取 key 加上盤別,近全與只取日盤是兩份獨立資料。
-
-        【ADR-060】「有沒有讀到期交所資料」必須看得見。
-        使用者最大的困惑是:明明匯入過,系統卻照樣狂發分段下載,而且完全
-        沒有任何訊息說明為什麼 —— 因為 load_daily 找不到檔案就安靜回傳空表。
-        現在每個 (商品, 盤別) 第一次查詢時一定寫一行日誌,講清楚:
-        讀到了幾根、涵蓋到哪、或者「找不到,我找的是這個完整路徑」。
+    def _taifex_load_hist(self, tx_id, session='all', month_rank=1):
+        """讀取某期交所商品/盤別/連續月份的本地日K (經記憶體快取)。沒匯入過回傳空 df。
+        【ADR-058/ADR-081】快取 key 加上盤別與連續月份等級 (R1/R2)。
         """
-        key = (tx_id, str(session))
+        rank = int(month_rank)
+        key = (tx_id, str(session), rank)
         hist = self._taifex_mem_cache.get(key)
         if hist is None:
-            path = taifex_store.store_path(self.TAIFEX_BASE_DIR, tx_id, session=session)
-            hist = taifex_store.load_daily(self.TAIFEX_BASE_DIR, tx_id, session=session)
+            path = taifex_store.store_path(self.TAIFEX_BASE_DIR, tx_id, session=session, month_rank=rank)
+            hist = taifex_store.load_daily(self.TAIFEX_BASE_DIR, tx_id, session=session, month_rank=rank)
             self._taifex_mem_cache[key] = hist
             sess_txt = '只用日盤' if session == 'day' else '近全'
+            rank_txt = f"R{rank}" if rank > 1 else "R1近月"
             if hist is None or hist.empty:
                 self.safe_after(0, self.log_message,
-                                f"【期交所歷史】✗ 找不到 {tx_id} ({sess_txt}) 的本地資料。"
+                                f"【期交所歷史】✗ 找不到 {tx_id} ({rank_txt},{sess_txt}) 的本地資料。"
                                 f"我找的路徑是:{path} —— 請確認檔案就在這裡 "
                                 f"(用「📥 期交所歷史」匯入會自動存到正確位置)。")
             else:
                 self.safe_after(0, self.log_message,
-                                f"【期交所歷史】✓ 已讀取 {tx_id} ({sess_txt}) {len(hist):,} 根,"
+                                f"【期交所歷史】✓ 已讀取 {tx_id} ({rank_txt},{sess_txt}) {len(hist):,} 根,"
                                 f"涵蓋 {hist.index[0]:%Y-%m-%d} ~ {hist.index[-1]:%Y-%m-%d}。"
                                 f"(檔案:{path})")
         return hist
 
     def show_taifex_status(self):
-        """【ADR-060】一次列出所有期交所商品的本地資料狀態 —— 使用者要能直接
-        回答「到底有沒有讀到、放對地方了沒」,不必自己翻資料夾猜。"""
+        """【ADR-060/ADR-081】一次列出所有期交所商品的本地資料狀態 (含 R1 近月與 R2 次月連續)。"""
         lines = [f"期交所歷史資料夾:{os.path.join(self.TAIFEX_BASE_DIR, taifex_store.SUBDIR)}", ""]
         any_found = False
         for tx_id in sorted(set(taifex_daily.PRODUCT_MAP.values())):
-            for sess, label in (('all', '近全'), ('day', '日盤')):
-                path = taifex_store.store_path(self.TAIFEX_BASE_DIR, tx_id, session=sess)
-                if os.path.exists(path):
-                    df = taifex_store.load_daily(self.TAIFEX_BASE_DIR, tx_id, session=sess)
-                    if df is not None and not df.empty:
-                        any_found = True
-                        lines.append(f"✓ {tx_id} ({label}):{len(df):,} 根,"
-                                     f"{df.index[0]:%Y-%m-%d} ~ {df.index[-1]:%Y-%m-%d}")
-                    else:
-                        lines.append(f"⚠ {tx_id} ({label}):檔案存在但讀不出內容 → {path}")
-                else:
-                    lines.append(f"✗ {tx_id} ({label}):無檔案 → {os.path.basename(path)}")
+            for rank, rlabel in ((1, 'R1近月'), (2, 'R2次月'), (3, 'R3遠月')):
+                for sess, label in (('all', '近全'), ('day', '日盤')):
+                    path = taifex_store.store_path(self.TAIFEX_BASE_DIR, tx_id, session=sess, month_rank=rank)
+                    if os.path.exists(path):
+                        df = taifex_store.load_daily(self.TAIFEX_BASE_DIR, tx_id, session=sess, month_rank=rank)
+                        if df is not None and not df.empty:
+                            any_found = True
+                            lines.append(f"✓ {tx_id} {rlabel} ({label}):{len(df):,} 根,"
+                                         f"{df.index[0]:%Y-%m-%d} ~ {df.index[-1]:%Y-%m-%d}")
+                        else:
+                            lines.append(f"⚠ {tx_id} {rlabel} ({label}):檔案存在但讀不出內容 → {path}")
+                    elif rank == 1:
+                        lines.append(f"✗ {tx_id} {rlabel} ({label}):無檔案 → {os.path.basename(path)}")
         if not any_found:
             lines += ["", "目前一份都沒有。請按「📥 期交所歷史」下載或匯入,",
                       "系統會自動存到上面那個資料夾 (不需要你手動搬檔案)。"]
@@ -3438,40 +3346,25 @@ class StockTradingAppPro(tk.Tk):
         messagebox.showinfo("期交所歷史資料狀態", msg, parent=self)
 
     def _taifex_prod_of(self, contract):
-        """【ADR-058】由合約推出期交所商品代碼;非 R1 連續合約或不支援的商品回 None。
-        抽成獨立方法,讓「延伸」與「跳過下載」兩條路徑用同一套判斷,不會分歧。"""
-        try:
-            sym = str(getattr(contract, 'symbol', '') or '').upper()
-            if not sym.endswith('R1'):
-                return None
-            return taifex_daily.PRODUCT_MAP.get(fut_catalog.product_code(sym))
-        except Exception:
+        if not contract:
             return None
+        sym = str(getattr(contract, 'symbol', '') or getattr(contract, 'code', '') or '').upper()
+        if 'R1' in sym or 'R2' in sym or 'R3' in sym:
+            return taifex_daily.PRODUCT_MAP.get(fut_catalog.product_code(sym))
+        return None
 
     def _taifex_plan_download(self, contract, asset_type, tf, start_dt, end_dt, session='all', tag="回測"):
-        """【ADR-058】使用者需求 #1 的核心解法:能不下載就不要下載。
-
-        使用者回報「回測/最佳化下載一直被券商擋」(ServerError: kbars request
-        $P2P/... = Solace 路由層流量管制)。ADR-048 已經做過節流/退避/切小段,
-        但那些都還是在「想辦法把請求送出去」。真正有效的作法是:期貨 R1 的
-        日/周/月K,只要本地期交所歷史已經涵蓋那段期間,就根本不必向券商要
-        —— 少發幾百個請求,自然不會被擋,也不吃你的每日流量配額。
-
-        回傳 (need_from, need_to, note):
-          * need_from/need_to = 仍需向券商下載的區間 (need_from 為 None 代表
-            完全不必下載)
-          * note = 給日誌看的白話說明
-        任何判斷失敗一律退回「照原樣全段下載」,絕不因為這個最佳化而少抓資料。
-        """
+        """【ADR-058/ADR-081】主圖與回測通用:判斷這段歷史是否「已經被期交所本地資料完整涵蓋」。"""
         try:
             if asset_type != "future" or tf not in ("日K", "周K", "月K"):
                 return start_dt, end_dt, ""
             tx_id = self._taifex_prod_of(contract)
             if not tx_id:
                 return start_dt, end_dt, ""
-            hist = self._taifex_load_hist(tx_id, session=session)
+            rank = getattr(self, '_month_rank_of', lambda x: 1)(contract)
+            hist = self._taifex_load_hist(tx_id, session=session, month_rank=rank)
             if (hist is None or hist.empty) and session == 'day':
-                hist = self._taifex_load_hist(tx_id, session='all')
+                hist = self._taifex_load_hist(tx_id, session='all', month_rank=rank)
             if hist is None or hist.empty:
                 return start_dt, end_dt, ""
             covered_until, need_from = taifex_daily.split_coverage(hist, start_dt, end_dt)
@@ -3557,13 +3450,15 @@ class StockTradingAppPro(tk.Tk):
             
             # TODO: ... (taifex logic remains exactly as is, this is just to anchor the new method)
             # Actually I don't need to replace `_extend_with_taifex`, I will prepend `_extend_with_yahoo` before `_extend_with_taifex` definition.
+            rank = getattr(self, '_month_rank_of', lambda x: 1)(contract)
+            
             # 【ADR-058】依回測選定的盤別口徑取用對應的那一份期交所資料
-            hist = self._taifex_load_hist(tx_id, session=session)
+            hist = self._taifex_load_hist(tx_id, session=session, month_rank=rank)
             if (hist is None or hist.empty) and session == 'day':
                 self.safe_after(0, self.log_message,
-                                f"【期交所歷史】{tx_id} 尚無「只用日盤」的資料檔 ({tx_id}_day.csv),"
+                                f"【期交所歷史】{tx_id} 尚無「只用日盤」的資料檔,"
                                 f"請重新匯入一次期交所歷史即可同時產生。本次改用近全序列。")
-                hist = self._taifex_load_hist(tx_id, session='all')
+                hist = self._taifex_load_hist(tx_id, session='all', month_rank=rank)
             if hist is None or hist.empty:
                 return pub_df
             out = taifex_daily.extend_shioaji_df(pub_df, hist, tf)
@@ -4521,6 +4416,7 @@ class StockTradingAppPro(tk.Tk):
                 self.plot_df = df.iloc[-max_bars:].copy()
             else:
                 self.plot_df = df.copy() 
+            df = self.plot_df 
             
             if getattr(self, 'current_canvas', None) is not None:
                 try: self.current_canvas.get_tk_widget().destroy()
@@ -5883,9 +5779,10 @@ class StockTradingAppPro(tk.Tk):
                 tag = 'qt_off' if not s.get('enabled') else ('qt_on' if s.get('mode') == '實單' else 'qt_sim')
                 tt = strategy_engine.trade_type_of(s)
                 sym_disp = f"{s.get('symbol','')} ({tt})"
+                sym_name = self._wl_display_name(s.get('symbol','')) if s.get('symbol','') else ''
                 # 【ADR-045】自訂策略的方向由 on_bar 程式碼決定,direction 只是佔位
                 dir_disp = '程式決定' if s.get('kind') == 'custom' else s.get('direction', '')
-                prepared.append((s['id'], (s.get('name',''), sym_disp, s.get('timeframe',''),
+                prepared.append((s['id'], (s.get('name',''), sym_disp, sym_name, s.get('timeframe',''),
                                             dir_disp, conds, s.get('mode','模擬'), status, running_disp,
                                             rt.get('trades_today', 0), pos, unreal_pnl_str), tag))
             # 【ADR-057】更新「所有」存活的量化面板 (分頁 + 獨立視窗),
