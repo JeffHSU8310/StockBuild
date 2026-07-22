@@ -5944,13 +5944,13 @@ class StockTradingAppPro(tk.Tk):
         if not s:
             self.log_message("【自動交易】請先在清單中選取要編輯的策略。")
             return
-        if s.get('enabled'):
-            self.log_message(f"【自動交易】啟動中的策略「{s.get('name')}」不得修改。請先停用後再編輯。")
-            return
+        readonly = bool(s.get('enabled'))
+        if readonly:
+            self.log_message(f"【自動交易】「{s.get('name')}」為啟動中，進入唯讀檢視模式。若要修改請先停用。")
         if s.get('kind') == 'custom':
-            self._qt_open_custom_editor(s)
+            self._qt_open_custom_editor(s, readonly=readonly)
         else:
-            self._qt_open_editor(s)
+            self._qt_open_editor(s, readonly=readonly)
 
     def _qt_delete_strategy(self):
         s = self._qt_selected()
@@ -6761,9 +6761,13 @@ class StockTradingAppPro(tk.Tk):
                   command=lambda: self._open_ai_helper_dialog(dlg, txt, _set_status)).pack(side=tk.LEFT, padx=6)
         tk.Button(foot, text="🧪 試跑一次", bg="#AB47BC", fg="white", relief="flat",
                   font=('微軟正黑體', 10, 'bold'), padx=14, pady=4, command=_test_run).pack(side=tk.LEFT, padx=6)
-        tk.Button(foot, text="儲存策略", bg="#29B6F6", fg="black", relief="flat",
-                  font=('微軟正黑體', 11, 'bold'), padx=18, pady=4, command=_save).pack(side=tk.LEFT, padx=6)
-        tk.Button(foot, text="取消", bg="#2A323D", fg="white", relief="flat",
+        if readonly:
+            tk.Button(foot, text="唯讀無法儲存", bg="#2A323D", fg="#8A99AD", relief="flat", state=tk.DISABLED,
+                      font=('微軟正黑體', 11, 'bold'), padx=18, pady=4).pack(side=tk.LEFT, padx=6)
+        else:
+            tk.Button(foot, text="儲存策略", bg="#29B6F6", fg="black", relief="flat",
+                      font=('微軟正黑體', 11, 'bold'), padx=18, pady=4, command=_save).pack(side=tk.LEFT, padx=6)
+        tk.Button(foot, text="關閉" if readonly else "取消", bg="#2A323D", fg="white", relief="flat",
                   font=('微軟正黑體', 11), padx=18, pady=4, command=dlg.destroy).pack(side=tk.LEFT, padx=6)
 
     AI_CONFIG_FILE = "ai_config.json"
@@ -7026,12 +7030,13 @@ class StockTradingAppPro(tk.Tk):
             'watch_timeframe': cb_wtf.get(),
         }}
 
-    def _qt_open_editor(self, strategy):
+    def _qt_open_editor(self, strategy, readonly=False):
         """新增/編輯策略對話框:基本參數 + 條件建構器 (進場AND / 出場OR)。"""
         is_new = strategy is None
         s = strategy_engine.new_strategy() if is_new else json.loads(json.dumps(strategy))
         dlg = tk.Toplevel(self)
-        dlg.title("新增策略" if is_new else f"編輯策略 — {s.get('name')}")
+        title_suffix = " (唯讀 - 策略執行中)" if readonly else ""
+        dlg.title("新增策略" if is_new else f"編輯策略 — {s.get('name')}{title_suffix}")
         dlg.configure(bg="#1A2026")
         self.center_window(dlg, 720, 620)
         dlg.transient(self)
@@ -7479,9 +7484,13 @@ class StockTradingAppPro(tk.Tk):
             dlg.destroy()
 
         foot = tk.Frame(dlg, bg="#1A2026"); foot.pack(pady=10)
-        tk.Button(foot, text="儲存策略", bg="#29B6F6", fg="black", relief="flat",
-                  font=('微軟正黑體', 11, 'bold'), padx=18, pady=4, command=_save).pack(side=tk.LEFT, padx=6)
-        tk.Button(foot, text="取消", bg="#2A323D", fg="white", relief="flat",
+        if readonly:
+            tk.Button(foot, text="唯讀無法儲存", bg="#2A323D", fg="#8A99AD", relief="flat", state=tk.DISABLED,
+                      font=('微軟正黑體', 11, 'bold'), padx=18, pady=4).pack(side=tk.LEFT, padx=6)
+        else:
+            tk.Button(foot, text="儲存策略", bg="#29B6F6", fg="black", relief="flat",
+                      font=('微軟正黑體', 11, 'bold'), padx=18, pady=4, command=_save).pack(side=tk.LEFT, padx=6)
+        tk.Button(foot, text="關閉" if readonly else "取消", bg="#2A323D", fg="white", relief="flat",
                   font=('微軟正黑體', 11), padx=18, pady=4, command=dlg.destroy).pack(side=tk.LEFT, padx=6)
 
     # ================= 【第十六輪 第6項】主圖K棒自動更新 =================
