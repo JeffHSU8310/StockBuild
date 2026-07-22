@@ -2763,7 +2763,11 @@ class StockTradingAppPro(tk.Tk):
     #   4. fetch 序號防 race (見 start_fetch_thread)。
     SJ_DAYS = {"1分K": 15, "5分K": 60, "15分K": 120, "30分K": 120, "60分K": 180,
                "日K": 365, "周K": 1095, "月K": 1825}
-    QUICK_DAYS = {"1分K": 2, "5分K": 5, "15分K": 10, "30分K": 15, "60分K": 20, "日K": 45, "周K": 240, "月K": 600}   # 兩段式第一段的小範圍
+    # 【ADR-069】兩段式第一段的小範圍。日/周/月K 特別小:因為日K以上的「深歷史」
+    # 是由 yahoo(股票 20年)/期交所(期貨) 在同一次 _publish 裡延伸補上的,shioaji
+    # 只需供「最近幾根」的即時新鮮度,不必抓 45~600 天的 1 分 K 回來重採樣 (那才是
+    # 日K 切換要等十幾二十秒的主因)。窗口小 → 搶先出圖近乎即時,完整深歷史照樣有。
+    QUICK_DAYS = {"1分K": 2, "5分K": 5, "15分K": 10, "30分K": 15, "60分K": 20, "日K": 7, "周K": 45, "月K": 120}
     CACHE_TTL_MIN_TF = 30    # 分K類快取視為新鮮的秒數
     CACHE_TTL_DAY_TF = 300   # 日K以上快取視為新鮮的秒數
     KBARS_CACHE_MAX = 6      # 快取最多保留幾檔商品的原始分K (LRU 淘汰最舊)
@@ -3909,17 +3913,17 @@ class StockTradingAppPro(tk.Tk):
                     return  # 快取新鮮,直接完工——這就是「換週期/切回商品秒開」的路徑
 
                 # ---- 兩段式第一段:先抓小範圍搶先出圖 ----
-                # 【ADR-068】原本只有期貨/指數走快速段,股票沒有——但股票分K
-                # (5分K 起抓 60 天) 要等 6 段分段下載 (~15 秒) 全部跑完才第一次
-                # 出圖,使用者體感「切半天才換圖」。改成股票的「分K」也走快速段:
-                # 先抓 QUICK_DAYS 的小範圍「單次」下載搶先出圖,K 線馬上可看可 hover,
-                # 完整 60 天歷史在同一背景執行緒接著補全 (補完就地換圖,視角不動)。
-                # 股票日K以上維持原樣不加快速段:日K會做 yahoo 延伸,避免快速段+
-                # 完整段各跑一次 yahoo 網路呼叫。
+                # 【ADR-068/069】先抓 QUICK_DAYS 的小範圍「單次」下載搶先出圖,K 線
+                # 馬上可看可 hover,完整歷史在同一背景執行緒接著補全 (補完就地換圖,
+                # 視角不動)。
+                #   ADR-068:股票的「分K」加入快速段 (原本只有期貨/指數有)。
+                #   ADR-069:股票的「日/周/月K」也加入。日K以上原本沒快速段、又抓
+                #     365 天 1 分 K 回來重採樣 (~15 秒),是日K切換慢的主因;其實深
+                #     歷史是 _publish 裡的 yahoo/期交所延伸補的,shioaji 只要供最近
+                #     幾根,故用很小的 QUICK_DAYS 就能搶先出「完整」日K圖。代價是
+                #     快速段+完整段各跑一次 yahoo 延伸,但第二次在背景、不擋出圖。
                 quick_len = None
-                slow_asset = self.asset_type in ("future", "index_tw")
-                min_tf = tf in ("1分K", "5分K", "15分K", "30分K", "60分K")
-                want_quick = slow_asset or (self.asset_type == "stock" and min_tf)
+                want_quick = self.asset_type in ("future", "index_tw", "stock")
                 if (not published_from_cache) and want_quick and tf in self.QUICK_DAYS:
                     try:
                         q_days = self.QUICK_DAYS[tf]
@@ -3965,6 +3969,13 @@ class StockTradingAppPro(tk.Tk):
                         is_min_tf = tf in ["1分K", "5分K", "15分K", "30分K", "60分K"]
                         if is_min_tf and (_t - _f).days > 5:
                             raw = self._download_kbars_chunked(contract, _f, _t, chunk_days=10, subsplit_days=5, abort_cb=_abort_if_superseded)
+                        elif (not is_min_tf) and (_t - _f).days > 90:
+                            # 【ADR-069】日/周/月K 的完整段原本是「單一 365~1825 天大請求」,
+                            # 會把整段 1 分 K 抓回來 (最慢那步,又整段獨佔 _kbars_lock ~15 秒),
+                            # 使用者切走也停不下來,是連點日K還是卡的殘留主因。改走可中止的
+                            # 分段下載 (90 天一段):段間釋放鎖並檢查 abort_cb,一切走就停手把
+                            # 資源讓給新商品。深歷史仍由 yahoo/期交所延伸補上,不受影響。
+                            raw = self._download_kbars_chunked(contract, _f, _t, chunk_days=90, abort_cb=_abort_if_superseded)
                         else:
                             try:
                                 raw = self._download_kbars_raw(contract, _f, _t)
