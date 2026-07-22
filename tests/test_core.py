@@ -26,6 +26,7 @@ import numpy as np
 from core import tick_rules
 from core import futures_session
 from core import market_session
+from core import secure_store
 from core import order_rules
 from core import indicators
 from core import strategy_engine
@@ -2607,6 +2608,44 @@ class TestMarketSession(unittest.TestCase):
         self.assertEqual(market_session.session_label('期貨', self._dt(2026, 7, 13, 22, 0)), '期貨夜盤')
         self.assertEqual(market_session.session_label('期貨', self._dt(2026, 7, 13, 22, 0), include_night=False), '休市')
         self.assertEqual(market_session.session_label('股票', self._dt(2026, 7, 13, 22, 0)), '休市')
+
+
+class TestSecureStore(unittest.TestCase):
+    """【ADR-073】加密憑證存放:往返、金鑰不符、竄改偵測。"""
+    def test_roundtrip(self):
+        key = b'device-seed-abc-123'
+        blob = secure_store.encrypt("憑證密碼P@ss零股", key)
+        self.assertNotIn("憑證密碼", blob)  # 密文裡看不到明文
+        self.assertEqual(secure_store.decrypt(blob, key), "憑證密碼P@ss零股")
+
+    def test_dict_roundtrip(self):
+        key = b'seed'
+        d = {'pid': 'A123', 'ca_pw': 'secret', 'n': 5}
+        back = secure_store.decrypt_dict(secure_store.encrypt_dict(d, key), key)
+        self.assertEqual(back, d)
+
+    def test_wrong_key_fails(self):
+        blob = secure_store.encrypt("hello", b'key-A')
+        with self.assertRaises(ValueError):
+            secure_store.decrypt(blob, b'key-B')
+
+    def test_tamper_detected(self):
+        import base64
+        blob = secure_store.encrypt("hello world", b'k')
+        raw = bytearray(base64.b64decode(blob))
+        raw[-1] ^= 0x01  # 動 tag 最後一個 byte
+        tampered = base64.b64encode(bytes(raw)).decode('ascii')
+        with self.assertRaises(ValueError):
+            secure_store.decrypt(tampered, b'k')
+
+    def test_empty_key_rejected(self):
+        with self.assertRaises(ValueError):
+            secure_store.encrypt("x", b'')
+
+    def test_ciphertext_differs_each_time(self):
+        # 隨機 salt/nonce → 同明文同金鑰兩次密文不同
+        key = b'k'
+        self.assertNotEqual(secure_store.encrypt("same", key), secure_store.encrypt("same", key))
 
 
 if __name__ == "__main__":

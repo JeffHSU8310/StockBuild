@@ -17,6 +17,9 @@ from datetime import datetime, timedelta
 from collections import deque
 import gc
 import re
+import platform
+import getpass
+import secrets
 import traceback
 import urllib.request
 import urllib.parse
@@ -37,6 +40,7 @@ from core import optimizer
 from core import paper_account
 from core import taifex_daily
 from core import market_session
+from core import secure_store
 from data import config_store
 from data import taifex_store
 
@@ -356,6 +360,9 @@ class StockTradingAppPro(tk.Tk):
         self._live_bar = None
         self._live_bar_artists = None
         self.safe_after(1000, self._live_bar_painter)
+        # 【ADR-073】開機自動登入:若已勾「記住憑證」且解得出加密憑證,啟動後
+        # 稍等 1.5 秒 (等視窗/元件都就緒) 再背景自動登入,達成「開一次不用管」。
+        self.safe_after(1500, self._try_auto_login_on_start)
 
     def on_app_close(self):
         """
@@ -874,6 +881,16 @@ class StockTradingAppPro(tk.Tk):
             selectcolor="#2A323D", activebackground="#0D1115",
             font=('微軟正黑體', 9), command=self._on_auto_reconnect_toggle)
         self.chk_auto_reconnect.pack(side=tk.RIGHT, padx=5, pady=5)
+        # 【ADR-073】記住憑證並開機自動登入 (加密存本機)。勾選後登入成功會把憑證
+        # 加密存檔,下次開程式自動登入;取消即刪檔。誠實提醒:裝置金鑰加密,擋
+        # 檔案外流但擋不了能完整存取本機本帳號的人。
+        self.remember_creds_var = tk.BooleanVar(value=bool(self.app_settings.get('remember_creds', False)))
+        self.chk_remember_creds = tk.Checkbutton(
+            market_panel, text="🔐 記住憑證(自動登入)", variable=self.remember_creds_var,
+            bg="#0D1115", fg=("#00E676" if self.remember_creds_var.get() else "#8A99AD"),
+            selectcolor="#2A323D", activebackground="#0D1115",
+            font=('微軟正黑體', 9), command=self._on_remember_creds_toggle)
+        self.chk_remember_creds.pack(side=tk.RIGHT, padx=5, pady=5)
         # 【ADR-072】盤中零股開盤時刻選擇 (預設 09:10;未來交易所改 09:00 自己切)。
         tk.Label(market_panel, text="零股開盤", bg="#0D1115", fg="#8A99AD",
                  font=('微軟正黑體', 9)).pack(side=tk.RIGHT, padx=(8, 2), pady=5)
@@ -1525,6 +1542,109 @@ class StockTradingAppPro(tk.Tk):
         finally:
             self._reconnecting = False
 
+    # ============================================================
+    # 【ADR-073】記住憑證並開機自動登入 (加密存本機)
+    # ============================================================
+    def _device_key_material(self):
+        """推導「綁這台機器/這個帳號」的金鑰材料 (bytes)。由 hostname + 使用者名 +
+        一份一次性隨機裝置碼 (device_id.bin) 組成;裝置碼不存在就產生一份。
+        這保證加密憑證檔複製到別台機器解不開,但無法防「能完整存取本機本帳號的人」
+        ——這是免輸入自動登入的固有取捨 (見 secure_store 說明)。"""
+        try:
+            did_path = os.path.join(os.path.dirname(os.path.abspath(self.secure_creds_file)), 'device_id.bin')
+        except Exception:
+            did_path = 'device_id.bin'
+        try:
+            if os.path.exists(did_path):
+                with open(did_path, 'rb') as f:
+                    did = f.read()
+            else:
+                did = secrets.token_bytes(32)
+                with open(did_path, 'wb') as f:
+                    f.write(did)
+        except Exception:
+            did = b'fallback-device-seed'
+        seed = f"{platform.node()}|{getpass.getuser()}|StockBuild".encode('utf-8', 'ignore')
+        return seed + did
+
+    def _save_secure_creds(self, creds):
+        """把憑證 (含密碼) 加密後寫到 secure_creds_file。"""
+        try:
+            blob = secure_store.encrypt_dict(creds, self._device_key_material())
+            with open(self.secure_creds_file, 'w', encoding='utf-8') as f:
+                json.dump({'blob': blob}, f)
+            self.log_message("【自動登入】已把憑證加密存到本機 (綁定這台機器),下次開程式會自動登入。"
+                             "注意:此為裝置金鑰加密,擋得住檔案外流,但擋不了能完整存取這台電腦"
+                             "本帳號的人;不想存了可取消勾選即刪除。")
+        except Exception as e:
+            self.log_message(f"【自動登入】憑證加密儲存失敗 (不影響本次連線): {type(e).__name__}: {e}")
+
+    def _load_secure_creds(self):
+        """讀回並解密憑證;沒有檔案/解不開一律回 None。"""
+        try:
+            if not os.path.exists(self.secure_creds_file):
+                return None
+            with open(self.secure_creds_file, 'r', encoding='utf-8') as f:
+                blob = json.load(f).get('blob', '')
+            if not blob:
+                return None
+            return secure_store.decrypt_dict(blob, self._device_key_material())
+        except Exception as e:
+            self.log_message(f"【自動登入】讀取加密憑證失敗 (可能換過機器或檔案損毀),需手動登入一次: {type(e).__name__}: {e}")
+            return None
+
+    def _delete_secure_creds(self):
+        try:
+            if os.path.exists(self.secure_creds_file):
+                os.remove(self.secure_creds_file)
+        except Exception:
+            pass
+
+    def _on_remember_creds_toggle(self):
+        """勾選「記住憑證」:已登入就立刻把記憶體憑證加密存檔;取消就刪檔。"""
+        on = bool(self.remember_creds_var.get())
+        try:
+            self.chk_remember_creds.config(fg="#00E676" if on else "#8A99AD")
+        except Exception:
+            pass
+        if on:
+            if self._login_creds_mem:
+                self._save_secure_creds(self._login_creds_mem)
+            else:
+                self.log_message("【自動登入】已勾選「記住憑證」,但目前尚未登入;"
+                                 "請先登入一次,登入成功後會自動把憑證加密存檔。")
+        else:
+            self._delete_secure_creds()
+            self.log_message("【自動登入】已取消「記住憑證」,本機加密憑證檔已刪除,下次開程式需手動登入。")
+        self._save_app_settings()
+
+    def _try_auto_login_on_start(self):
+        """開機自動登入:若設定記住憑證且解得出加密憑證,背景自動登入一次。"""
+        try:
+            if not (getattr(self, 'remember_creds_var', None) and self.remember_creds_var.get()):
+                return
+            if self.api_logged_in or self._login_in_progress or not HAS_SJ:
+                return
+            creds = self._load_secure_creds()
+            if not creds:
+                return
+            self.log_message("【自動登入】偵測到已記住的加密憑證,正在背景自動登入券商 API...")
+            self._login_in_progress = True
+            try:
+                self.btn_login.config(text="⏳ 自動登入中...", bg="#8A99AD", fg="black")
+            except Exception:
+                pass
+            try:
+                self._start_login_watchdog()
+            except Exception:
+                pass
+            threading.Thread(
+                target=self.process_broker_login,
+                args=(creds['api_key'], creds['secret_key'], creds['pid'], creds['ca_path'], creds['ca_pw']),
+                daemon=True).start()
+        except Exception as e:
+            self.log_message(f"【自動登入】啟動自動登入時發生狀況: {type(e).__name__}: {e}")
+
     def toggle_login(self):
         if self._login_in_progress:
             # 【第十二輪修正】登入中 (shioaji 下載合約可能需要 30 秒~2 分鐘,
@@ -1801,6 +1921,13 @@ class StockTradingAppPro(tk.Tk):
             # 供「斷線自動重連」使用。這是達成「開一次、整天不用管」的關鍵材料。
             self._login_creds_mem = {'api_key': api_key, 'secret_key': secret_key,
                                      'pid': pid, 'ca_path': ca_path, 'ca_pw': ca_pw}
+            # 【ADR-073】若使用者勾了「記住憑證」,登入成功即把憑證加密存本機,
+            # 供下次開程式自動登入 (只在勾選時才落地,且是加密的)。
+            try:
+                if getattr(self, 'remember_creds_var', None) and self.remember_creds_var.get():
+                    self.safe_after(0, self._save_secure_creds, dict(self._login_creds_mem))
+            except Exception:
+                pass
             self.safe_after(0, lambda: self.btn_login.config(text="🔓 登出券商 API", bg="#FF1744", fg="white"))
             self.safe_after(0, lambda: self.lbl_api_status.config(text="🟢 券商 API 已連線 (實盤模式)", fg="#00E676"))
             self.safe_after(0, self.log_message, "【登入成功】連線建立完成，合約下載完畢，實盤功能已啟用！")
