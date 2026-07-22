@@ -4375,7 +4375,13 @@ class StockTradingAppPro(tk.Tk):
 
             for widget in self.chart_frame.winfo_children(): widget.destroy()
             plt.close('all')
-            gc.collect() 
+            # 【效能】gc.collect() 很貴 (大 heap 可達數十~上百 ms),而 draw_chart 在
+            # 「切商品/背景補全/縮放平移改版面」都會跑到,每次都 full GC 是切換與
+            # 重繪變慢的主因之一。plt.close(fig) 已釋放 matplotlib 圖物件;改成每
+            # 隔幾次才 collect 一次,把記憶體回收挪出熱路徑,又不至於長期堆積。
+            self._draw_count = getattr(self, '_draw_count', 0) + 1
+            if self._draw_count % 12 == 0:
+                gc.collect()
             
             apds = []
             panel_ratios = [5, 1.2] 
@@ -4610,13 +4616,22 @@ class StockTradingAppPro(tk.Tk):
             # 只做「還原底圖+畫十字線/文字+blit」(毫秒級),不再整張圖重畫。
             self._hover_bg = None
             self.current_canvas.mpl_connect('draw_event', self._on_canvas_draw)
+            _draw_t0 = time.time()
             self.current_canvas.draw()
-            
+            _draw_ms = (time.time() - _draw_t0) * 1000.0
+
             self.current_canvas.mpl_connect('scroll_event', self.on_scroll_zoom)
             self.current_canvas.mpl_connect('button_press_event', self.on_mouse_press)
             self.current_canvas.mpl_connect('button_release_event', self.on_mouse_release)
             self.current_canvas.mpl_connect('motion_notify_event', self.on_mouse_move)
-            self.log_message(f"[{txt_fmt_char}] 載入成功 ({display_title})")
+            # 【效能診斷】單次繪圖 (mpf.plot + canvas.draw) 的實際渲染毫秒數;偏高時
+            # 才記一行 (>350ms),讓使用者回報時能看出「切換/縮放平移慢」是不是卡在
+            # matplotlib 渲染本身 (K 棒數量、面板數、視窗越大越慢)。不洗版。
+            if _draw_ms > 350:
+                self.log_message(f"[{txt_fmt_char}] 載入成功 ({display_title}) — 本次繪圖渲染 {_draw_ms:.0f} ms "
+                                 f"({len(df)} 根K棒);若切換/縮放偏慢多半卡在此。")
+            else:
+                self.log_message(f"[{txt_fmt_char}] 載入成功 ({display_title})")
         except Exception as e: self.log_message(f"畫布繪製失敗: {e}")
 
     def on_scroll_zoom(self, event):
@@ -4625,16 +4640,33 @@ class StockTradingAppPro(tk.Tk):
         factor = 0.85 if event.button == 'up' else 1.15; new_range = range_x * factor
         max_range = len(self.plot_df) + 20
         if new_range > max_range: new_range = max_range
-        if new_range < 15: new_range = 15 
+        if new_range < 15: new_range = 15
         rel_x = (event.xdata - xmin) / range_x
-        
+
         new_xmin = event.xdata - new_range * rel_x
         new_xmax = event.xdata + new_range * (1 - rel_x)
         ax.set_xlim(new_xmin, new_xmax)
-        
+
         self.auto_scale_y(ax, new_xmin, new_xmax)
         self.auto_scale_indicator_panels(new_xmin, new_xmax)
+        # 【效能】標記「縮放進行中」→ _on_canvas_draw 這段期間不做全圖 hover 底圖
+        # 快取 (連續滾動時純浪費);停止滾動 200ms 後再補一次快取,hover 才能用 blit。
+        self._zoom_active = True
+        if getattr(self, '_zoom_end_id', None) is not None:
+            try: self.after_cancel(self._zoom_end_id)
+            except Exception: pass
+        self._zoom_end_id = self.safe_after(200, self._on_zoom_settled)
         event.canvas.draw_idle()
+
+    def _on_zoom_settled(self):
+        """縮放停止後呼叫:清旗標並補一次完整重繪,讓 hover 底圖重新快取。"""
+        self._zoom_end_id = None
+        self._zoom_active = False
+        try:
+            if self.current_canvas is not None:
+                self.current_canvas.draw_idle()
+        except Exception:
+            pass
 
     def _on_canvas_draw(self, event=None):
         """
@@ -4649,6 +4681,14 @@ class StockTradingAppPro(tk.Tk):
                 return
             if event is not None and getattr(event, 'canvas', cv) is not cv:
                 return  # 舊 canvas 的殘留事件,忽略
+            # 【效能】縮放/平移進行中時,hover 底圖每一幀都被作廢 (視野一直變),
+            # 這時候還 copy_from_bbox(整張圖) 純粹是白花錢 (一次全圖點陣複製)。
+            # 互動中先跳過快取,等互動結束 (放開滑鼠/停止滾動) 再補一次即可,
+            # 讓平移/縮放的每一幀省下一次全圖複製。
+            if getattr(self, 'is_panning', False) or getattr(self, '_zoom_active', False):
+                self._hover_bg = None
+                self._hover_bg_view = None
+                return
             self._hover_bg = cv.copy_from_bbox(fig.bbox)
             # 【ADR-044 第4項】記錄快取當下的視野:移動/縮放後視野改變,舊背景
             # 快取上疊畫新座標的活K棒/十字線會產生「殘影」;blit 前比對即可偵測。
