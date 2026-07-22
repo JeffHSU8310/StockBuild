@@ -7039,7 +7039,7 @@ class StockTradingAppPro(tk.Tk):
         title_suffix = " (唯讀 - 策略執行中)" if readonly else ""
         dlg.title("新增策略" if is_new else f"編輯策略 — {s.get('name')}{title_suffix}")
         dlg.configure(bg="#1A2026")
-        self.center_window(dlg, 720, 620)
+        self.center_window(dlg, 800, 700)
         dlg.transient(self)
         try:
             dlg.lift(); dlg.focus_force()
