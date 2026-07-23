@@ -39,6 +39,11 @@ core/chukuangren_band.py — 「楚狂人之終極波段」內建策略 (純邏�
     待確認出場 (停損/點數停利/SMA20停利):仍符合條件才真正出場,否則作廢、
     維持原部位並繼續每日監控。
 
+  【新ADR 確認與下單分兩個時間點】12:00確認成立不會立刻送單,而是記進
+  armed_intent 並等 60 秒 (約12:01) 後才真正下單 (on_execute_armed),下單
+  用的價格是執行當下 (B) 的最新價,不是12:00確認當下的價——這是使用者
+  明確要求「12:00確認,條件成立,12:01才下單」,不要兩件事在同一瞬間發生。
+
 本模組不做的事:合約解析、抓K棒、下單、風控守門 (由 stock_app_pro.py
 的 _quant_eval_pass 呼叫既有的 strategy_engine.risk_check/apply_fill 負責,
 本模組只負責產生跟 strategy_engine 相同格式的 intents)。
@@ -141,6 +146,13 @@ def validate(strategy):
     tt = strategy_engine.trade_type_of(strategy)
     if tt not in strategy_engine.TRADE_TYPES:
         return False, "交易種類僅支援 股票 / 零股 / 期貨"
+    pt = strategy.get('price_type', '限價')
+    if pt not in strategy_engine.PRICE_TYPES:
+        return False, f"委託方式僅支援 {'/'.join(strategy_engine.PRICE_TYPES)}"
+    if pt in strategy_engine.FUTURES_ONLY_PRICE_TYPES and tt != '期貨':
+        return False, "範圍市價僅期貨支援 (股票/零股交易所規則沒有這個委託方式)"
+    if tt == '零股' and pt != '限價':
+        return False, "零股依交易所規則只能限價 (鐵則6,不可用市價/範圍市價)"
     direction = direction_of(strategy)
     if strategy.get('direction') not in DIRECTIONS:
         return False, "方向僅支援 做多 / 做空"
@@ -178,6 +190,12 @@ def ensure_runtime(rt):
     rt.setdefault('entry_index_price', 0.0)  # D 或 E:進場當時的加權指數點位 (ADR-085 一定記錄)
     rt.setdefault('last_daily_bar_date', '')
     rt.setdefault('last_confirm_date', '')
+    # 【新ADR 確認/下單分兩個時間點】armed_intent:12:00確認成立、還沒真正
+    # 下單的動作 ({'kind','action','qty'(僅OPEN用),'reason'});armed_at_ts:
+    # 確認當下的時間戳,on_execute_armed 要等過了 delay_sec 秒才會真正組出
+    # intent (預設60秒,即約12:00確認→12:01下單)。
+    rt.setdefault('armed_intent', None)
+    rt.setdefault('armed_at_ts', 0.0)
     return rt
 
 
@@ -276,19 +294,23 @@ def on_daily_close(params, rt, daily_df, direction='做多'):
 _REASON_LABEL = {'SL': '固定停損', 'TP_POINT': '點數移動停利', 'TP_SMA20': 'SMA20移動停利'}
 
 
-def on_noon_check(params, rt, confirm_price, today_key, qty=1):
-    """隔天中午12:00 呼叫 (confirm_price=加權指數當下的5分K收盤價)。
-    確認 pending_entry / pending_exit 是否仍然成立,回傳 intents list
-    (格式與 strategy_engine.evaluate_strategy 相同,可直接丟給
-    strategy_engine.risk_check / apply_fill 處理)。同一個交易日只會真正
-    確認一次 (用 rt['last_confirm_date'] 防重複)。
+def on_noon_confirm(params, rt, confirm_price, today_key, now_ts, qty=1):
+    """隔天中午12:00 呼叫 (confirm_price=加權指數當下的5分K收盤價) —— 只做
+    『確認』,不下單。確認 pending_entry / pending_exit 是否仍然成立;成立
+    就把要執行的動作記進 rt['armed_intent'] 並記下確認時間 rt['armed_at_ts']。
+    同一個交易日只會真正確認一次 (用 rt['last_confirm_date'] 防重複)。
+
+    【新ADR 確認/下單分兩個時間點】真正的下單延後到 on_execute_armed() 判斷
+    『已過 delay_sec 秒 (預設60秒,即約12:00確認→12:01下單)』後才發生——
+    使用者要求確認與下單分開,不要12:00確認成立就立刻在同一瞬間送單。
 
     【ADR-085】進場確認成立時,一定把 confirm_price 記進 rt['entry_index_price']
-    (=D 多單 / E 空單) —— 之後的停損/停利全部以這個加權指數點位為基準。"""
+    (=D 多單 / E 空單) —— 之後的停損/停利全部以這個加權指數點位為基準
+    (記錄的是12:00確認當下的點位,不是1分鐘後下單當下的點位,語意不變)。
+    不回傳任何東西,純粹修改 rt (in-place)。"""
     ensure_runtime(rt)
-    intents = []
     if rt.get('last_confirm_date') == today_key:
-        return intents
+        return
     rt['last_confirm_date'] = today_key
     X, Z, S2 = params['x'], params['z'], params['s2']
 
@@ -304,11 +326,13 @@ def on_noon_check(params, rt, confirm_price, today_key, qty=1):
             rt['sma20_mode'] = False
             action = '買進' if d == 'LONG' else '賣出'
             dname = '多單D' if d == 'LONG' else '空單E'
-            intents.append({'kind': 'OPEN', 'action': action, 'qty': int(qty),
-                            'price': float(confirm_price),
-                            'reason': f"楚狂人進場確認 (隔日12點指數{confirm_price:g} "
-                                      f"{'>' if d == 'LONG' else '<'} X={X:g}),"
-                                      f"記錄進場加權指數點位 {dname}={confirm_price:g}"})
+            rt['armed_intent'] = {
+                'kind': 'OPEN', 'action': action, 'qty': int(qty),
+                'reason': f"楚狂人進場確認 (隔日12點指數{confirm_price:g} "
+                          f"{'>' if d == 'LONG' else '<'} X={X:g}),"
+                          f"記錄進場加權指數點位 {dname}={confirm_price:g}",
+            }
+            rt['armed_at_ts'] = float(now_ts)
         rt['pending_entry'] = None
 
     pex = rt.get('pending_exit')
@@ -326,12 +350,38 @@ def on_noon_check(params, rt, confirm_price, today_key, qty=1):
             confirmed = (confirm_price < ref) if position == 'LONG' else (confirm_price > ref)
         if confirmed:
             action = '賣出' if position == 'LONG' else '買進'
-            intents.append({'kind': 'CLOSE', 'action': action, 'qty': int(rt.get('qty', qty) or qty),
-                            'price': float(confirm_price),
-                            'reason': f"楚狂人出場確認 ({_REASON_LABEL.get(reason, reason)})"})
+            rt['armed_intent'] = {
+                'kind': 'CLOSE', 'action': action,
+                'reason': f"楚狂人出場確認 ({_REASON_LABEL.get(reason, reason)})",
+            }
+            rt['armed_at_ts'] = float(now_ts)
             rt['trail_armed'] = False
             rt['trail_base'] = 0.0
             rt['sma20_mode'] = False
             rt['entry_index_price'] = 0.0
         rt['pending_exit'] = None
-    return intents
+
+
+def on_execute_armed(rt, exec_price, now_ts, delay_sec=60.0):
+    """confirm 後延遲下單:rt['armed_intent'] 存在且已經過了 delay_sec 秒
+    (預設60秒,即12:00確認→12:01下單) 才真正組出要送出的 intent (格式與
+    strategy_engine.evaluate_strategy 相同,可直接丟給 risk_check/apply_fill)。
+
+    exec_price:真正下單那一刻 (執行商品B) 的最新價,不是12:00確認當下的A價
+    (confirm_price)——確認與下單本來就是兩個時間點,價格自然也各自取當下的。
+    還沒到時間就回傳空 list,呼叫端每次評估都可以放心呼叫 (冪等)。"""
+    ensure_runtime(rt)
+    ai = rt.get('armed_intent')
+    if ai is None:
+        return []
+    if float(now_ts) - float(rt.get('armed_at_ts', 0) or 0) < float(delay_sec):
+        return []
+    if ai['kind'] == 'OPEN':
+        qty = int(ai.get('qty', 1))
+    else:
+        qty = int(rt.get('qty', 0) or 0)
+    intent = {'kind': ai['kind'], 'action': ai['action'], 'qty': qty,
+              'price': float(exec_price), 'reason': ai['reason']}
+    rt['armed_intent'] = None
+    rt['armed_at_ts'] = 0.0
+    return [intent]

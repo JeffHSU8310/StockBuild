@@ -2862,6 +2862,16 @@ class TestChukuangrenBand(unittest.TestCase):
         p.update(overrides)
         return p
 
+    def _confirm_and_execute(self, params, rt, confirm_price, today_key, qty=1,
+                              exec_price=None, now_ts=1000.0, delay_sec=60.0):
+        """【新ADR 確認/下單分兩個時間點】測試輔助:模擬 12:00 confirm →
+        (過了 delay_sec 秒) 12:01 執行 這兩步,回傳跟舊版 on_noon_check 一樣
+        的 intents list,方便既有測試沿用同一種斷言寫法。exec_price 不帶時
+        預設等於 confirm_price (=A/B同價的簡化情境,不影響邏輯本身測試)。"""
+        chukuangren_band.on_noon_confirm(params, rt, confirm_price, today_key, now_ts, qty=qty)
+        ep = confirm_price if exec_price is None else exec_price
+        return chukuangren_band.on_execute_armed(rt, ep, now_ts + delay_sec, delay_sec=delay_sec)
+
     # ---------- default_strategy / params_of / validate ----------
 
     def test_default_strategy_shape(self):
@@ -2878,6 +2888,33 @@ class TestChukuangrenBand(unittest.TestCase):
     def test_param_keys_for_direction(self):
         self.assertEqual(chukuangren_band.param_keys_for('做多'), ('x', 'y', 'z', 'c', 'f'))
         self.assertEqual(chukuangren_band.param_keys_for('做空'), ('x', 's1', 's2', 'c', 'f'))
+
+    def _valid_long_strategy(self, **overrides):
+        s = chukuangren_band.default_strategy()
+        s.update({'symbol': 'MXFR1', 'trade_type': '期貨', 'market': '台期貨', 'qty': 1,
+                  'ck_x': 100.0, 'ck_y': 90.0, 'ck_z': 92.0, 'ck_c': 5.0, 'ck_f': 2.0})
+        s.update(overrides)
+        return s
+
+    def test_default_strategy_price_type_is_limit(self):
+        s = chukuangren_band.default_strategy()
+        self.assertEqual(s['price_type'], '限價')
+
+    def test_validate_range_market_valid_for_futures(self):
+        s = self._valid_long_strategy(price_type='範圍市價')
+        self.assertTrue(chukuangren_band.validate(s)[0])
+
+    def test_validate_range_market_rejected_for_stock(self):
+        s = self._valid_long_strategy(trade_type='股票', market='台股', price_type='範圍市價')
+        ok, msg = chukuangren_band.validate(s)
+        self.assertFalse(ok)
+        self.assertIn('範圍市價', msg)
+
+    def test_validate_odd_lot_forced_limit(self):
+        s = self._valid_long_strategy(trade_type='零股', market='台股', price_type='市價')
+        ok, msg = chukuangren_band.validate(s)
+        self.assertFalse(ok)
+        self.assertIn('零股', msg)
 
     def test_every_param_has_label_and_help(self):
         # 每一個要填的參數都要有標籤與完整中文說明,不可漏 (UI 直接讀這兩份)
@@ -2974,13 +3011,13 @@ class TestChukuangrenBand(unittest.TestCase):
         self.assertIsNone(rt['pending_entry'])
         self.assertEqual(rt['last_daily_bar_date'], '')
 
-    # ---------- on_noon_check:隔天中午確認進場 + 記錄進場指數點位 ----------
+    # ---------- on_noon_confirm+on_execute_armed:隔天中午確認進場 + 記錄進場指數點位 ----------
 
     def test_noon_check_confirms_long_entry_records_index_point(self):
         rt = strategy_engine.new_runtime()
         rt['pending_entry'] = {'dir': 'LONG', 'date': '2026-01-01'}
         params = self._params()
-        intents = chukuangren_band.on_noon_check(params, rt, 105.0, '2026-01-02', qty=3)
+        intents = self._confirm_and_execute(params, rt, 105.0, '2026-01-02', qty=3)
         self.assertEqual(len(intents), 1)
         self.assertEqual(intents[0]['kind'], 'OPEN')
         self.assertEqual(intents[0]['action'], '買進')
@@ -2994,7 +3031,7 @@ class TestChukuangrenBand(unittest.TestCase):
         rt = strategy_engine.new_runtime()
         rt['pending_entry'] = {'dir': 'SHORT', 'date': '2026-01-01'}
         params = self._params()
-        intents = chukuangren_band.on_noon_check(params, rt, 95.0, '2026-01-02', qty=2)
+        intents = self._confirm_and_execute(params, rt, 95.0, '2026-01-02', qty=2)
         self.assertEqual(len(intents), 1)
         self.assertEqual(intents[0]['action'], '賣出')
         self.assertEqual(rt['entry_index_price'], 95.0)
@@ -3003,7 +3040,7 @@ class TestChukuangrenBand(unittest.TestCase):
         rt = strategy_engine.new_runtime()
         rt['pending_entry'] = {'dir': 'LONG', 'date': '2026-01-01'}
         params = self._params()
-        intents = chukuangren_band.on_noon_check(params, rt, 98.0, '2026-01-02')
+        intents = self._confirm_and_execute(params, rt, 98.0, '2026-01-02')
         self.assertEqual(intents, [])
         self.assertIsNone(rt['pending_entry'])
         self.assertEqual(rt['entry_index_price'], 0.0)
@@ -3012,10 +3049,59 @@ class TestChukuangrenBand(unittest.TestCase):
         rt = strategy_engine.new_runtime()
         rt['pending_entry'] = {'dir': 'LONG', 'date': '2026-01-01'}
         params = self._params()
-        chukuangren_band.on_noon_check(params, rt, 105.0, '2026-01-02')
+        self._confirm_and_execute(params, rt, 105.0, '2026-01-02')
         rt['pending_entry'] = {'dir': 'LONG', 'date': '2026-01-02'}
-        intents2 = chukuangren_band.on_noon_check(params, rt, 106.0, '2026-01-02')
+        intents2 = self._confirm_and_execute(params, rt, 106.0, '2026-01-02')
         self.assertEqual(intents2, [])
+
+    # ---------- 【新ADR】確認(12:00)與下單(12:01)分兩個時間點 ----------
+
+    def test_noon_confirm_arms_but_does_not_execute_immediately(self):
+        rt = strategy_engine.new_runtime()
+        rt['pending_entry'] = {'dir': 'LONG', 'date': '2026-01-01'}
+        params = self._params()
+        chukuangren_band.on_noon_confirm(params, rt, 105.0, '2026-01-02', now_ts=1000.0, qty=3)
+        self.assertIsNotNone(rt['armed_intent'])
+        self.assertEqual(rt['armed_intent']['kind'], 'OPEN')
+        self.assertEqual(rt['armed_at_ts'], 1000.0)
+        # ADR-085 記錄進場點位在確認當下就發生,不用等到執行
+        self.assertEqual(rt['entry_index_price'], 105.0)
+        # 還沒過60秒 (12:01) → 不應該有 intent
+        intents = chukuangren_band.on_execute_armed(rt, 106.0, now_ts=1030.0)
+        self.assertEqual(intents, [])
+        self.assertIsNotNone(rt['armed_intent'])  # 仍在等待,還沒清掉
+
+    def test_execute_armed_fires_after_delay_using_exec_price_not_confirm_price(self):
+        rt = strategy_engine.new_runtime()
+        rt['pending_entry'] = {'dir': 'LONG', 'date': '2026-01-01'}
+        params = self._params()
+        chukuangren_band.on_noon_confirm(params, rt, 105.0, '2026-01-02', now_ts=1000.0, qty=3)
+        # 過了60秒 (約12:01),用執行當下 (B) 的最新價 108.0,不是12:00確認價105.0
+        intents = chukuangren_band.on_execute_armed(rt, 108.0, now_ts=1060.0)
+        self.assertEqual(len(intents), 1)
+        self.assertEqual(intents[0]['kind'], 'OPEN')
+        self.assertEqual(intents[0]['action'], '買進')
+        self.assertEqual(intents[0]['qty'], 3)
+        self.assertEqual(intents[0]['price'], 108.0)  # 執行價,不是確認價
+        self.assertIsNone(rt['armed_intent'])          # 已清空,不會重複下單
+        self.assertEqual(rt['armed_at_ts'], 0.0)
+
+    def test_execute_armed_noop_when_nothing_armed(self):
+        rt = strategy_engine.new_runtime()
+        intents = chukuangren_band.on_execute_armed(rt, 100.0, now_ts=9999.0)
+        self.assertEqual(intents, [])
+
+    def test_execute_armed_close_uses_current_qty_from_runtime(self):
+        rt = strategy_engine.new_runtime()
+        rt['state'] = 'LONG'; rt['qty'] = 5
+        rt['pending_exit'] = {'reason': 'SL', 'date': '2026-01-01'}
+        params = self._params()
+        chukuangren_band.on_noon_confirm(params, rt, 91.0, '2026-01-02', now_ts=2000.0)  # 91<Z=92
+        intents = chukuangren_band.on_execute_armed(rt, 90.5, now_ts=2060.0)
+        self.assertEqual(len(intents), 1)
+        self.assertEqual(intents[0]['kind'], 'CLOSE')
+        self.assertEqual(intents[0]['qty'], 5)
+        self.assertEqual(intents[0]['price'], 90.5)
 
     # ---------- 固定停損:觸發→隔天確認/作廢 ----------
 
@@ -3032,7 +3118,7 @@ class TestChukuangrenBand(unittest.TestCase):
         rt['state'] = 'LONG'; rt['qty'] = 2
         rt['pending_exit'] = {'reason': 'SL', 'date': '2026-01-01'}
         params = self._params()
-        intents = chukuangren_band.on_noon_check(params, rt, 91.0, '2026-01-02')  # 91 < Z=92
+        intents = self._confirm_and_execute(params, rt, 91.0, '2026-01-02')  # 91 < Z=92
         self.assertEqual(len(intents), 1)
         self.assertEqual(intents[0]['kind'], 'CLOSE')
         self.assertEqual(intents[0]['action'], '賣出')
@@ -3043,7 +3129,7 @@ class TestChukuangrenBand(unittest.TestCase):
         rt['state'] = 'LONG'
         rt['pending_exit'] = {'reason': 'SL', 'date': '2026-01-01'}
         params = self._params()
-        intents = chukuangren_band.on_noon_check(params, rt, 93.0, '2026-01-02')  # 93 > Z=92
+        intents = self._confirm_and_execute(params, rt, 93.0, '2026-01-02')  # 93 > Z=92
         self.assertEqual(intents, [])
         self.assertIsNone(rt['pending_exit'])
 
@@ -3060,7 +3146,7 @@ class TestChukuangrenBand(unittest.TestCase):
         rt['state'] = 'SHORT'
         rt['pending_exit'] = {'reason': 'SL', 'date': '2026-01-01'}
         params = self._params()
-        intents = chukuangren_band.on_noon_check(params, rt, 109.0, '2026-01-02')  # 109 > S2=108
+        intents = self._confirm_and_execute(params, rt, 109.0, '2026-01-02')  # 109 > S2=108
         self.assertEqual(len(intents), 1)
         self.assertEqual(intents[0]['action'], '買進')
 
@@ -3095,7 +3181,7 @@ class TestChukuangrenBand(unittest.TestCase):
         rt['state'] = 'LONG'; rt['trail_base'] = 107.0
         rt['pending_exit'] = {'reason': 'TP_POINT', 'date': '2026-01-01'}
         params = self._params()
-        intents = chukuangren_band.on_noon_check(params, rt, 106.0, '2026-01-02')  # 106 <= 107
+        intents = self._confirm_and_execute(params, rt, 106.0, '2026-01-02')  # 106 <= 107
         self.assertEqual(len(intents), 1)
         self.assertEqual(intents[0]['kind'], 'CLOSE')
         self.assertEqual(rt['trail_base'], 0.0)
@@ -3105,7 +3191,7 @@ class TestChukuangrenBand(unittest.TestCase):
         rt['state'] = 'LONG'; rt['trail_base'] = 107.0
         rt['pending_exit'] = {'reason': 'TP_POINT', 'date': '2026-01-01'}
         params = self._params()
-        intents = chukuangren_band.on_noon_check(params, rt, 108.0, '2026-01-02')  # 108 > 107
+        intents = self._confirm_and_execute(params, rt, 108.0, '2026-01-02')  # 108 > 107
         self.assertEqual(intents, [])
         self.assertEqual(rt['trail_base'], 107.0)
 
@@ -3168,7 +3254,7 @@ class TestChukuangrenBand(unittest.TestCase):
         rt['state'] = 'LONG'
         rt['pending_exit'] = {'reason': 'TP_SMA20', 'date': '2026-01-01', 'sma20_ref': 102.0}
         params = self._params()
-        intents = chukuangren_band.on_noon_check(params, rt, 99.0, '2026-01-02')
+        intents = self._confirm_and_execute(params, rt, 99.0, '2026-01-02')
         self.assertEqual(len(intents), 1)
         self.assertEqual(intents[0]['kind'], 'CLOSE')
 
@@ -3177,7 +3263,7 @@ class TestChukuangrenBand(unittest.TestCase):
         rt['state'] = 'LONG'
         rt['pending_exit'] = {'reason': 'TP_SMA20', 'date': '2026-01-01', 'sma20_ref': 102.0}
         params = self._params()
-        intents = chukuangren_band.on_noon_check(params, rt, 103.0, '2026-01-02')
+        intents = self._confirm_and_execute(params, rt, 103.0, '2026-01-02')
         self.assertEqual(intents, [])
 
     # ---------- pending_exit 待確認期間暫停繼續評估 ----------
@@ -3201,7 +3287,7 @@ class TestChukuangrenBand(unittest.TestCase):
         chukuangren_band.on_daily_close(params, rt, df1, direction='做多')
         self.assertEqual(rt['pending_entry']['dir'], 'LONG')
 
-        intents = chukuangren_band.on_noon_check(params, rt, 106.0, '2026-01-20', qty=1)
+        intents = self._confirm_and_execute(params, rt, 106.0, '2026-01-20', qty=1)
         self.assertEqual(len(intents), 1)
         self.assertEqual(intents[0]['kind'], 'OPEN')
         strategy_engine.apply_fill({'buy_and_hold': False}, rt, intents[0], now_ts=0)
@@ -3218,7 +3304,7 @@ class TestChukuangrenBand(unittest.TestCase):
         self.assertEqual(rt['pending_exit']['reason'], 'TP_SMA20')
 
         sma20_ref = rt['pending_exit']['sma20_ref']
-        intents2 = chukuangren_band.on_noon_check(params, rt, sma20_ref - 1, '2026-01-23')
+        intents2 = self._confirm_and_execute(params, rt, sma20_ref - 1, '2026-01-23')
         self.assertEqual(len(intents2), 1)
         self.assertEqual(intents2[0]['kind'], 'CLOSE')
         strategy_engine.apply_fill({'buy_and_hold': False}, rt, intents2[0], now_ts=0)

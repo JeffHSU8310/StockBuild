@@ -6264,8 +6264,13 @@ class StockTradingAppPro(tk.Tk):
 
                 if s.get('kind') == chukuangren_band.KIND:
                     # 【新ADR 楚狂人之終極波段】獨立分派:A固定用日K做突破/停損/停利
-                    # 訊號判斷,5分K做「隔天中午12:00」二次確認;B的執行價同樣在
-                    # 確認當下用5分K取得,不沿用一般看A做B的「B最新收盤K棒」。
+                    # 訊號判斷,5分K做「隔天中午12:00」二次確認 (只確認,不下單)。
+                    # 【新ADR 確認/下單分兩個時間點】確認成立後不會在這裡立刻下單,
+                    # 而是記進 rt['armed_intent'],真正送單延後約60秒 (12:01) 由
+                    # _qt_chukuangren_execute_pass() 獨立檢查執行——那個節奏不受
+                    # 這裡5分K邊界閘門限制 (5分K邊界只在整5分鐘觸發,不會剛好落在
+                    # 12:01)。intents 這裡永遠是空的,下面共用的intent處理迴圈對
+                    # 楚狂人策略是no-op,合乎預期。
                     w_contract, w_asset, w_sym, w_mkt = self._qt_resolve_watch(s)
                     if w_contract is None:
                         raise RuntimeError(f"看盤商品(看A)合約解析失敗: {strategy_engine.watch_symbol_of(s)}")
@@ -6288,12 +6293,13 @@ class StockTradingAppPro(tk.Tk):
                                                                  cache_sym=w_sym, cache_market=w_mkt)
                         if intraday_df is not None and not intraday_df.empty:
                             confirm_price = float(intraday_df['Close'].iloc[-1])
-                            intents = chukuangren_band.on_noon_check(
-                                params, rt, confirm_price, today_key, qty=int(s.get('qty', 1)))
-                            if intents:
-                                b_intraday_df = self._qt_fetch_closed_bars(s, contract, asset_type, tf='5分K')
-                                if b_intraday_df is not None and not b_intraday_df.empty:
-                                    b_exec_price = float(b_intraday_df['Close'].iloc[-1])
+                            chukuangren_band.on_noon_confirm(
+                                params, rt, confirm_price, today_key, now_ts, qty=int(s.get('qty', 1)))
+                            if rt.get('armed_intent'):
+                                self.safe_after(0, self.log_message,
+                                                f"【自動交易-待下單】策略「{s.get('name')}」12:00確認成立"
+                                                f" ({rt['armed_intent']['reason']}),約1分鐘後 (12:01) 依"
+                                                f"{s.get('symbol')}當時最新價自動送單。")
                 else:
                     w_contract, w_asset, w_sym, w_mkt = self._qt_resolve_watch(s)
                     if w_contract is None:
@@ -6501,6 +6507,86 @@ class StockTradingAppPro(tk.Tk):
                 self.safe_after(0, self.log_message,
                                 f"【自動交易-即時停損異常】策略「{s.get('name')}」: {type(e).__name__}: {e}")
 
+    def _qt_chukuangren_execute_pass(self):
+        """【新ADR 確認/下單分兩個時間點】楚狂人策略12:00確認成立後不會立刻
+        下單,而是記進 rt['armed_intent']——真正送單要等
+        chukuangren_band.on_execute_armed 判斷『已過60秒』(約12:01) 才發生。
+
+        這個檢查獨立於 _quant_eval_pass 的5分K邊界閘門之外:楚狂人的5分K
+        邊界只在每5分鐘整點觸發一次 (12:00/12:05/...),不會剛好落在12:01,
+        所以延遲下單無法沿用同一套邊界機制,得另外掛在 quant_runner_worker
+        既有的2秒輪詢節奏上,每次都呼叫、沒有 armed_intent 的策略一律
+        立刻continue (成本可忽略)。
+
+        執行價用B (執行商品) 當下最新的1分K收盤價 (比照原本5分K的精神,但
+        用更短週期讓「1分鐘後」這件事真的反映在價格上,不會跟12:00確認時
+        用的是同一根還沒收盤的5分K)。"""
+        if not self._qt_running:
+            return
+        if not (self.api_logged_in and HAS_SJ and self.sj_api):
+            return
+        now_ts = time.time()
+        changed = False
+        for s in list(self.strategies):
+            if not s.get('enabled') or s.get('kind') != chukuangren_band.KIND:
+                continue
+            rt = self._qt_runtime(s['id'])
+            if rt.get('armed_intent') is None:
+                continue
+            try:
+                contract, asset_type = self._qt_resolve(s)
+                if contract is None:
+                    continue
+                b_df = self._qt_fetch_closed_bars(s, contract, asset_type, tf='1分K')
+                if b_df is None or b_df.empty:
+                    continue
+                exec_px = float(b_df['Close'].iloc[-1])
+                intents = chukuangren_band.on_execute_armed(rt, exec_px, now_ts)
+                if not intents:
+                    continue  # 還沒過60秒,下一輪(2秒後)再檢查
+                for intent in intents:
+                    label = (f"策略「{s.get('name')}」{intent['action']} {intent['qty']} "
+                            f"{s.get('symbol')} @ {exec_px:g} [12:01延遲下單]")
+                    ok, reason = strategy_engine.risk_check(s, rt, intent, now_ts)
+                    if not ok:
+                        self.safe_after(0, self.log_message, f"【自動交易-風控擋單】{label} — {reason}")
+                        continue
+                    if s.get('mode') == '實單' and self._qt_running:
+                        sent, msg = self._place_strategy_order(s, intent, contract, asset_type, exec_price=exec_px)
+                        if sent:
+                            strategy_engine.apply_fill(s, rt, intent, now_ts, exec_price=exec_px)
+                            changed = True
+                            self.safe_after(0, self.log_message, f"【自動交易-實單】🔥 {label} | {intent['reason']} | {msg}")
+                        else:
+                            self.safe_after(0, self.log_message, f"【自動交易-實單失敗】{label} — {msg} (狀態未變更)")
+                    else:
+                        strategy_engine.apply_fill(s, rt, intent, now_ts, exec_price=exec_px)
+                        changed = True
+                        try:
+                            rec = paper_account.apply_fill(
+                                self.paper_acct, datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                s.get('market', '台股'), s.get('symbol', ''),
+                                intent['action'], intent['kind'], intent['qty'], exec_px,
+                                trade_type=strategy_engine.trade_type_of(s))
+                            paper_account.mark_price(self.paper_acct, s.get('symbol', ''), exec_px)
+                            self._qt_save_paper()
+                            pnl_txt = f",此筆已實現 {_fmt_amt_signed(rec['pnl'])}" if intent['kind'] == 'CLOSE' else ""
+                            eq = paper_account.equity(self.paper_acct)
+                            self.safe_after(0, self.log_message,
+                                            f"【自動交易-模擬】🧪 {label} | {intent['reason']} → 已記入模擬帳戶"
+                                            f" (權益 {_fmt_amt(eq)}{pnl_txt})")
+                        except Exception:
+                            self.safe_after(0, self.log_message, f"【自動交易-模擬】🧪 {label} | {intent['reason']} (模擬)")
+                rt['error_count'] = 0
+            except Exception as e:
+                rt['error_count'] = int(rt.get('error_count', 0)) + 1
+                self.safe_after(0, self.log_message,
+                                f"【自動交易-異常】策略「{s.get('name')}」延遲下單第 {rt['error_count']} 次錯誤: "
+                                f"{type(e).__name__}: {e}")
+        if changed:
+            self._qt_save_state()
+            self.safe_after(0, self._qt_refresh_tree)
+
     def _qt_refresh_paper_account(self):
         try:
             if not getattr(self, '_paper_win', None) or not self._paper_win.winfo_exists():
@@ -6553,7 +6639,8 @@ class StockTradingAppPro(tk.Tk):
                 if getattr(self, '_closing', False):
                     return
                 self._quant_eval_pass()
-                
+                self._qt_chukuangren_execute_pass()
+
                 now_ts = _time.time()
                 if self.api_logged_in and HAS_SJ and getattr(self, 'sj_api', None) and getattr(self, 'paper_acct', None):
                     if now_ts - last_snap_time >= 3.0:
@@ -7144,8 +7231,10 @@ class StockTradingAppPro(tk.Tk):
         except Exception:
             pass
         tk.Label(dlg, text=("看加權指數走勢決定進出場方向,實際下單另一個你自選的商品 (股票/期貨)。"
-                            "進場/停損/停利訊號一律「隔天中午12:00 (5分K收盤價) 二次確認」才會真正下單，"
-                            "當天觸發只是「待確認」，隔天不成立就作廢、繼續等下一次訊號。"),
+                            "進場/停損/停利訊號一律「隔天中午12:00 (5分K收盤價) 二次確認」，"
+                            "當天觸發只是「待確認」，隔天不成立就作廢、繼續等下一次訊號。"
+                            "確認成立後不會立刻下單，會等約1分鐘 (12:01) 依當時最新價才真正送單，"
+                            "確認與下單是兩個不同時間點。"),
                  bg="#12181F", fg="#FFCA28", font=('微軟正黑體', 9), wraplength=600,
                  justify='left').pack(fill=tk.X, padx=10, pady=(10, 4))
 
@@ -7190,6 +7279,31 @@ class StockTradingAppPro(tk.Tk):
         cb_mode.set(s.get('mode', '模擬')); cb_mode.grid(row=4, column=3, padx=4, pady=(8, 0), sticky='w')
         tk.Label(top, text="(做空僅限期貨)", bg="#1A2026", fg="#8A99AD",
                  font=('微軟正黑體', 8)).grid(row=4, column=4, columnspan=2, sticky='w', padx=(8, 0), pady=(8, 0))
+
+        # 【新ADR】委託方式:限價/市價/範圍市價 (範圍市價僅期貨;零股鐵則6鎖限價)
+        _lbl(top, "委託方式").grid(row=5, column=0, sticky='w', pady=(8, 0))
+        cb_ptype = ttk.Combobox(top, width=8, state='readonly', style="BlackText.TCombobox")
+        cb_ptype.grid(row=5, column=1, padx=4, pady=(8, 0), sticky='w')
+        lbl_ptype_hint = tk.Label(top, bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8))
+        lbl_ptype_hint.grid(row=5, column=2, columnspan=4, sticky='w', padx=(8, 0), pady=(8, 0))
+
+        def _sync_ptype_options(*_a):
+            tt_now = cb_tt.get()
+            if tt_now == '期貨':
+                vals = list(strategy_engine.PRICE_TYPES)
+                hint = "限價套用「讓價檔數」;市價/範圍市價 依當下市場成交。"
+            elif tt_now == '零股':
+                vals = ['限價']
+                hint = "零股依交易所規則只能限價 (鐵則6)。"
+            else:
+                vals = ['限價', '市價']
+                hint = "限價套用「讓價檔數」;市價 依當下市場成交。股票無範圍市價。"
+            cb_ptype.config(values=vals)
+            cur = s.get('price_type', '限價') if not cb_ptype.get() else cb_ptype.get()
+            cb_ptype.set(cur if cur in vals else '限價')
+            lbl_ptype_hint.config(text=hint)
+        cb_tt.bind('<<ComboboxSelected>>', lambda e: _sync_ptype_options(), add='+')
+        _sync_ptype_options()
 
         watch_fr = tk.Frame(dlg, bg="#12181F"); watch_fr.pack(fill=tk.X, padx=12, pady=(8, 4))
         tk.Label(watch_fr, text="看盤(A) — 固定看指數,決定進出場方向 (不下單)", bg="#12181F",
@@ -7252,6 +7366,7 @@ class StockTradingAppPro(tk.Tk):
             except (TypeError, ValueError):
                 s['qty'] = 0
             s['mode'] = cb_mode.get()
+            s['price_type'] = cb_ptype.get() or '限價'
             s['watch_enabled'] = True
             s['watch_symbol'] = e_wsym.get().strip().upper() or '^TWII'
             s['watch_trade_type'] = '指數'
