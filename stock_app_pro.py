@@ -6451,7 +6451,8 @@ class StockTradingAppPro(tk.Tk):
                         mult, _ = paper_account._fut_multiplier(sym)
                         u = diff * mult * p['qty']
                     tag = 'p_win' if u > 0 else ('p_loss' if u < 0 else 'p_flat')
-                    tvp.insert("", tk.END, iid=sym, values=(sym, p['market'], p['direction'], p['qty'],
+                    name = self._wl_display_name(sym)
+                    tvp.insert("", tk.END, iid=sym, values=(sym, name, p['direction'], p['qty'],
                                                     f"{p['avg_price']:g}", f"{p.get('mark_price', p['avg_price']):g}",
                                                     f"{_fmt_amt_signed(u)}"), tags=(tag,))
                 if keep and tvp.exists(keep):
@@ -9348,11 +9349,12 @@ class StockTradingAppPro(tk.Tk):
         tk.Label(dlg, text="※ 台股含手續費0.1425%與證交稅0.3%;期貨每口單邊估50元、以契約乘數計損益(TXF=200/MXF=50/TMF=10);未實現以最後成交標記價計。",
                  bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8)).pack(anchor='w', padx=12)
         tk.Label(dlg, text="目前持倉:", bg="#1A2026", fg="#FFCA28", font=('微軟正黑體', 9, 'bold')).pack(anchor='w', padx=12, pady=(6, 0))
-        pos_cols = ("sym", "market", "dir", "qty", "avg", "mark", "unreal")
-        pos_heads = {"sym": "商品", "market": "市場", "dir": "方向", "qty": "數量", "avg": "均價", "mark": "標記價", "unreal": "未實現"}
+        pos_cols = ("sym", "name", "dir", "qty", "avg", "mark", "unreal")
+        pos_heads = {"sym": "商品代號", "name": "商品名稱", "dir": "方向", "qty": "數量", "avg": "均價", "mark": "標記價", "unreal": "未實現"}
+        widths_pos = {"sym": 80, "name": 90, "dir": 50, "qty": 50, "avg": 80, "mark": 80, "unreal": 90}
         tvp = ttk.Treeview(dlg, columns=pos_cols, show="headings", style='Trades.Treeview', height=4)
         for c in pos_cols:
-            tvp.heading(c, text=pos_heads[c]); tvp.column(c, width=110, anchor="center")
+            tvp.heading(c, text=pos_heads[c]); tvp.column(c, width=widths_pos[c], anchor="center")
         tvp.tag_configure('p_win', foreground='#FF1744', background='#12161A')
         tvp.tag_configure('p_loss', foreground='#00E676', background='#12161A')
         tvp.tag_configure('p_flat', foreground='white', background='#12161A')
