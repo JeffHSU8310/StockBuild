@@ -3016,6 +3016,28 @@ class TestChukuangrenBand(unittest.TestCase):
         chukuangren_band.on_daily_close(params, rt, df2, direction='做多')
         self.assertEqual(rt['pending_exit']['reason'], 'TP_SMA20')
 
+    def test_long_does_not_switch_to_sma20_mode_when_profit_not_over_c(self):
+        rt = strategy_engine.new_runtime()
+        rt['state'] = 'LONG'; rt['entry_index_price'] = 100.0
+        params = self._params(y=50.0)  # c=5.0
+        # profit=104-100=4 < C=5,即使收盤(104)已站上 sma20(=100.2) 也不該切換
+        df = self._mk_daily_df([100] * 19 + [104])
+        chukuangren_band.on_daily_close(params, rt, df, direction='做多')
+        self.assertFalse(rt['sma20_mode'])
+
+    def test_short_switches_to_sma20_mode_only_after_profit_over_c(self):
+        rt = strategy_engine.new_runtime()
+        rt['state'] = 'SHORT'; rt['entry_index_price'] = 100.0
+        params = self._params(s1=150.0)  # c=5.0
+        # profit=100-97=3 < C=5,即使收盤(97)已跌破 sma20(=99.85) 也不該切換
+        df = self._mk_daily_df([100] * 19 + [97])
+        chukuangren_band.on_daily_close(params, rt, df, direction='做空')
+        self.assertFalse(rt['sma20_mode'])
+        # 隔天獲利拉大到超過 C 且仍跌破 sma20,才真正切換
+        df2 = self._mk_daily_df([100] * 19 + [97, 80])
+        chukuangren_band.on_daily_close(params, rt, df2, direction='做空')
+        self.assertTrue(rt['sma20_mode'])
+
     def test_long_fixed_stop_still_fires_even_in_sma20_mode(self):
         rt = strategy_engine.new_runtime()
         rt['state'] = 'LONG'; rt['entry_index_price'] = 100.0

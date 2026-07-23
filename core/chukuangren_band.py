@@ -23,9 +23,10 @@ core/chukuangren_band.py — 「楚狂人之終極波段」內建策略 (純邏�
     有多單:跌破Y → 待確認停損;若已進入 SMA20 模式且跌破SMA20 → 待確認SMA20停利;
             否則走點數移動停利 (獲利(收盤-D)超過C才啟動,停利線從進場點D起算,
             獲利每上升F、停利線就往上鎖F(棘輪式,只升不降),跌破停利線 →
-            待確認點數停利);若收盤漲過SMA20 → 切換進 SMA20 模式 (一旦切換,
-            不會切回;固定停損Y仍持續監控)。
-    空單對稱處理 (S1/S2、停利線從進場點E往下鎖)。
+            待確認點數停利);獲利超過C 且收盤漲過SMA20 → 切換進 SMA20 模式
+            (一旦切換,不會切回;固定停損Y仍持續監控)。
+    空單對稱處理 (S1/S2、停利線從進場點E往下鎖;獲利超過C 且收盤跌破SMA20
+    才切換進 SMA20 模式)。
 
   【ADR-085 移除 H】舊版有一個「移動停利基準起始值 H」是絕對指數點位,但進場點
   D 要進場當下才知道,預先填一個絕對值 (甚至填 0) 會讓點數移動停利失效。改成
@@ -72,7 +73,9 @@ PARAM_HELP = {
     's2': ("空單的『停損確認線』(加權指數點位)。突破 S1 之後,隔天中午12:00 加權指數仍"
            "高於 S2,空單才真的全部平倉;若已回到 S2 之下就作廢、繼續持有。一般設在 S1 附近。"),
     'c': ("移動停利的『啟動門檻』(點數)。獲利 (目前加權指數與進場點位的差) 超過 C 點,"
-          "才開始用移動停利保護獲利;C 也大約等於允許的回撤點數 (回撤到接近成本就出場)。"),
+          "才開始用移動停利保護獲利;C 也大約等於允許的回撤點數 (回撤到接近成本就出場)。"
+          "同時也是切換到 SMA20 移動停利模式的前提:獲利要先超過 C,且收盤站上/跌破"
+          "SMA20,才會切換,獲利還沒過 C 時即使站上/跌破 SMA20 也不會切換。"),
     'f': ("移動停利的『步幅』(點數)。啟動後,獲利每再增加 F 點,停利線就往上 (多單) /"
           "往下 (空單) 鎖 F 點,鎖住的獲利只增不減;F 越小,停利線跟得越緊。"),
 }
@@ -220,8 +223,8 @@ def on_daily_close(params, rt, daily_df, direction='做多'):
                 rt['pending_exit'] = {'reason': 'TP_SMA20', 'date': today_date, 'sma20_ref': sma20}
             return rt
         # 點數移動停利模式:停利線從進場點 entry_px 起算,獲利每 +F 往上鎖 F
+        profit = (close - entry_px) if entry_px > 0 else 0.0
         if entry_px > 0:
-            profit = close - entry_px
             if not rt.get('trail_armed') and profit > C:
                 rt['trail_armed'] = True
                 rt['trail_base'] = entry_px
@@ -234,7 +237,10 @@ def on_daily_close(params, rt, daily_df, direction='做多'):
             if rt.get('trail_armed') and close < rt.get('trail_base', entry_px):
                 rt['pending_exit'] = {'reason': 'TP_POINT', 'date': today_date}
                 return rt
-        if not pd.isna(sma20) and close > sma20:
+        # 【使用者需求】獲利要先超過 C,且收盤站上 SMA20,才切換進 SMA20 模式;
+        # 獲利還沒過 C 時即使站上 SMA20 也不切換,避免剛進場、獲利極小甚至還沒
+        # 啟動點數移動停利保護,就被 SMA20 雜訊提早切走。
+        if profit > C and not pd.isna(sma20) and close > sma20:
             rt['sma20_mode'] = True
     else:  # SHORT
         if close > S1:
@@ -244,8 +250,8 @@ def on_daily_close(params, rt, daily_df, direction='做多'):
             if not pd.isna(sma20) and close > sma20:
                 rt['pending_exit'] = {'reason': 'TP_SMA20', 'date': today_date, 'sma20_ref': sma20}
             return rt
+        profit = (entry_px - close) if entry_px > 0 else 0.0
         if entry_px > 0:
-            profit = entry_px - close
             if not rt.get('trail_armed') and profit > C:
                 rt['trail_armed'] = True
                 rt['trail_base'] = entry_px
@@ -258,7 +264,7 @@ def on_daily_close(params, rt, daily_df, direction='做多'):
             if rt.get('trail_armed') and close > rt.get('trail_base', entry_px):
                 rt['pending_exit'] = {'reason': 'TP_POINT', 'date': today_date}
                 return rt
-        if not pd.isna(sma20) and close < sma20:
+        if profit > C and not pd.isna(sma20) and close < sma20:
             rt['sma20_mode'] = True
     return rt
 
