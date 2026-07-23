@@ -42,6 +42,7 @@ from core import taifex_daily
 from core import market_session
 from core import secure_store
 from core import chukuangren_band
+from core import telegram_notify
 from data import config_store
 from data import taifex_store
 
@@ -347,6 +348,9 @@ class StockTradingAppPro(tk.Tk):
         self.log_message("【系統啟動】已阻斷初始 YF 加載。請先完成券商實盤 API 驗證登入。")
         # 【ADR-035】量化自動交易:總開關每次啟動一律關閉 (絕不持久化「開」狀態)
         self._qt_running = False
+        # 【新ADR】Telegram 通知設定:快取進記憶體,log_message() 每次呼叫都會
+        # 檢查,不要每次都重新讀檔案 (量化 runner 訊息很密集)。
+        self.telegram_cfg = config_store.load_telegram_config(self.TELEGRAM_CONFIG_FILE)
         self._qt_load()
         self._qt_refresh_tree()
         threading.Thread(target=self.fetch_market_indices_worker, daemon=True).start()
@@ -2073,6 +2077,9 @@ class StockTradingAppPro(tk.Tk):
         tk.Button(bar, text="💰 模擬帳戶", bg="#FFB300", fg="black",
                   relief="flat", font=('微軟正黑體', 9, 'bold'), padx=10, pady=2,
                   command=self._qt_open_paper_window).pack(side=tk.LEFT, padx=6)
+        tk.Button(bar, text="📱 Telegram通知", bg="#26A5E4", fg="white",
+                  relief="flat", font=('微軟正黑體', 9, 'bold'), padx=10, pady=2,
+                  command=self._qt_open_telegram_settings).pack(side=tk.LEFT, padx=6)
         if compact:
             # 分頁版:最重要的是「把完整視窗叫出來」這顆按鈕
             tk.Button(bar, text="🗔 開啟量化交易視窗 (完整畫面)", bg="#7E57C2", fg="white",
@@ -5449,6 +5456,129 @@ class StockTradingAppPro(tk.Tk):
                         pass
             except Exception:
                 pass
+        # 【新ADR】量化交易啟動中,任何成交/系統訊息 (統一以「【自動交易-xxx】」
+        # 開頭,見 telegram_notify.is_quant_message) 都額外用 Telegram 推播一份。
+        # 只在總開關開啟時推播 (使用者要求「啟動量化交易時」才要),且 bot_token/
+        # chat_id 都設定好才會真的送;實際 HTTP 呼叫丟背景執行緒,不擋 UI。
+        if (getattr(self, '_qt_running', False)
+                and telegram_notify.is_quant_message(msg)
+                and telegram_notify.config_ready(getattr(self, 'telegram_cfg', None))):
+            self._send_telegram_async(str(msg))
+
+    def _send_telegram_async(self, text):
+        """背景執行緒送出 Telegram 訊息 (urllib,零新依賴)。成功/失敗都只記
+        一行系統日誌 (不用「【自動交易」開頭,避免被 is_quant_message 抓到
+        又反覆觸發推播);失敗不拋例外、不影響量化 runner 本身運作。"""
+        cfg = self.telegram_cfg
+        def _worker():
+            import urllib.request
+            try:
+                req_spec = telegram_notify.build_send_request(
+                    cfg.get('bot_token', ''), cfg.get('chat_id', ''), text)
+                req = urllib.request.Request(req_spec['url'], data=req_spec['data'],
+                                             headers=req_spec['headers'])
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    body = resp.read()
+                ok, info = telegram_notify.parse_response(body)
+                if not ok:
+                    self.safe_after(0, self.log_message, f"【Telegram通知】送出失敗: {info}")
+            except Exception as e:
+                self.safe_after(0, self.log_message, f"【Telegram通知】送出失敗: {type(e).__name__}: {e}")
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _telegram_test_send(self, bot_token, chat_id, text, status_cb):
+        """設定視窗的「測試發送」用:直接用畫面上目前 (可能還沒存檔) 的
+        bot_token/chat_id 送一則測試訊息,結果回報給 status_cb (更新對話框
+        裡的狀態文字),不寫進主系統日誌、不受 is_quant_message/總開關限制。"""
+        def _worker():
+            import urllib.request
+            try:
+                req_spec = telegram_notify.build_send_request(bot_token, chat_id, text)
+                req = urllib.request.Request(req_spec['url'], data=req_spec['data'],
+                                             headers=req_spec['headers'])
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    body = resp.read()
+                ok, info = telegram_notify.parse_response(body)
+                self.safe_after(0, status_cb, ("✓ 測試訊息已送出,請檢查 Telegram。" if ok
+                                               else f"✗ 送出失敗: {info}"), ok)
+            except ValueError as e:
+                self.safe_after(0, status_cb, f"✗ {e}", False)
+            except Exception as e:
+                self.safe_after(0, status_cb, f"✗ 送出失敗: {type(e).__name__}: {e}", False)
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _qt_open_telegram_settings(self):
+        """【新ADR】Telegram 通知設定:量化交易總開關開啟期間,任何成交/系統
+        訊息 (【自動交易-xxx】開頭) 都會額外推播一份到這裡設定的聊天。"""
+        cfg = dict(self.telegram_cfg or {})
+        dlg = tk.Toplevel(self)
+        dlg.title("📱 Telegram 通知設定")
+        dlg.configure(bg="#1A2026")
+        self.center_window(dlg, 560, 380)
+        dlg.transient(self)
+        try:
+            dlg.lift(); dlg.focus_force()
+        except Exception:
+            pass
+        tk.Label(dlg, text=("啟動自動交易「總開關」期間,任何成交/風控/休市待命/例外等系統訊息 "
+                            "(系統日誌裡「【自動交易-xxx】」開頭的那些) 都會額外用 Telegram 推播一份。\n"
+                            "取得方式:跟 @BotFather 對話建立 Bot 拿到 Token;跟你的 Bot 說一句話後,"
+                            "用 @userinfobot 或 https://api.telegram.org/bot<Token>/getUpdates 查出 Chat ID。"),
+                 bg="#12181F", fg="#8A99AD", font=('微軟正黑體', 9), wraplength=520,
+                 justify='left').pack(fill=tk.X, padx=10, pady=(10, 6))
+
+        row = tk.Frame(dlg, bg="#1A2026"); row.pack(fill=tk.X, padx=12, pady=2)
+        tk.Label(row, text="Bot Token", bg="#1A2026", fg="white", font=('微軟正黑體', 9)).grid(row=0, column=0, sticky='w')
+        e_token = tk.Entry(row, width=42, bg="#2A323D", fg="white", show="*")
+        e_token.insert(0, cfg.get('bot_token', '')); e_token.grid(row=0, column=1, padx=4, sticky='w', pady=(0, 4))
+        tk.Label(row, text="Chat ID", bg="#1A2026", fg="white", font=('微軟正黑體', 9)).grid(row=1, column=0, sticky='w')
+        e_chat = tk.Entry(row, width=20, bg="#2A323D", fg="white")
+        e_chat.insert(0, cfg.get('chat_id', '')); e_chat.grid(row=1, column=1, padx=4, sticky='w')
+
+        var_enabled = tk.BooleanVar(value=bool(cfg.get('enabled', False)))
+        tk.Checkbutton(dlg, text="啟用 Telegram 通知", variable=var_enabled,
+                       bg="#1A2026", fg="#00E676", selectcolor="#2A323D", activebackground="#1A2026",
+                       font=('微軟正黑體', 9, 'bold')).pack(anchor='w', padx=12, pady=(8, 2))
+
+        lbl_status = tk.Label(dlg, text="", bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 9),
+                              wraplength=520, justify='left', anchor='w')
+        lbl_status.pack(fill=tk.X, padx=12, pady=(4, 0))
+
+        def _set_status(msg, ok=True):
+            try:
+                if dlg.winfo_exists():
+                    lbl_status.config(text=msg, fg="#00E676" if ok else "#FF5252")
+            except Exception:
+                pass
+
+        def _test():
+            token = e_token.get().strip()
+            chat_id = e_chat.get().strip()
+            if not token or not chat_id:
+                _set_status("✗ 請先填 Bot Token 與 Chat ID", False)
+                return
+            _set_status("送出中…")
+            self._telegram_test_send(token, chat_id, "【測試訊息】StockBuild Telegram 通知設定成功。", _set_status)
+
+        def _save():
+            token = e_token.get().strip()
+            chat_id = e_chat.get().strip()
+            enabled = bool(var_enabled.get())
+            if enabled and not (token and chat_id):
+                _set_status("✗ 啟用通知前,Bot Token 與 Chat ID 都要先填", False)
+                return
+            config_store.save_telegram_config(self.TELEGRAM_CONFIG_FILE, token, chat_id, enabled)
+            self.telegram_cfg = {'bot_token': token, 'chat_id': chat_id, 'enabled': enabled}
+            self.log_message(f"【Telegram通知】設定已儲存 ({'已啟用' if enabled else '已停用'})。")
+            dlg.destroy()
+
+        foot = tk.Frame(dlg, bg="#1A2026"); foot.pack(pady=10)
+        tk.Button(foot, text="🧪 測試發送", bg="#00ACC1", fg="black", relief="flat",
+                  font=('微軟正黑體', 10, 'bold'), padx=14, pady=3, command=_test).pack(side=tk.LEFT, padx=6)
+        tk.Button(foot, text="儲存", bg="#29B6F6", fg="black", relief="flat",
+                  font=('微軟正黑體', 10, 'bold'), padx=18, pady=3, command=_save).pack(side=tk.LEFT, padx=6)
+        tk.Button(foot, text="取消", bg="#2A323D", fg="white", relief="flat",
+                  font=('微軟正黑體', 10), padx=18, pady=3, command=dlg.destroy).pack(side=tk.LEFT, padx=6)
 
     # ================= 使用者調整#5:我的委託單 / 我的已成交 =================
     # ================= 【第十一輪 第2項】我的庫存 =================
@@ -7017,6 +7147,7 @@ class StockTradingAppPro(tk.Tk):
                   font=('微軟正黑體', 11), padx=18, pady=4, command=dlg.destroy).pack(side=tk.LEFT, padx=6)
 
     AI_CONFIG_FILE = "ai_config.json"
+    TELEGRAM_CONFIG_FILE = "telegram_config.json"
     STRATEGY_SCRIPT_DIR = "strategies"
     BT_CACHE_TTL = 600          # 【ADR-052】回測下載快取有效期 (秒)
     BT_CACHE_MAX = 4            # 最多保留幾筆 (原始分K很佔記憶體)

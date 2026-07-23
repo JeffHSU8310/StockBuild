@@ -16,6 +16,7 @@ import sys
 import json
 import tempfile
 import unittest
+import urllib.parse
 
 # 讓這份測試不管從哪個目錄被呼叫，都找得到專案根目錄下的 core/ 與 data/ 套件
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -39,6 +40,7 @@ from core import optimizer
 from core import paper_account
 from core import taifex_daily
 from core import chukuangren_band
+from core import telegram_notify
 from data import config_store
 from data import taifex_store
 
@@ -1258,6 +1260,82 @@ class TestAiConfigStore(unittest.TestCase):
         self.assertEqual(d['model'], 'claude-sonnet-4-6')
         self.assertEqual(config_store.load_ai_config(p + '.none'), {})
         os.remove(p)
+
+
+class TestTelegramConfigStore(unittest.TestCase):
+    """【新ADR】Telegram 通知設定檔存取。"""
+
+    def test_roundtrip_and_missing(self):
+        import tempfile
+        p = os.path.join(tempfile.gettempdir(), '_telegram_notify_config.json')
+        config_store.save_telegram_config(p, '123:ABC', '999888', True)
+        d = config_store.load_telegram_config(p)
+        self.assertEqual(d['bot_token'], '123:ABC')
+        self.assertEqual(d['chat_id'], '999888')
+        self.assertTrue(d['enabled'])
+        self.assertEqual(config_store.load_telegram_config(p + '.none'), {})
+        os.remove(p)
+
+    def test_disabled_roundtrip(self):
+        import tempfile
+        p = os.path.join(tempfile.gettempdir(), '_telegram_notify_config2.json')
+        config_store.save_telegram_config(p, '', '', False)
+        d = config_store.load_telegram_config(p)
+        self.assertEqual(d['bot_token'], '')
+        self.assertFalse(d['enabled'])
+        os.remove(p)
+
+
+class TestTelegramNotify(unittest.TestCase):
+    """【新ADR】Telegram 通知純邏輯層:訊息判斷/組請求/解析回應,零網路呼叫。"""
+
+    def test_is_quant_message_matches_prefix(self):
+        self.assertTrue(telegram_notify.is_quant_message("【自動交易-模擬】策略「A」買進 1 2330 @ 600"))
+        self.assertTrue(telegram_notify.is_quant_message("【自動交易-風控擋單】xxx"))
+        self.assertFalse(telegram_notify.is_quant_message("【量化交易】已開啟獨立視窗"))
+        self.assertFalse(telegram_notify.is_quant_message("隨便一段不相干的文字"))
+        self.assertFalse(telegram_notify.is_quant_message(""))
+        self.assertFalse(telegram_notify.is_quant_message(None))
+
+    def test_config_ready(self):
+        self.assertTrue(telegram_notify.config_ready({'bot_token': '123:ABC', 'chat_id': '999'}))
+        self.assertFalse(telegram_notify.config_ready({'bot_token': '', 'chat_id': '999'}))
+        self.assertFalse(telegram_notify.config_ready({'bot_token': '123:ABC', 'chat_id': ''}))
+        self.assertFalse(telegram_notify.config_ready({}))
+        self.assertFalse(telegram_notify.config_ready(None))
+
+    def test_build_send_request_shape(self):
+        req = telegram_notify.build_send_request('123:ABC', '999888', '策略成交測試')
+        self.assertEqual(req['url'], 'https://api.telegram.org/bot123:ABC/sendMessage')
+        self.assertIn(b'chat_id=999888', req['data'])
+        self.assertIn('Content-Type', req['headers'])
+
+    def test_build_send_request_rejects_blank_credentials(self):
+        with self.assertRaises(ValueError):
+            telegram_notify.build_send_request('', '999888', 'x')
+        with self.assertRaises(ValueError):
+            telegram_notify.build_send_request('123:ABC', '', 'x')
+
+    def test_build_send_request_truncates_long_text(self):
+        long_text = 'A' * 5000
+        req = telegram_notify.build_send_request('123:ABC', '999888', long_text)
+        # 解碼回來確認實際送出的文字沒有超過上限太多 (含截斷提示字樣)
+        decoded = urllib.parse.parse_qs(req['data'].decode('utf-8'))['text'][0]
+        self.assertLessEqual(len(decoded), telegram_notify.MAX_MESSAGE_LEN + 20)
+        self.assertIn('截斷', decoded)
+
+    def test_parse_response_ok(self):
+        ok, msg = telegram_notify.parse_response(b'{"ok":true,"result":{"message_id":1}}')
+        self.assertTrue(ok)
+
+    def test_parse_response_failure_with_description(self):
+        ok, msg = telegram_notify.parse_response('{"ok":false,"description":"Bad Request: chat not found"}')
+        self.assertFalse(ok)
+        self.assertIn('chat not found', msg)
+
+    def test_parse_response_invalid_json(self):
+        ok, msg = telegram_notify.parse_response('not json at all')
+        self.assertFalse(ok)
 
 
 class TestCostModel(unittest.TestCase):

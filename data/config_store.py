@@ -168,6 +168,26 @@ def save_ai_config(path: str, api_key: str, model: str):
 
 
 # ---------------------------------------------------------------------------
+# 【新ADR】Telegram 通知設定 (bot token + chat id + 開關)
+# ---------------------------------------------------------------------------
+def load_telegram_config(path: str) -> dict:
+    """讀取 Telegram 通知設定。檔案不存在/壞掉回傳空 dict (呼叫端補預設值)。"""
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_telegram_config(path: str, bot_token: str, chat_id: str, enabled: bool):
+    """儲存 Telegram 通知設定 (token 僅存本機,注意檔案不要外流)。"""
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump({'bot_token': str(bot_token or ''), 'chat_id': str(chat_id or ''),
+                  'enabled': bool(enabled)}, f, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
 # 【ADR-072】一般 App 設定 (通用鍵值,例如盤中零股開盤時刻、自動重連/自動登入
 # 偏好等)。用一份 JSON 存放,讀不到/壞掉一律回傳預設,絕不因設定檔壞掉就當掉。
 # ---------------------------------------------------------------------------
