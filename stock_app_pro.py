@@ -6120,12 +6120,16 @@ class StockTradingAppPro(tk.Tk):
 
     def _place_strategy_order(self, strategy, intent, contract, asset_type, exec_price=None):
         """
-        實單下單:鏡射 execute_order 的組單參數 (股票=現股整股限價ROD,
-        期貨=限價ROD),價格 ± slippage_ticks 檔 (往成交方向讓價)。回傳 (ok, 說明)。
+        實單下單:鏡射 execute_order 的組單參數 (股票=現股整股,期貨=無條件單),
+        委託方式依 strategy['price_type'] (限價/市價/範圍市價,新ADR)。
+        限價才會套用 slippage_ticks 讓價;市價/範圍市價 價格送 0,依市場當下成交。
 
         【ADR-075 看A做B】exec_price:實際「要下單的商品 B」的成交基準價;有帶
         就用它 (看A做B),否則沿用 intent['price'] (一般模式 = 訊號商品自己的價)。
         contract/asset_type 一律是 B (執行商品),tick/讓價都以 B 計。
+
+        【鐵則6】零股一律強制限價 (price_type_of 已做防呆退回限價),不因這裡
+        新增的委託方式選項而放寬,交易所規則不可繞過。
         """
         try:
             sym = str(strategy.get('symbol', '')).upper()
@@ -6137,27 +6141,36 @@ class StockTradingAppPro(tk.Tk):
             px = round(round(px / tick) * tick, 4)
             sj_action = sj.constant.Action.Buy if intent['action'] == '買進' else sj.constant.Action.Sell
             tt = strategy_engine.trade_type_of(strategy)
+            ptype = strategy_engine.price_type_of(strategy)
+            is_lmt = (ptype == '限價')
+            order_px = px if is_lmt else 0.0
+            ptype_label = {'限價': f"限價{px:g}", '市價': "市價", '範圍市價': "範圍市價"}[ptype]
             if tt == '期貨':
-                order = self.sj_api.Order(price=px, quantity=qty, action=sj_action,
-                                          price_type=sj.constant.FuturesPriceType.LMT,
+                fut_ptype = {'限價': sj.constant.FuturesPriceType.LMT,
+                             '市價': sj.constant.FuturesPriceType.MKT,
+                             '範圍市價': sj.constant.FuturesPriceType.MKP}[ptype]
+                order = self.sj_api.Order(price=order_px, quantity=qty, action=sj_action,
+                                          price_type=fut_ptype,
                                           order_type=sj.constant.OrderType.ROD)
             elif tt == '零股':
-                # 【ADR-043 第4項】零股:盤中零股單 (IntradayOdd),數量單位=股
-                order = self.sj_api.Order(price=px, quantity=qty, action=sj_action,
+                # 【ADR-043 第4項/鐵則6】零股:盤中零股單 (IntradayOdd),數量單位=股,
+                # 只能限價 (price_type_of 已強制退回限價,order_px 一定等於 px)。
+                order = self.sj_api.Order(price=order_px, quantity=qty, action=sj_action,
                                           price_type=sj.constant.StockPriceType.LMT,
                                           order_type=sj.constant.OrderType.ROD,
                                           order_lot=sj.constant.StockOrderLot.IntradayOdd,
                                           order_cond=sj.constant.StockOrderCond.Cash)
             else:  # 股票 (整股)
-                order = self.sj_api.Order(price=px, quantity=qty, action=sj_action,
-                                          price_type=sj.constant.StockPriceType.LMT,
+                stk_ptype = sj.constant.StockPriceType.MKT if ptype == '市價' else sj.constant.StockPriceType.LMT
+                order = self.sj_api.Order(price=order_px, quantity=qty, action=sj_action,
+                                          price_type=stk_ptype,
                                           order_type=sj.constant.OrderType.ROD,
                                           order_lot=sj.constant.StockOrderLot.Common,
                                           order_cond=sj.constant.StockOrderCond.Cash)
             trade = self.sj_api.place_order(contract, order)
             st = getattr(getattr(trade, 'status', None), 'status', '')
             unit = strategy_engine.qty_unit_of(strategy)
-            return True, f"限價 {px:g} x{qty}{unit} ({tt}) 已送出 (狀態 {getattr(st, 'name', st) or '送出'})"
+            return True, f"{ptype_label} x{qty}{unit} ({tt}) 已送出 (狀態 {getattr(st, 'name', st) or '送出'})"
         except Exception as e:
             return False, f"{type(e).__name__}: {e}"
 
@@ -7525,6 +7538,35 @@ class StockTradingAppPro(tk.Tk):
         cb_mode = ttk.Combobox(top, values=['模擬', '實單'], width=7, state='readonly', style="BlackText.TCombobox")
         cb_mode.set(s.get('mode', '模擬')); cb_mode.grid(row=3, column=5, padx=4, pady=(6, 0))
 
+        # 【新ADR】委託方式:限價/市價/範圍市價。範圍市價僅期貨支援 (TAIFEX規則);
+        # 零股依鐵則6只能限價,交易種類選零股時鎖住只剩「限價」可選。
+        _ptype_row = tk.Frame(top, bg="#1A2026")
+        _ptype_row.grid(row=12, column=0, columnspan=7, sticky='w', pady=(2, 0))
+        tk.Label(_ptype_row, text="委託方式", bg="#1A2026", fg="white",
+                 font=('微軟正黑體', 9)).pack(side=tk.LEFT)
+        cb_ptype = ttk.Combobox(_ptype_row, width=8, state='readonly', style="BlackText.TCombobox")
+        cb_ptype.pack(side=tk.LEFT, padx=6)
+        _lbl_ptype_hint = tk.Label(_ptype_row, bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8))
+        _lbl_ptype_hint.pack(side=tk.LEFT, padx=(6, 0))
+
+        def _sync_ptype_options(*_a):
+            tt_now = cb_tt.get()
+            if tt_now == '期貨':
+                vals = list(strategy_engine.PRICE_TYPES)
+                hint = "限價才會套用「讓價檔數」讓價;市價/範圍市價 依當下市場成交(價格送0)。"
+            elif tt_now == '零股':
+                vals = ['限價']
+                hint = "零股依交易所規則只能限價 (鐵則6),市價/範圍市價 不開放。"
+            else:  # 股票
+                vals = ['限價', '市價']
+                hint = "限價才會套用「讓價檔數」讓價;市價 依當下市場成交(價格送0)。股票無範圍市價。"
+            cb_ptype.config(values=vals)
+            cur = s.get('price_type', '限價') if not cb_ptype.get() else cb_ptype.get()
+            cb_ptype.set(cur if cur in vals else '限價')
+            _lbl_ptype_hint.config(text=hint)
+        cb_tt.bind('<<ComboboxSelected>>', lambda e: _sync_ptype_options(), add='+')
+        _sync_ptype_options()
+
         # --- 【ADR-074】看A做B ---
         watch_ui = self._qt_build_watch_panel(dlg, s)
 
@@ -7751,6 +7793,7 @@ class StockTradingAppPro(tk.Tk):
             except (TypeError, ValueError): s['take_profit_abs'] = 0.0
             try: s['slippage_ticks'] = int(e_slip.get().strip())
             except (TypeError, ValueError): s['slippage_ticks'] = 2
+            s['price_type'] = cb_ptype.get() or '限價'
             try: s['max_trades_per_day'] = int(e_maxd.get().strip())
             except (TypeError, ValueError): s['max_trades_per_day'] = 3
             s['entry_time_start'] = e_en_st.get().strip()

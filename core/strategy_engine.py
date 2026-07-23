@@ -423,6 +423,9 @@ def new_strategy():
         'direction': '做多',          # 做多 / 做空 (做空僅限期貨)
         'qty': 1,                     # 單位依 trade_type:股票=張, 零股=股, 期貨=口
         'slippage_ticks': 2,          # 限價單相對收盤價讓價的檔數 (提高成交率)
+        'price_type': '限價',         # 【新ADR】限價/市價/範圍市價 (範圍市價僅期貨);
+                                       # 限價才會套用 slippage_ticks 讓價,市價/範圍市價
+                                       # 直接以0價送出 (依市場當下成交,不受讓價檔數影響)
         'entry': [],                  # 進場條件 list (全部成立才進場, AND)
         'exit_signals': [],           # 出場訊號 list (任一成立即出場, OR)
         'stop_loss_pct': 2.0,         # 停損 % (0=停用)
@@ -523,6 +526,29 @@ def is_futures(strategy):
     return trade_type_of(strategy) == '期貨'
 
 
+# 【新ADR】委託價格類型:限價/市價/範圍市價。範圍市價 (TAIFEX的MKP) 只有
+# 期貨才有這個委託方式,股票交易所規則裡沒有這個選項。
+# 【鐵則6】零股 (IntradayOdd) 依交易所規則只能限價ROD,市價/範圍市價 一律不可,
+# 這是既有的硬性規定 (core/order_rules.py),不因本次新增委託方式選項而放寬。
+PRICE_TYPES = ('限價', '市價', '範圍市價')
+FUTURES_ONLY_PRICE_TYPES = ('範圍市價',)
+
+
+def price_type_of(strategy):
+    """讀策略的委託價格類型,沒設定 (舊策略相容) 或不合法值一律退回「限價」
+    (=既有行為,永遠安全的預設)。零股一律強制限價 (鐵則6,交易所規則不可放寬);
+    範圍市價只對期貨有意義,非期貨策略若存了「範圍市價」(理論上 validate_strategy
+    會擋,這裡防呆再擋一次) 一樣退回限價。"""
+    if trade_type_of(strategy) == '零股':
+        return '限價'
+    pt = strategy.get('price_type', '限價')
+    if pt not in PRICE_TYPES:
+        return '限價'
+    if pt in FUTURES_ONLY_PRICE_TYPES and not is_futures(strategy):
+        return '限價'
+    return pt
+
+
 # 【ADR-074 看A做B】A (訊號來源) 可選的種類:比交易種類多一個「指數」。
 WATCH_TRADE_TYPES = ('股票', '期貨', '指數')
 
@@ -593,6 +619,13 @@ def validate_strategy(s):
     tt = trade_type_of(s)
     if tt not in TRADE_TYPES:
         return False, "交易種類僅支援 股票 / 零股 / 期貨"
+    pt = s.get('price_type', '限價')
+    if pt not in PRICE_TYPES:
+        return False, f"委託方式僅支援 {'/'.join(PRICE_TYPES)}"
+    if pt in FUTURES_ONLY_PRICE_TYPES and tt != '期貨':
+        return False, "範圍市價僅期貨支援 (股票/零股交易所規則沒有這個委託方式)"
+    if tt == '零股' and pt != '限價':
+        return False, "零股依交易所規則只能限價 (鐵則6,不可用市價/範圍市價)"
     if s.get('timeframe') not in VALID_TIMEFRAMES:
         return False, f"週期僅支援 {'/'.join(VALID_TIMEFRAMES)}"
     if s.get('direction') not in ('做多', '做空'):

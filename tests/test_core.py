@@ -1021,6 +1021,49 @@ class TestTradeTypeAndAbsStops(unittest.TestCase):
         s2 = dict(s); s2['trade_type'] = '期貨'; s2['market'] = '台期貨'
         self.assertTrue(strategy_engine.validate_strategy(s2)[0])   # 期貨做空放行
 
+    # ---------- 【新ADR】委託方式:限價/市價/範圍市價 ----------
+
+    def _base_strategy(self, **overrides):
+        s = strategy_engine.new_strategy()
+        s.update({'name': 'P', 'symbol': 'X', 'direction': '做多',
+                  'entry': [{'type': 'ma_cross_up', 'params': {}}], 'stop_loss_pct': 2.0})
+        s.update(overrides)
+        return s
+
+    def test_price_type_default_is_limit(self):
+        s = strategy_engine.new_strategy()
+        self.assertEqual(s['price_type'], '限價')
+        self.assertEqual(strategy_engine.price_type_of(s), '限價')
+
+    def test_price_type_range_market_valid_for_futures(self):
+        s = self._base_strategy(trade_type='期貨', market='台期貨', symbol='TXF', price_type='範圍市價')
+        self.assertTrue(strategy_engine.validate_strategy(s)[0])
+        self.assertEqual(strategy_engine.price_type_of(s), '範圍市價')
+
+    def test_price_type_range_market_rejected_for_stock(self):
+        s = self._base_strategy(trade_type='股票', price_type='範圍市價')
+        ok, msg = strategy_engine.validate_strategy(s)
+        self.assertFalse(ok)
+        self.assertIn('範圍市價', msg)
+
+    def test_price_type_market_valid_for_stock(self):
+        s = self._base_strategy(trade_type='股票', price_type='市價')
+        self.assertTrue(strategy_engine.validate_strategy(s)[0])
+
+    def test_price_type_odd_lot_forced_limit(self):
+        s = self._base_strategy(trade_type='零股', price_type='市價')
+        ok, msg = strategy_engine.validate_strategy(s)
+        self.assertFalse(ok)
+        self.assertIn('零股', msg)
+        # price_type_of 防呆:即使存了不合法值,讀出來也強制退回限價
+        self.assertEqual(strategy_engine.price_type_of(s), '限價')
+
+    def test_price_type_invalid_value_falls_back_to_limit(self):
+        s = self._base_strategy(trade_type='期貨', market='台期貨', price_type='亂填')
+        self.assertEqual(strategy_engine.price_type_of(s), '限價')
+        ok, msg = strategy_engine.validate_strategy(s)
+        self.assertFalse(ok)  # 存檔時仍然要擋下不合法值,不能默默改掉使用者的設定
+
 
 class TestCustomFreedomAndMetrics(unittest.TestCase):
     """【ADR-044】Ctx 自由度升級 (state/進場價/新指標/log) 與回測進階指標。"""
