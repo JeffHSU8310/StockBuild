@@ -2733,15 +2733,16 @@ class TestSecureStore(unittest.TestCase):
 
 
 class TestChukuangrenBand(unittest.TestCase):
-    """【新ADR】「楚狂人之終極波段」內建策略:看加權指數(A)訊號,做自選商品(B)。"""
+    """【ADR-084/085】「楚狂人之終極波段」:看加權指數(A)訊號,做自選商品(B),
+    單一方向(做多/做空)、隔天中午12點二次確認、點數移動停利(從進場點D起算)→SMA20移動停利。"""
 
     def _mk_daily_df(self, closes, start='2026-01-01'):
         idx = pd.date_range(start=start, periods=len(closes), freq='D')
         return pd.DataFrame({'Close': closes}, index=idx)
 
     def _params(self, **overrides):
-        p = {'x': 100.0, 'y': 90.0, 'z': 92.0, 's1': 110.0, 's2': 108.0,
-             'c': 5.0, 'f': 2.0, 'h': 103.0}
+        # h 已在 ADR-085 移除;停利線一律從進場點 D 起算
+        p = {'x': 100.0, 'y': 90.0, 'z': 92.0, 's1': 110.0, 's2': 108.0, 'c': 5.0, 'f': 2.0}
         p.update(overrides)
         return p
 
@@ -2750,90 +2751,109 @@ class TestChukuangrenBand(unittest.TestCase):
     def test_default_strategy_shape(self):
         s = chukuangren_band.default_strategy()
         self.assertEqual(s['kind'], 'chukuangren_band')
+        self.assertEqual(s['direction'], '做多')
         self.assertTrue(s['watch_enabled'])
         self.assertEqual(s['watch_symbol'], '^TWII')
-        self.assertEqual(s['watch_trade_type'], '指數')
         self.assertEqual(s['watch_timeframe'], '5分K')
         p = chukuangren_band.params_of(s)
         self.assertEqual(set(p.keys()), set(chukuangren_band.PARAM_KEYS))
+        self.assertNotIn('h', p)  # H 已移除
 
-    def test_validate_requires_y_below_x(self):
+    def test_param_keys_for_direction(self):
+        self.assertEqual(chukuangren_band.param_keys_for('做多'), ('x', 'y', 'z', 'c', 'f'))
+        self.assertEqual(chukuangren_band.param_keys_for('做空'), ('x', 's1', 's2', 'c', 'f'))
+
+    def test_validate_long_requires_y_below_x(self):
         s = chukuangren_band.default_strategy()
-        s['symbol'] = '2330'; s['qty'] = 1
-        s['ck_x'] = 100; s['ck_y'] = 105; s['ck_s1'] = 110
+        s['symbol'] = '2330'; s['qty'] = 1; s['direction'] = '做多'
+        s['ck_x'] = 100; s['ck_y'] = 105
         ok, msg = chukuangren_band.validate(s)
         self.assertFalse(ok)
         self.assertIn('Y', msg)
 
-    def test_validate_requires_s1_above_x(self):
+    def test_validate_short_requires_s1_above_x_and_futures(self):
         s = chukuangren_band.default_strategy()
-        s['symbol'] = '2330'; s['qty'] = 1
-        s['ck_x'] = 100; s['ck_y'] = 90; s['ck_s1'] = 95
+        s['symbol'] = 'TXF'; s['qty'] = 1; s['direction'] = '做空'
+        s['trade_type'] = '期貨'; s['market'] = '台期貨'
+        s['ck_x'] = 100; s['ck_s1'] = 95
         ok, msg = chukuangren_band.validate(s)
         self.assertFalse(ok)
         self.assertIn('S1', msg)
 
-    def test_validate_rejects_index_execution_symbol(self):
+    def test_validate_short_rejects_stock(self):
         s = chukuangren_band.default_strategy()
-        s['symbol'] = '^TWII'; s['qty'] = 1
-        s['ck_x'] = 100; s['ck_y'] = 90; s['ck_s1'] = 110
+        s['symbol'] = '2330'; s['qty'] = 1; s['direction'] = '做空'
+        s['trade_type'] = '股票'; s['ck_x'] = 100; s['ck_s1'] = 110
         ok, msg = chukuangren_band.validate(s)
         self.assertFalse(ok)
 
-    def test_validate_passes_reasonable_params(self):
+    def test_validate_rejects_index_execution_symbol(self):
         s = chukuangren_band.default_strategy()
-        s['symbol'] = '2330'; s['qty'] = 1
-        s['ck_x'] = 100; s['ck_y'] = 90; s['ck_z'] = 92
-        s['ck_s1'] = 110; s['ck_s2'] = 108
-        s['ck_c'] = 5; s['ck_f'] = 2; s['ck_h'] = 103
+        s['symbol'] = '^TWII'; s['qty'] = 1
+        s['ck_x'] = 100; s['ck_y'] = 90
+        ok, msg = chukuangren_band.validate(s)
+        self.assertFalse(ok)
+
+    def test_validate_passes_reasonable_long(self):
+        s = chukuangren_band.default_strategy()
+        s['symbol'] = '2330'; s['qty'] = 1; s['direction'] = '做多'
+        s['ck_x'] = 100; s['ck_y'] = 90; s['ck_z'] = 92; s['ck_c'] = 5; s['ck_f'] = 2
         ok, msg = chukuangren_band.validate(s)
         self.assertTrue(ok, msg)
 
-    # ---------- on_daily_close:進場訊號偵測 ----------
+    # ---------- on_daily_close:方向閘門的進場訊號偵測 ----------
 
-    def test_daily_close_flat_long_entry_pending(self):
+    def test_long_direction_enters_only_long(self):
         rt = strategy_engine.new_runtime()
         params = self._params()
-        df = self._mk_daily_df([95] * 19 + [105])
-        chukuangren_band.on_daily_close(params, rt, df)
-        self.assertIsNotNone(rt['pending_entry'])
+        # 突破 X → 待確認多單
+        df_up = self._mk_daily_df([95] * 19 + [105])
+        chukuangren_band.on_daily_close(params, rt, df_up, direction='做多')
         self.assertEqual(rt['pending_entry']['dir'], 'LONG')
+        # 做多方向遇到跌破 X 不進場 (不會反向做空)
+        rt2 = strategy_engine.new_runtime()
+        df_dn = self._mk_daily_df([105] * 19 + [95])
+        chukuangren_band.on_daily_close(params, rt2, df_dn, direction='做多')
+        self.assertIsNone(rt2['pending_entry'])
 
-    def test_daily_close_flat_short_entry_pending(self):
+    def test_short_direction_enters_only_short(self):
         rt = strategy_engine.new_runtime()
         params = self._params()
-        df = self._mk_daily_df([105] * 19 + [95])
-        chukuangren_band.on_daily_close(params, rt, df)
-        self.assertIsNotNone(rt['pending_entry'])
+        df_dn = self._mk_daily_df([105] * 19 + [95])
+        chukuangren_band.on_daily_close(params, rt, df_dn, direction='做空')
         self.assertEqual(rt['pending_entry']['dir'], 'SHORT')
+        rt2 = strategy_engine.new_runtime()
+        df_up = self._mk_daily_df([95] * 19 + [105])
+        chukuangren_band.on_daily_close(params, rt2, df_up, direction='做空')
+        self.assertIsNone(rt2['pending_entry'])
 
     def test_daily_close_no_trigger_at_exact_x(self):
         rt = strategy_engine.new_runtime()
         params = self._params()
-        df = self._mk_daily_df([95] * 19 + [100])  # 剛好等於 X,不算突破也不算跌破
-        chukuangren_band.on_daily_close(params, rt, df)
+        df = self._mk_daily_df([95] * 19 + [100])
+        chukuangren_band.on_daily_close(params, rt, df, direction='做多')
         self.assertIsNone(rt['pending_entry'])
 
     def test_daily_close_idempotent_same_trading_day(self):
         rt = strategy_engine.new_runtime()
         params = self._params()
         df = self._mk_daily_df([95] * 19 + [105])
-        chukuangren_band.on_daily_close(params, rt, df)
-        rt['pending_entry'] = None  # 人為清空,驗證同一天(daily_df 沒變)不會重新設定
-        chukuangren_band.on_daily_close(params, rt, df)
+        chukuangren_band.on_daily_close(params, rt, df, direction='做多')
+        rt['pending_entry'] = None
+        chukuangren_band.on_daily_close(params, rt, df, direction='做多')
         self.assertIsNone(rt['pending_entry'])
 
     def test_daily_close_not_enough_history_is_noop(self):
         rt = strategy_engine.new_runtime()
         params = self._params()
-        df = self._mk_daily_df([105] * 10)  # 不足20根,SMA20算不出來,應該整個no-op
-        chukuangren_band.on_daily_close(params, rt, df)
+        df = self._mk_daily_df([105] * 10)
+        chukuangren_band.on_daily_close(params, rt, df, direction='做多')
         self.assertIsNone(rt['pending_entry'])
         self.assertEqual(rt['last_daily_bar_date'], '')
 
-    # ---------- on_noon_check:隔天中午12點確認進場 ----------
+    # ---------- on_noon_check:隔天中午確認進場 + 記錄進場指數點位 ----------
 
-    def test_noon_check_confirms_long_entry(self):
+    def test_noon_check_confirms_long_entry_records_index_point(self):
         rt = strategy_engine.new_runtime()
         rt['pending_entry'] = {'dir': 'LONG', 'date': '2026-01-01'}
         params = self._params()
@@ -2843,9 +2863,11 @@ class TestChukuangrenBand(unittest.TestCase):
         self.assertEqual(intents[0]['action'], '買進')
         self.assertEqual(intents[0]['qty'], 3)
         self.assertIsNone(rt['pending_entry'])
+        # ADR-085:一定記錄進場當時的加權指數點位
         self.assertEqual(rt['entry_index_price'], 105.0)
+        self.assertIn('記錄進場加權指數點位', intents[0]['reason'])
 
-    def test_noon_check_confirms_short_entry(self):
+    def test_noon_check_confirms_short_entry_records_index_point(self):
         rt = strategy_engine.new_runtime()
         rt['pending_entry'] = {'dir': 'SHORT', 'date': '2026-01-01'}
         params = self._params()
@@ -2868,8 +2890,8 @@ class TestChukuangrenBand(unittest.TestCase):
         rt['pending_entry'] = {'dir': 'LONG', 'date': '2026-01-01'}
         params = self._params()
         chukuangren_band.on_noon_check(params, rt, 105.0, '2026-01-02')
-        rt['pending_entry'] = {'dir': 'LONG', 'date': '2026-01-02'}  # 模擬又被daily_close重設
-        intents2 = chukuangren_band.on_noon_check(params, rt, 106.0, '2026-01-02')  # 同一天再呼叫
+        rt['pending_entry'] = {'dir': 'LONG', 'date': '2026-01-02'}
+        intents2 = chukuangren_band.on_noon_check(params, rt, 106.0, '2026-01-02')
         self.assertEqual(intents2, [])
 
     # ---------- 固定停損:觸發→隔天確認/作廢 ----------
@@ -2879,7 +2901,7 @@ class TestChukuangrenBand(unittest.TestCase):
         rt['state'] = 'LONG'; rt['entry_index_price'] = 100.0
         params = self._params()
         df = self._mk_daily_df([100] * 19 + [85])  # 85 < Y=90
-        chukuangren_band.on_daily_close(params, rt, df)
+        chukuangren_band.on_daily_close(params, rt, df, direction='做多')
         self.assertEqual(rt['pending_exit'], {'reason': 'SL', 'date': df.index[-1].strftime('%Y-%m-%d')})
 
     def test_noon_check_confirms_long_stop_loss(self):
@@ -2898,7 +2920,7 @@ class TestChukuangrenBand(unittest.TestCase):
         rt['state'] = 'LONG'
         rt['pending_exit'] = {'reason': 'SL', 'date': '2026-01-01'}
         params = self._params()
-        intents = chukuangren_band.on_noon_check(params, rt, 93.0, '2026-01-02')  # 93 > Z=92,作廢
+        intents = chukuangren_band.on_noon_check(params, rt, 93.0, '2026-01-02')  # 93 > Z=92
         self.assertEqual(intents, [])
         self.assertIsNone(rt['pending_exit'])
 
@@ -2907,7 +2929,7 @@ class TestChukuangrenBand(unittest.TestCase):
         rt['state'] = 'SHORT'; rt['entry_index_price'] = 100.0
         params = self._params()
         df = self._mk_daily_df([100] * 19 + [115])  # 115 > S1=110
-        chukuangren_band.on_daily_close(params, rt, df)
+        chukuangren_band.on_daily_close(params, rt, df, direction='做空')
         self.assertEqual(rt['pending_exit']['reason'], 'SL')
 
     def test_noon_check_confirms_short_stop_loss(self):
@@ -2919,86 +2941,81 @@ class TestChukuangrenBand(unittest.TestCase):
         self.assertEqual(len(intents), 1)
         self.assertEqual(intents[0]['action'], '買進')
 
-    # ---------- 點數移動停利:啟動、棘輪上調/下調、觸發 ----------
+    # ---------- 點數移動停利:從進場點D起算、棘輪、觸發 ----------
 
-    def test_long_point_trailing_stop_arms_and_ratchets(self):
+    def test_long_point_trailing_arms_from_entry_and_ratchets(self):
         rt = strategy_engine.new_runtime()
         rt['state'] = 'LONG'; rt['entry_index_price'] = 100.0
-        params = self._params()  # c=5, f=2, h=103
-        # day: close=110,profit=10>c=5 → armed,trail_base 起始 H=103,
-        # 之後 ratchet: n=(10-5)//2=2 → trail_base=103+2*2=107
+        params = self._params()  # c=5, f=2
+        # close=110, profit=10>c=5 → armed, base 從進場點 100 起算;
+        # n=(10-5)//2=2 → base=100+2*2=104。close(110) 仍 > 104,不觸發。
         df = self._mk_daily_df([100] * 19 + [110])
-        chukuangren_band.on_daily_close(params, rt, df)
+        chukuangren_band.on_daily_close(params, rt, df, direction='做多')
         self.assertTrue(rt['trail_armed'])
-        self.assertEqual(rt['trail_base'], 107.0)
-        self.assertIsNone(rt['pending_exit'])  # close(110) 仍 > trail_base(107),還沒觸發
+        self.assertEqual(rt['trail_base'], 104.0)
+        self.assertIsNone(rt['pending_exit'])
 
-    def test_long_point_trailing_stop_never_ratchets_down(self):
+    def test_long_point_trailing_never_ratchets_down_and_triggers(self):
         rt = strategy_engine.new_runtime()
         rt['state'] = 'LONG'; rt['entry_index_price'] = 100.0
-        rt['trail_armed'] = True; rt['trail_base'] = 107.0
+        rt['trail_armed'] = True; rt['trail_base'] = 108.0
         params = self._params()
-        # profit(6)=close(106)-entry(100)=6>c=5,但 n=(6-5)//2=0 → candidate=103,
-        # 103 < 既有 107,不可以往下調
-        df = self._mk_daily_df([100] * 20 + [106])
-        chukuangren_band.on_daily_close(params, rt, df)
-        self.assertEqual(rt['trail_base'], 107.0)
-        # close(106) < trail_base(107) → 觸發點數移動停利待確認
-        self.assertEqual(rt['pending_exit'], {'reason': 'TP_POINT', 'date': df.index[-1].strftime('%Y-%m-%d')})
+        # profit=close(107)-100=7,n=(7-5)//2=1 → candidate=100+2=102 < 108,不下調。
+        # close(107) < base(108) → 觸發點數移動停利待確認。
+        df = self._mk_daily_df([100] * 20 + [107])
+        chukuangren_band.on_daily_close(params, rt, df, direction='做多')
+        self.assertEqual(rt['trail_base'], 108.0)
+        self.assertEqual(rt['pending_exit']['reason'], 'TP_POINT')
 
     def test_noon_check_confirms_long_point_take_profit(self):
         rt = strategy_engine.new_runtime()
-        rt['state'] = 'LONG'
-        rt['trail_base'] = 107.0
+        rt['state'] = 'LONG'; rt['trail_base'] = 107.0
         rt['pending_exit'] = {'reason': 'TP_POINT', 'date': '2026-01-01'}
         params = self._params()
         intents = chukuangren_band.on_noon_check(params, rt, 106.0, '2026-01-02')  # 106 <= 107
         self.assertEqual(len(intents), 1)
         self.assertEqual(intents[0]['kind'], 'CLOSE')
-        self.assertEqual(rt['trail_base'], 0.0)  # 平倉後重置
+        self.assertEqual(rt['trail_base'], 0.0)
 
     def test_noon_check_invalidates_long_point_take_profit(self):
         rt = strategy_engine.new_runtime()
-        rt['state'] = 'LONG'
-        rt['trail_base'] = 107.0
+        rt['state'] = 'LONG'; rt['trail_base'] = 107.0
         rt['pending_exit'] = {'reason': 'TP_POINT', 'date': '2026-01-01'}
         params = self._params()
-        intents = chukuangren_band.on_noon_check(params, rt, 108.0, '2026-01-02')  # 108 > 107,作廢
+        intents = chukuangren_band.on_noon_check(params, rt, 108.0, '2026-01-02')  # 108 > 107
         self.assertEqual(intents, [])
-        self.assertEqual(rt['trail_base'], 107.0)  # 作廢時不重置,部位持續監控
+        self.assertEqual(rt['trail_base'], 107.0)
 
-    def test_short_point_trailing_stop_arms_and_ratchets_down(self):
+    def test_short_point_trailing_arms_from_entry_and_ratchets_down(self):
         rt = strategy_engine.new_runtime()
         rt['state'] = 'SHORT'; rt['entry_index_price'] = 100.0
-        params = self._params()  # c=5, f=2, h=103 (空單基準也用同一個h,由使用者依方向自行填適當值)
-        df = self._mk_daily_df([100] * 19 + [90])  # profit = 100-90=10 > c=5
-        chukuangren_band.on_daily_close(params, rt, df)
+        params = self._params()  # c=5, f=2
+        df = self._mk_daily_df([100] * 19 + [90])  # profit=100-90=10>5
+        chukuangren_band.on_daily_close(params, rt, df, direction='做空')
         self.assertTrue(rt['trail_armed'])
-        self.assertEqual(rt['trail_base'], 99.0)  # h=103, n=(10-5)//2=2 → 103-2*2=99
+        self.assertEqual(rt['trail_base'], 96.0)  # 100 - (10-5)//2 *2 = 100-4 = 96
 
     # ---------- SMA20 移動停利模式切換與確認 ----------
 
     def test_long_switches_to_sma20_mode_and_fixed_stop_still_monitored(self):
         rt = strategy_engine.new_runtime()
         rt['state'] = 'LONG'; rt['entry_index_price'] = 100.0
-        params = self._params(y=50.0)  # 把固定停損拉很低,避免這個測試被它干擾
-        df = self._mk_daily_df([100] * 19 + [150])  # 大漲,收盤遠高於 SMA20 → 切換進 SMA20 模式
-        chukuangren_band.on_daily_close(params, rt, df)
+        params = self._params(y=50.0)
+        df = self._mk_daily_df([100] * 19 + [150])
+        chukuangren_band.on_daily_close(params, rt, df, direction='做多')
         self.assertTrue(rt['sma20_mode'])
-        self.assertIsNone(rt['pending_exit'])  # 這天還沒跌破SMA20,不應該有待確認出場
-
-        # 下一天大跌,跌破 SMA20 (且仍遠高於已調低的固定停損Y=50) → 待確認 SMA20 停利
+        self.assertIsNone(rt['pending_exit'])
         df2 = self._mk_daily_df([100] * 19 + [150, 95])
-        chukuangren_band.on_daily_close(params, rt, df2)
+        chukuangren_band.on_daily_close(params, rt, df2, direction='做多')
         self.assertEqual(rt['pending_exit']['reason'], 'TP_SMA20')
 
     def test_long_fixed_stop_still_fires_even_in_sma20_mode(self):
         rt = strategy_engine.new_runtime()
         rt['state'] = 'LONG'; rt['entry_index_price'] = 100.0
         rt['sma20_mode'] = True
-        params = self._params()  # y=90 (預設)
-        df = self._mk_daily_df([100] * 19 + [85])  # 跌破固定停損 Y=90,即使已在SMA20模式仍要監控
-        chukuangren_band.on_daily_close(params, rt, df)
+        params = self._params()  # y=90
+        df = self._mk_daily_df([100] * 19 + [85])
+        chukuangren_band.on_daily_close(params, rt, df, direction='做多')
         self.assertEqual(rt['pending_exit']['reason'], 'SL')
 
     def test_noon_check_confirms_sma20_take_profit(self):
@@ -3006,7 +3023,7 @@ class TestChukuangrenBand(unittest.TestCase):
         rt['state'] = 'LONG'
         rt['pending_exit'] = {'reason': 'TP_SMA20', 'date': '2026-01-01', 'sma20_ref': 102.0}
         params = self._params()
-        intents = chukuangren_band.on_noon_check(params, rt, 99.0, '2026-01-02')  # 99 < sma20_ref 102
+        intents = chukuangren_band.on_noon_check(params, rt, 99.0, '2026-01-02')
         self.assertEqual(len(intents), 1)
         self.assertEqual(intents[0]['kind'], 'CLOSE')
 
@@ -3015,7 +3032,7 @@ class TestChukuangrenBand(unittest.TestCase):
         rt['state'] = 'LONG'
         rt['pending_exit'] = {'reason': 'TP_SMA20', 'date': '2026-01-01', 'sma20_ref': 102.0}
         params = self._params()
-        intents = chukuangren_band.on_noon_check(params, rt, 103.0, '2026-01-02')  # 103 > 102,作廢
+        intents = chukuangren_band.on_noon_check(params, rt, 103.0, '2026-01-02')
         self.assertEqual(intents, [])
 
     # ---------- pending_exit 待確認期間暫停繼續評估 ----------
@@ -3026,21 +3043,19 @@ class TestChukuangrenBand(unittest.TestCase):
         rt['pending_exit'] = {'reason': 'SL', 'date': '2025-12-31'}
         rt['last_daily_bar_date'] = '2025-12-31'
         params = self._params()
-        df = self._mk_daily_df([100] * 19 + [200])  # 即使今天大漲也不該覆蓋既有的待確認出場
-        chukuangren_band.on_daily_close(params, rt, df)
-        self.assertEqual(rt['pending_exit']['reason'], 'SL')  # 維持不變,等隔天12點確認結果
+        df = self._mk_daily_df([100] * 19 + [200])
+        chukuangren_band.on_daily_close(params, rt, df, direction='做多')
+        self.assertEqual(rt['pending_exit']['reason'], 'SL')
 
-    # ---------- 完整多天流程整合測試 ----------
+    # ---------- 完整流程整合測試 ----------
 
     def test_full_round_trip_long_entry_then_sma20_take_profit(self):
         rt = strategy_engine.new_runtime()
-        params = self._params(y=50.0)  # 拉低固定停損,避免跟本測試要驗證的SMA20路徑打架
-        # Day1~19 flat,Day20 收盤突破 X=100 → 待確認多單
+        params = self._params(y=50.0)
         df1 = self._mk_daily_df([95] * 19 + [105])
-        chukuangren_band.on_daily_close(params, rt, df1)
+        chukuangren_band.on_daily_close(params, rt, df1, direction='做多')
         self.assertEqual(rt['pending_entry']['dir'], 'LONG')
 
-        # 隔天中午confirm_price=106 > X=100 → 確認進場
         intents = chukuangren_band.on_noon_check(params, rt, 106.0, '2026-01-20', qty=1)
         self.assertEqual(len(intents), 1)
         self.assertEqual(intents[0]['kind'], 'OPEN')
@@ -3048,15 +3063,13 @@ class TestChukuangrenBand(unittest.TestCase):
         self.assertEqual(rt['state'], 'LONG')
         self.assertEqual(rt['entry_index_price'], 106.0)
 
-        # 隔天大漲,獲利超過C啟動點數移動停利,同時收盤漲過SMA20 → 切換進SMA20模式
         df2 = self._mk_daily_df([95] * 19 + [105, 130])
-        chukuangren_band.on_daily_close(params, rt, df2)
+        chukuangren_band.on_daily_close(params, rt, df2, direction='做多')
         self.assertTrue(rt['sma20_mode'])
         self.assertIsNone(rt['pending_exit'])
 
-        # 之後大跌,跌破SMA20 (仍遠高於已拉低的固定停損Y=50) → 待確認SMA20停利
         df3 = self._mk_daily_df([95] * 19 + [105, 130, 90])
-        chukuangren_band.on_daily_close(params, rt, df3)
+        chukuangren_band.on_daily_close(params, rt, df3, direction='做多')
         self.assertEqual(rt['pending_exit']['reason'], 'TP_SMA20')
 
         sma20_ref = rt['pending_exit']['sma20_ref']

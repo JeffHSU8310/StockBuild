@@ -5809,8 +5809,6 @@ class StockTradingAppPro(tk.Tk):
                 # 【ADR-045】自訂策略的方向由 on_bar 程式碼決定,direction 只是佔位
                 if s.get('kind') == 'custom':
                     dir_disp = '程式決定'
-                elif s.get('kind') == chukuangren_band.KIND:
-                    dir_disp = '多空自動判斷'
                 else:
                     dir_disp = s.get('direction', '')
                 prepared.append((s['id'], (s.get('name',''), sym_disp, sym_name, s.get('timeframe',''),
@@ -5910,8 +5908,6 @@ class StockTradingAppPro(tk.Tk):
         for s in enabled:
             if s.get('kind') == 'custom':
                 dir_disp = '程式決定'
-            elif s.get('kind') == chukuangren_band.KIND:
-                dir_disp = '多空自動判斷'
             else:
                 dir_disp = s.get('direction')
             box.insert(tk.END, f"[{s.get('mode')}] {s.get('name')} — {s.get('symbol')} {s.get('timeframe')} {dir_disp} x{s.get('qty')}")
@@ -6265,7 +6261,8 @@ class StockTradingAppPro(tk.Tk):
                     if daily_df is None or daily_df.empty:
                         continue  # 沒資料不算錯誤 (可能休市/剛登入還沒建立快取)
                     params = chukuangren_band.params_of(s)
-                    chukuangren_band.on_daily_close(params, rt, daily_df)
+                    chukuangren_band.on_daily_close(params, rt, daily_df,
+                                                    chukuangren_band.direction_of(s))
                     intents = []
                     b_exec_price = None
                     now_dt = datetime.now()
@@ -7105,9 +7102,14 @@ class StockTradingAppPro(tk.Tk):
         self._qt_editor_symbol_target = _bt
         e_sym.bind('<FocusIn>', lambda *_a: setattr(self, '_qt_editor_symbol_target', _bt), add='+')
 
-        _lbl(top, "模式").grid(row=4, column=0, sticky='w', pady=(8, 0))
+        _lbl(top, "方向").grid(row=4, column=0, sticky='w', pady=(8, 0))
+        cb_dir = ttk.Combobox(top, values=list(chukuangren_band.DIRECTIONS), width=7, state='readonly', style="BlackText.TCombobox")
+        cb_dir.set(chukuangren_band.direction_of(s)); cb_dir.grid(row=4, column=1, padx=4, pady=(8, 0), sticky='w')
+        _lbl(top, "模式").grid(row=4, column=2, sticky='w', padx=(8, 0), pady=(8, 0))
         cb_mode = ttk.Combobox(top, values=['模擬', '實單'], width=7, state='readonly', style="BlackText.TCombobox")
-        cb_mode.set(s.get('mode', '模擬')); cb_mode.grid(row=4, column=1, padx=4, pady=(8, 0), sticky='w')
+        cb_mode.set(s.get('mode', '模擬')); cb_mode.grid(row=4, column=3, padx=4, pady=(8, 0), sticky='w')
+        tk.Label(top, text="(做空僅限期貨)", bg="#1A2026", fg="#8A99AD",
+                 font=('微軟正黑體', 8)).grid(row=4, column=4, columnspan=2, sticky='w', padx=(8, 0), pady=(8, 0))
 
         watch_fr = tk.Frame(dlg, bg="#12181F"); watch_fr.pack(fill=tk.X, padx=12, pady=(8, 4))
         tk.Label(watch_fr, text="看盤(A) — 固定看指數,決定進出場方向 (不下單)", bg="#12181F",
@@ -7125,17 +7127,34 @@ class StockTradingAppPro(tk.Tk):
         _at = (dlg, e_wsym, cb_wtt_a, lambda *_a: None, 'A')
         e_wsym.bind('<FocusIn>', lambda *_a: setattr(self, '_qt_editor_symbol_target', _at), add='+')
 
-        param_fr = tk.Frame(dlg, bg="#1A2026"); param_fr.pack(fill=tk.X, padx=12, pady=(6, 4))
-        tk.Label(param_fr, text="參數 (加權指數點位/點數,依你的判斷自行設定)", bg="#1A2026",
-                 fg="#FFCA28", font=('微軟正黑體', 9, 'bold')).grid(row=0, column=0, columnspan=4, sticky='w', pady=(0, 4))
+        # 參數區:X/C/F 兩方向共用;Y/Z 只做多顯示、S1/S2 只做空顯示 (ADR-085)。
+        # 依「方向」下拉選單動態切換要顯示的那組停損參數。
+        pcontainer = tk.Frame(dlg, bg="#1A2026"); pcontainer.pack(fill=tk.X, padx=12, pady=(6, 4))
+        tk.Label(pcontainer, text="參數 (加權指數點位/點數,依你的判斷自行設定)", bg="#1A2026",
+                 fg="#FFCA28", font=('微軟正黑體', 9, 'bold')).pack(anchor='w', pady=(0, 4))
         param_entries = {}
-        for i, k in enumerate(chukuangren_band.PARAM_KEYS):
-            r = 1 + i // 2
-            c = (i % 2) * 2
-            _lbl(param_fr, chukuangren_band.PARAM_LABELS[k]).grid(row=r, column=c, sticky='w', pady=2)
-            e = _ent(param_fr, s.get(f'ck_{k}', 0.0), 10)
-            e.grid(row=r, column=c + 1, padx=(4, 16), pady=2, sticky='w')
-            param_entries[k] = e
+
+        def _mk_param_rows(parent, keys):
+            fr = tk.Frame(parent, bg="#1A2026")
+            for i, k in enumerate(keys):
+                _lbl(fr, chukuangren_band.PARAM_LABELS[k]).grid(row=i, column=0, sticky='w', pady=2)
+                e = _ent(fr, s.get(f'ck_{k}', 0.0), 10)
+                e.grid(row=i, column=1, padx=(6, 16), pady=2, sticky='w')
+                param_entries[k] = e
+            return fr
+
+        common_fr = _mk_param_rows(pcontainer, ('x', 'c', 'f')); common_fr.pack(fill=tk.X, anchor='w')
+        long_fr = _mk_param_rows(pcontainer, ('y', 'z'))
+        short_fr = _mk_param_rows(pcontainer, ('s1', 's2'))
+
+        def _refresh_dir(*_a):
+            long_fr.pack_forget(); short_fr.pack_forget()
+            if cb_dir.get() == '做空':
+                short_fr.pack(fill=tk.X, anchor='w', after=common_fr)
+            else:
+                long_fr.pack(fill=tk.X, anchor='w', after=common_fr)
+        cb_dir.bind('<<ComboboxSelected>>', _refresh_dir)
+        _refresh_dir()
 
         def _collect():
             s['kind'] = chukuangren_band.KIND
@@ -7143,7 +7162,7 @@ class StockTradingAppPro(tk.Tk):
             s['symbol'] = e_sym.get().strip().upper()
             s['trade_type'] = cb_tt.get()
             s['market'] = '台期貨' if cb_tt.get() == '期貨' else '台股'
-            s['direction'] = '做多'  # 佔位:實際多空由訊號動態決定,本欄位對此策略無作用
+            s['direction'] = cb_dir.get() if cb_dir.get() in chukuangren_band.DIRECTIONS else '做多'
             try:
                 s['qty'] = int(e_qty.get().strip())
             except (TypeError, ValueError):
