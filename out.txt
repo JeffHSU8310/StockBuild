@@ -1,9 +1,0 @@
---- 期交所歷史 ---
-1154: tk.Button(row_frame, text="📥 期交所歷史", bg="#2A323D", fg="#29B6F6", relief="flat",
-2920: f"(用「📥 期交所歷史」匯入會自動存到正確位置)。")
-2947: lines += ["", "目前一份都沒有。請按「📥 期交所歷史」下載或匯入,",
-3097: """「📥 期交所歷史」對話框:選商品 + 日期區間 → 自動下載;或手動匯入
-
---- volume mpf ---
-52: mc = mpf.make_marketcolors(up='#FF1744', down='#00E676', edge='inherit', wick='inherit', volume='inherit', ohlc='inherit')
-3986: fig, axlist = mpf.plot(

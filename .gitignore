@@ -7,3 +7,17 @@ __pycache__/
 broker_config.json
 永豐API/
 *.pfx
+
+# 臨時與除錯 Dump 檔
+dump_*.txt
+dump_*.py
+find_*.txt
+search_*.txt
+search_*.py
+out.txt
+check_try.txt
+scratch_*.txt
+taifex_dlg.txt
+test_mpf*.py
+test_sj.py
+*.png

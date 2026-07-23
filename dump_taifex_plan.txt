@@ -1,1 +1,0 @@
-3044:     def _taifex_plan_download(self, contract, asset_type, tf, start_dt, end_dt, session='all', tag="回測"):\n

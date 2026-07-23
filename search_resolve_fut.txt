@@ -1,1 +1,0 @@
-3364:     def _resolve_futures_contract(self, raw):\n
