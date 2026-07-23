@@ -7057,7 +7057,7 @@ class StockTradingAppPro(tk.Tk):
         title_suffix = " (唯讀 - 策略執行中)" if readonly else ""
         dlg.title("楚狂人之終極波段" + ("" if is_new else f" — {s.get('name')}{title_suffix}"))
         dlg.configure(bg="#1A2026")
-        self.center_window(dlg, 640, 640)
+        self.center_window(dlg, 660, 820)
         dlg.transient(self)
         try:
             dlg.lift(); dlg.focus_force()
@@ -7137,10 +7137,14 @@ class StockTradingAppPro(tk.Tk):
         def _mk_param_rows(parent, keys):
             fr = tk.Frame(parent, bg="#1A2026")
             for i, k in enumerate(keys):
-                _lbl(fr, chukuangren_band.PARAM_LABELS[k]).grid(row=i, column=0, sticky='w', pady=2)
+                rr = i * 2  # 每個參數佔兩列:第一列標籤+輸入框,第二列灰色中文說明
+                _lbl(fr, chukuangren_band.PARAM_LABELS[k]).grid(row=rr, column=0, sticky='w', pady=(4, 0))
                 e = _ent(fr, s.get(f'ck_{k}', 0.0), 10)
-                e.grid(row=i, column=1, padx=(6, 16), pady=2, sticky='w')
+                e.grid(row=rr, column=1, padx=(6, 16), pady=(4, 0), sticky='w')
                 param_entries[k] = e
+                tk.Label(fr, text=chukuangren_band.PARAM_HELP[k], bg="#1A2026", fg="#8A99AD",
+                         font=('微軟正黑體', 8), wraplength=580, justify='left').grid(
+                         row=rr + 1, column=0, columnspan=2, sticky='w', padx=(4, 0), pady=(0, 2))
             return fr
 
         common_fr = _mk_param_rows(pcontainer, ('x', 'c', 'f')); common_fr.pack(fill=tk.X, anchor='w')

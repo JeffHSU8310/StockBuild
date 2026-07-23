@@ -2763,6 +2763,13 @@ class TestChukuangrenBand(unittest.TestCase):
         self.assertEqual(chukuangren_band.param_keys_for('做多'), ('x', 'y', 'z', 'c', 'f'))
         self.assertEqual(chukuangren_band.param_keys_for('做空'), ('x', 's1', 's2', 'c', 'f'))
 
+    def test_every_param_has_label_and_help(self):
+        # 每一個要填的參數都要有標籤與完整中文說明,不可漏 (UI 直接讀這兩份)
+        for k in chukuangren_band.PARAM_KEYS:
+            self.assertIn(k, chukuangren_band.PARAM_LABELS)
+            self.assertIn(k, chukuangren_band.PARAM_HELP)
+            self.assertTrue(chukuangren_band.PARAM_HELP[k].strip())
+
     def test_validate_long_requires_y_below_x(self):
         s = chukuangren_band.default_strategy()
         s['symbol'] = '2330'; s['qty'] = 1; s['direction'] = '做多'
