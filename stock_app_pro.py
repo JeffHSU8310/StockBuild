@@ -9322,7 +9322,7 @@ class StockTradingAppPro(tk.Tk):
         self._paper_win = dlg
         dlg.title("💰 模擬帳戶 (虛擬資金,僅供策略驗證)")
         dlg.configure(bg="#1A2026")
-        self.center_window(dlg, 860, 560)
+        self.center_window(dlg, 940, 560)
         dlg.transient(self)
         try:
             dlg.lift(); dlg.focus_force()
@@ -9360,10 +9360,12 @@ class StockTradingAppPro(tk.Tk):
         self._paper_ui['tvp'] = tvp
         self._qt_refresh_paper_account()
         tk.Label(dlg, text="交易紀錄 (最新在上):", bg="#1A2026", fg="#FFCA28", font=('微軟正黑體', 9, 'bold')).pack(anchor='w', padx=12, pady=(6, 0))
-        h_cols = ("ts", "sym", "act", "kind", "qty", "price", "fee", "pnl")
-        h_heads = {"ts": "時間", "sym": "商品", "act": "買賣", "kind": "開/平", "qty": "數量", "price": "價格", "fee": "費用", "pnl": "已實現"}
+        h_cols = ("ts", "sym", "name", "dir", "act", "kind", "qty", "price", "fee", "pnl")
+        h_heads = {"ts": "時間", "sym": "商品代號", "name": "商品名稱", "dir": "方向", "act": "買賣",
+                   "kind": "開/平", "qty": "數量", "price": "價格", "fee": "費用", "pnl": "已實現"}
         tvh = ttk.Treeview(dlg, columns=h_cols, show="headings", style='Trades.Treeview', height=7)
-        widths = {"ts": 150, "sym": 80, "act": 50, "kind": 50, "qty": 50, "price": 80, "fee": 70, "pnl": 90}
+        widths = {"ts": 150, "sym": 80, "name": 90, "dir": 50, "act": 50, "kind": 50,
+                  "qty": 50, "price": 80, "fee": 70, "pnl": 90}
         for c in h_cols:
             tvh.heading(c, text=h_heads[c]); tvh.column(c, width=widths[c], anchor="center")
         tvh.tag_configure('p_win', foreground='#FF1744', background='#12161A')
@@ -9372,11 +9374,24 @@ class StockTradingAppPro(tk.Tk):
         vsb = ttk.Scrollbar(dlg, orient="vertical", command=tvh.yview)
         tvh.configure(yscrollcommand=vsb.set)
         tvh.pack(fill=tk.BOTH, expand=True, padx=10, pady=2)
+        # 【使用者需求】商品代號旁補上商品名稱 + 方向 (做多/做空)。方向不是新的
+        # 資料欄位,是「開倉買進/平倉賣出=做多」「開倉賣出/平倉買進=做空」直接從
+        # 既有 action+kind 推導,history 紀錄本身不用改。名稱查詢結果就地快取,
+        # 同一檔在 200 筆紀錄裡重複出現時不用重複解析。
+        _name_cache = {}
+        def _sym_name(sym):
+            if sym not in _name_cache:
+                _name_cache[sym] = self._wl_display_name(sym)
+            return _name_cache[sym]
         for rec in reversed(a['history'][-200:]):
             kind_txt = '開倉' if rec['kind'] == 'OPEN' else '平倉'
+            is_long = (rec['kind'] == 'OPEN' and rec['action'] == '買進') or \
+                      (rec['kind'] == 'CLOSE' and rec['action'] == '賣出')
+            dir_txt = '做多' if is_long else '做空'
             tag = 'p_win' if rec['pnl'] > 0 else ('p_loss' if rec['pnl'] < 0 else 'p_flat')
-            tvh.insert("", tk.END, values=(rec['ts'], rec['symbol'], rec['action'], kind_txt,
-                                            rec['qty'], f"{rec['price']:g}", f"{_fmt_amt(rec['fee'])}",
+            tvh.insert("", tk.END, values=(rec['ts'], rec['symbol'], _sym_name(rec['symbol']), dir_txt,
+                                            rec['action'], kind_txt, rec['qty'], f"{rec['price']:g}",
+                                            f"{_fmt_amt(rec['fee'])}",
                                             f"{_fmt_amt_signed(rec['pnl'])}" if rec['kind'] == 'CLOSE' else '--'), tags=(tag,))
         foot = tk.Frame(dlg, bg="#1A2026"); foot.pack(pady=8)
         def _reset():
