@@ -932,6 +932,79 @@ class TestTradeTypeAndAbsStops(unittest.TestCase):
         i2 = strategy_engine.evaluate_strategy(s2, rt2, df2, _t.time(), '2026-01-16')
         self.assertEqual(len(i2), 1); self.assertIn('停利', i2[0]['reason']); self.assertIn('點', i2[0]['reason'])
 
+    def test_apply_fill_exec_entry_price_tracks_b_separately_from_a(self):
+        """【新ADR】看A做B時,apply_fill(exec_price=) 要把B的成交價存進
+        exec_entry_price,跟A的entry_price是兩個不同尺度的數字。"""
+        s = strategy_engine.new_strategy()
+        s.update({'name': 'AB', 'symbol': 'MXFR1', 'trade_type': '期貨', 'market': '台期貨'})
+        rt = strategy_engine.new_runtime()
+        intent = {'kind': 'OPEN', 'action': '買進', 'qty': 1, 'price': 22500.0}  # A(TXF)的價
+        strategy_engine.apply_fill(s, rt, intent, 0, exec_price=44402.0)  # B(MXFR1)的成交價
+        self.assertEqual(rt['entry_price'], 22500.0)
+        self.assertEqual(rt['exec_entry_price'], 44402.0)
+        close_intent = {'kind': 'CLOSE', 'action': '賣出', 'qty': 1, 'price': 22400.0}
+        strategy_engine.apply_fill(s, rt, close_intent, 1)
+        self.assertEqual(rt['exec_entry_price'], 0.0)
+
+    def test_apply_fill_without_exec_price_falls_back_to_intent_price(self):
+        """未帶 exec_price (一般不看A做B、測試/回測既有呼叫點) 時,
+        exec_entry_price 退回等於 entry_price,行為不變。"""
+        s = strategy_engine.new_strategy()
+        rt = strategy_engine.new_runtime()
+        intent = {'kind': 'OPEN', 'action': '買進', 'qty': 1, 'price': 100.0}
+        strategy_engine.apply_fill(s, rt, intent, 0)
+        self.assertEqual(rt['exec_entry_price'], 100.0)
+
+    # ---------- 【新ADR】期貨即時停損/停利 (不等K棒收盤) ----------
+
+    def test_intrabar_futures_stop_triggers_immediately_on_live_price(self):
+        s = strategy_engine.new_strategy()
+        s.update({'name': 'F', 'symbol': 'MXFR1', 'trade_type': '期貨', 'market': '台期貨',
+                  'stop_loss_abs': 70.0})
+        rt = strategy_engine.new_runtime()
+        rt.update({'state': 'LONG', 'qty': 1, 'exec_entry_price': 44402.0})
+        intent = strategy_engine.check_intrabar_futures_stop(s, rt, 44277.0)  # 跌125點>70點
+        self.assertIsNotNone(intent)
+        self.assertEqual(intent['kind'], 'CLOSE')
+        self.assertEqual(intent['action'], '賣出')
+        self.assertIn('即時停損', intent['reason'])
+
+    def test_intrabar_futures_stop_not_triggered_within_threshold(self):
+        s = strategy_engine.new_strategy()
+        s.update({'name': 'F', 'symbol': 'MXFR1', 'trade_type': '期貨', 'market': '台期貨',
+                  'stop_loss_abs': 70.0})
+        rt = strategy_engine.new_runtime()
+        rt.update({'state': 'LONG', 'qty': 1, 'exec_entry_price': 44402.0})
+        intent = strategy_engine.check_intrabar_futures_stop(s, rt, 44350.0)  # 跌52點<70點
+        self.assertIsNone(intent)
+
+    def test_intrabar_futures_stop_ignored_for_stocks(self):
+        s = strategy_engine.new_strategy()
+        s.update({'name': 'ST', 'symbol': '2330', 'trade_type': '股票', 'stop_loss_abs': 5.0})
+        rt = strategy_engine.new_runtime()
+        rt.update({'state': 'LONG', 'qty': 1, 'exec_entry_price': 600.0})
+        intent = strategy_engine.check_intrabar_futures_stop(s, rt, 500.0)  # 跌100元遠超5元
+        self.assertIsNone(intent)  # 股票不受此新機制影響,維持K棒收盤才判定
+
+    def test_intrabar_futures_stop_ignored_when_flat(self):
+        s = strategy_engine.new_strategy()
+        s.update({'name': 'F', 'symbol': 'MXFR1', 'trade_type': '期貨', 'market': '台期貨',
+                  'stop_loss_abs': 70.0})
+        rt = strategy_engine.new_runtime()  # state 預設 FLAT
+        intent = strategy_engine.check_intrabar_futures_stop(s, rt, 40000.0)
+        self.assertIsNone(intent)
+
+    def test_intrabar_futures_stop_take_profit_pct_short(self):
+        s = strategy_engine.new_strategy()
+        s.update({'name': 'F', 'symbol': 'TMF', 'trade_type': '期貨', 'market': '台期貨',
+                  'take_profit_pct': 1.0})
+        rt = strategy_engine.new_runtime()
+        rt.update({'state': 'SHORT', 'qty': 1, 'exec_entry_price': 20000.0})
+        intent = strategy_engine.check_intrabar_futures_stop(s, rt, 19700.0)  # 跌1.5%>1%停利
+        self.assertIsNotNone(intent)
+        self.assertEqual(intent['action'], '買進')
+        self.assertIn('即時停利', intent['reason'])
+
     def test_paper_odd_lot(self):
         a = paper_account.new_account(1000000)
         paper_account.apply_fill(a, 't', '台股', '2330', '買進', 'OPEN', 10, 600.0, trade_type='零股')

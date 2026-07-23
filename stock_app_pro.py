@@ -6341,13 +6341,13 @@ class StockTradingAppPro(tk.Tk):
                     if s.get('mode') == '實單' and self._qt_running:
                         sent, msg = self._place_strategy_order(s, intent, contract, asset_type, exec_price=exec_px)
                         if sent:
-                            strategy_engine.apply_fill(s, rt, intent, now_ts)
+                            strategy_engine.apply_fill(s, rt, intent, now_ts, exec_price=exec_px)
                             changed = True
                             self.safe_after(0, self.log_message, f"【自動交易-實單】🔥 {label} | {intent['reason']} | {msg}")
                         else:
                             self.safe_after(0, self.log_message, f"【自動交易-實單失敗】{label} — {msg} (狀態未變更,下一根K棒會再評估)")
                     else:
-                        strategy_engine.apply_fill(s, rt, intent, now_ts)
+                        strategy_engine.apply_fill(s, rt, intent, now_ts, exec_price=exec_px)
                         changed = True
                         # 【ADR-041】模擬成交記進虛擬模擬帳戶 (完整記帳:資金/持倉/損益)
                         try:
@@ -6409,6 +6409,7 @@ class StockTradingAppPro(tk.Tk):
             snaps = self.sj_api.snapshots(contracts)
             if snaps:
                 import core.paper_account as paper_account
+                live_price_by_symbol = {}
                 for snap in snaps:
                     code = getattr(snap, 'code', '')
                     close = getattr(snap, 'close', 0)
@@ -6417,10 +6418,75 @@ class StockTradingAppPro(tk.Tk):
                         for sym, c in needed.items():
                             if getattr(c, 'code', '') == code or getattr(c, 'symbol', '') == code:
                                 paper_account.mark_price(self.paper_acct, sym, float(close))
+                                live_price_by_symbol[sym] = float(close)
+                # 【新ADR 期貨即時停損停利】沿用這次已經打過的 snapshots() 結果,
+                # 不額外呼叫 API (鐵則5:snapshots() 節流)——期貨標的一旦價格觸及
+                # 使用者設定的停損%/停利%/停損點數/停利點數,不等K棒收盤立刻出場。
+                self._qt_check_realtime_futures_stops(live_price_by_symbol)
                 return True
         except Exception:
             pass
         return False
+
+    def _qt_check_realtime_futures_stops(self, live_price_by_symbol):
+        """【新ADR】期貨標的用內建停損%/停利%/停損點數(元)/停利點數(元) 時,
+        不等該策略訊號週期的K棒收盤,即時價 (live_price_by_symbol,來自
+        _qt_update_realtime_pnl 剛打的 snapshots()) 一觸及條件就立刻出場。
+
+        背景:strategy_engine.evaluate_strategy() 的停損/停利只在K棒收盤時
+        評估一次,且「看A做B」時比對基準是A的價格 (ADR-075),兩者疊加會讓
+        畫面上B的帳面已經虧超過停損點、系統卻遲遲沒有動作——這是使用者
+        實測回報的重大落差,這裡補上以B (實際下單/實際損益) 的即時價為準的
+        獨立監控通道,不影響原本以A為準、K棒收盤才判定的既有邏輯 (兩者互不
+        排斥,誰先觸發就用誰的結果,觸發後 state 變 FLAT,另一邊自然是no-op)。
+        股票/零股不受影響,維持原本K棒收盤才判定的行為。"""
+        if not live_price_by_symbol:
+            return
+        for s in list(self.strategies):
+            if not s.get('enabled'):
+                continue
+            if strategy_engine.trade_type_of(s) != '期貨':
+                continue
+            sym = s.get('symbol', '')
+            live_price = live_price_by_symbol.get(sym)
+            if live_price is None:
+                continue
+            rt = self._qt_runtime(s['id'])
+            if rt.get('state') not in ('LONG', 'SHORT'):
+                continue
+            intent = strategy_engine.check_intrabar_futures_stop(s, rt, live_price)
+            if intent is None:
+                continue
+            try:
+                contract, asset_type = self._qt_resolve(s)
+                if contract is None:
+                    continue
+                label = f"策略「{s.get('name')}」{intent['action']} {intent['qty']} {sym} @ {live_price:g} [即時]"
+                if s.get('mode') == '實單' and self._qt_running:
+                    sent, msg = self._place_strategy_order(s, intent, contract, asset_type, exec_price=live_price)
+                    if not sent:
+                        self.safe_after(0, self.log_message, f"【自動交易-實單失敗】{label} — {msg} (狀態未變更,下次再試)")
+                        continue
+                    strategy_engine.apply_fill(s, rt, intent, time.time(), exec_price=live_price)
+                    self.safe_after(0, self.log_message, f"【自動交易-實單】🔥 {label} | {intent['reason']} | {msg}")
+                else:
+                    strategy_engine.apply_fill(s, rt, intent, time.time(), exec_price=live_price)
+                    rec = paper_account.apply_fill(
+                        self.paper_acct, datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        s.get('market', '台股'), sym, intent['action'], intent['kind'],
+                        intent['qty'], live_price, trade_type=strategy_engine.trade_type_of(s))
+                    paper_account.mark_price(self.paper_acct, sym, live_price)
+                    self._qt_save_paper()
+                    pnl_txt = f",此筆已實現 {_fmt_amt_signed(rec['pnl'])}" if intent['kind'] == 'CLOSE' else ""
+                    self.safe_after(0, self.log_message,
+                                    f"【自動交易-模擬】🧪 {label} | {intent['reason']} → 已記入模擬帳戶{pnl_txt}")
+                self._qt_save_state()
+                self.safe_after(0, self._qt_refresh_tree)
+                if getattr(self, '_paper_win', None) and self._paper_win.winfo_exists():
+                    self.safe_after(0, self._qt_refresh_paper_account)
+            except Exception as e:
+                self.safe_after(0, self.log_message,
+                                f"【自動交易-即時停損異常】策略「{s.get('name')}」: {type(e).__name__}: {e}")
 
     def _qt_refresh_paper_account(self):
         try:

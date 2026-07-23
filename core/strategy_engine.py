@@ -568,6 +568,9 @@ def new_runtime():
     return {
         'state': 'FLAT',              # FLAT / LONG / SHORT
         'entry_price': 0.0,
+        'exec_entry_price': 0.0,      # 【新ADR】實際下單商品(看A做B時是B)的成交均價,
+                                       # 給期貨即時停損/停利用 (entry_price 是A的價,
+                                       # 看A做B時跟B不同尺度,不能拿來跟B的即時價比較)
         'qty': 0,
         'last_bar_ts': '',            # 同一根K棒不重複評估的閘門
         'trades_today': 0,
@@ -947,8 +950,13 @@ def risk_check(strategy, runtime, intent, now_ts):
     return True, ""
 
 
-def apply_fill(strategy, runtime, intent, now_ts):
-    """下單送出後更新狀態 (Phase1 採「委託視同成交」的樂觀模型,詳見 ADR-035 侷限)。"""
+def apply_fill(strategy, runtime, intent, now_ts, exec_price=None):
+    """下單送出後更新狀態 (Phase1 採「委託視同成交」的樂觀模型,詳見 ADR-035 侷限)。
+
+    【新ADR】exec_price:實際下單商品 (看A做B時是B) 的成交價,寫進
+    runtime['exec_entry_price'] 供期貨即時停損/停利 (check_intrabar_futures_stop)
+    比對用。未提供時 (測試/回測/一般不看A做B) 退回用 intent['price']
+    (此時 exec_entry_price 就等於 entry_price,行為不變)。"""
     if intent['kind'] == 'OPEN':
         # 【ADR-065】last_order_ts 只在「進場」時更新,語意是「距離上次進場
         # 多久」——冷卻本來就只該限制進場頻率 (見 risk_check)。若這裡連 CLOSE
@@ -970,17 +978,22 @@ def apply_fill(strategy, runtime, intent, now_ts):
         # 【ADR-061】買進持有 (累積) 模式:同方向再次開倉要「加碼」,
         # 也就是數量累加、進場價改成加權平均成本,而不是把前一筆蓋掉。
         # 舊版直接覆蓋 entry_price/qty,在累積模型下會讓成本基礎完全失真。
+        exec_px = float(exec_price) if exec_price is not None else float(intent['price'])
         prev_qty = int(runtime.get('qty', 0) or 0)
         if (strategy.get('buy_and_hold') and prev_qty > 0
                 and runtime.get('state') == new_state):
             add_qty = int(intent['qty'])
             prev_px = float(runtime.get('entry_price', 0) or 0)
+            prev_exec_px = float(runtime.get('exec_entry_price', 0) or 0)
             total_qty = prev_qty + add_qty
             runtime['entry_price'] = ((prev_px * prev_qty + float(intent['price']) * add_qty)
                                       / total_qty) if total_qty else 0.0
+            runtime['exec_entry_price'] = ((prev_exec_px * prev_qty + exec_px * add_qty)
+                                           / total_qty) if total_qty else 0.0
             runtime['qty'] = total_qty
         else:
             runtime['entry_price'] = float(intent['price'])
+            runtime['exec_entry_price'] = exec_px
             runtime['qty'] = int(intent['qty'])
         runtime['state'] = new_state
         runtime['trades_today'] = int(runtime.get('trades_today', 0)) + 1
@@ -991,4 +1004,50 @@ def apply_fill(strategy, runtime, intent, now_ts):
         runtime['realized_pnl_today'] = float(runtime.get('realized_pnl_today', 0.0)) + pnl
         runtime['state'] = 'FLAT'
         runtime['entry_price'] = 0.0
+        runtime['exec_entry_price'] = 0.0
         runtime['qty'] = 0
+
+
+def check_intrabar_futures_stop(strategy, runtime, live_price):
+    """【新ADR】期貨即時停損/停利:不等K棒收盤,即時價 (呼叫端傳入下單商品B的
+    最新市價快照) 一觸及使用者設定的停損%/停利%/停損點數/停利點數,立刻回傳
+    CLOSE intent (不等下一根K棒)。
+
+    背景:evaluate_strategy() 的停損/停利只在該策略訊號週期 (可能是5分K甚至
+    更長) K棒收盤時評估一次,且比對基準是「看A做B」的A的價格 (ADR-075) ——
+    兩者都會讓「畫面上B的帳面已經虧超過停損點,系統卻遲遲沒有動作」。這裡改用
+    runtime['exec_entry_price'] (B的實際成交均價,apply_fill 寫入) 對比 B 的
+    即時價,基準與畫面上的損益完全一致,且不受K棒收盤節奏限制。
+
+    只在期貨 (trade_type_of=='期貨') 且目前有部位時檢查;股票/零股維持原有
+    「K棒收盤才判定」的行為不變 (使用者這次只要求期貨即時,原本設計並非缺陷,
+    是另一種取捨,不擴大改動範圍)。與 evaluate_strategy() 內建的K棒收盤停損/
+    停利 (以A為準) 各自獨立、互不影響——不管哪一邊先觸發,觸發後 state 變
+    FLAT,另一邊下次評估時 state!=LONG/SHORT 自然是 no-op。
+
+    回傳 intent dict 或 None (未觸發/不適用)。"""
+    if trade_type_of(strategy) != '期貨':
+        return None
+    state = runtime.get('state', 'FLAT')
+    if state not in ('LONG', 'SHORT'):
+        return None
+    entry = float(runtime.get('exec_entry_price', 0) or 0)
+    live_price = float(live_price or 0)
+    if entry <= 0 or live_price <= 0:
+        return None
+    direction_mult = 1.0 if state == 'LONG' else -1.0
+    move_pct = (live_price - entry) / entry * 100.0 * direction_mult
+    move_abs = (live_price - entry) * direction_mult
+    sl = float(strategy.get('stop_loss_pct', 0) or 0)
+    tp = float(strategy.get('take_profit_pct', 0) or 0)
+    sl_abs = float(strategy.get('stop_loss_abs', 0) or 0)
+    tp_abs = float(strategy.get('take_profit_abs', 0) or 0)
+    if sl > 0 and move_pct <= -sl:
+        return _close_intent(runtime, live_price, f"即時停損出場 (損益 {move_pct:.2f}% ≤ -{sl}%)")
+    if sl_abs > 0 and move_abs <= -sl_abs:
+        return _close_intent(runtime, live_price, f"即時停損出場 (損益 {move_abs:+.2f}點 ≤ -{sl_abs}點)")
+    if tp > 0 and move_pct >= tp:
+        return _close_intent(runtime, live_price, f"即時停利出場 (損益 {move_pct:.2f}% ≥ {tp}%)")
+    if tp_abs > 0 and move_abs >= tp_abs:
+        return _close_intent(runtime, live_price, f"即時停利出場 (損益 {move_abs:+.2f}點 ≥ {tp_abs}點)")
+    return None
