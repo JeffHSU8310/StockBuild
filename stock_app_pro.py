@@ -2843,12 +2843,16 @@ class StockTradingAppPro(tk.Tk):
             pass
 
     def watchlist_quote_worker(self):
-        """【第十六輪 第2項】1 秒節奏:期貨/指數串流報價每秒上屏 (當沖等級);
-        股票批次快照維持每 10 輪 (=10秒) 一次 (P-03 節流)。未登入時安靜等待。"""
+        """【新ADR 報價加速】期貨/指數串流報價每 0.25 秒上屏 (當沖等級);
+        股票批次快照維持每 10 輪 (=2.5秒) 一次。未登入時安靜等待。
+        【鐵則5】股票快照間隔調整前已查 shioaji 官方文件的次數限制
+        (snapshots/ticks/kbars 等合計 10 秒 50 次上限),2.5 秒一次的批次
+        快照仍遠低於這個上限,詳見 DECISIONS_ADR094.md。"""
         i = 0
         while True:
             try:
-                # 【ADR-044】期指/指數串流上屏 1→0.5 秒;股票快照維持 5 秒 (i%10)。
+                # 【新ADR 報價加速】期指/指數串流上屏 0.5→0.25 秒;
+                # 股票快照 10 輪 × 0.25 秒 = 2.5 秒一次 (原本 10×0.5=5 秒)。
                 if i % 10 == 0:
                     self._wl_fetch_quotes_once()
                     self._wl_ensure_stream_subs()
@@ -2859,7 +2863,7 @@ class StockTradingAppPro(tk.Tk):
             except Exception:
                 pass
             i += 1
-            time.sleep(0.5)
+            time.sleep(0.25)
 
     def fetch_realtime_worker(self):
         while True:
@@ -2878,12 +2882,15 @@ class StockTradingAppPro(tk.Tk):
                         self.safe_after(0, self.update_quote_ui, bidask, tick, self.is_odd_lot)
                     elif contract:
                         # 無串流 (盤後/剛切換商品):以 snapshot 補參考資料。
-                        # 【修正1】節流至每 5 秒一次 —— 原本每 0.5 秒打一次 snapshots,
-                        #          會快速耗盡 shioaji 每日 API 流量配額,之後所有查詢失效。
+                        # 【修正1】節流至每 3 秒一次 (鐵則5:原本5秒,調整前已查
+                        #          shioaji 官方文件 snapshots/ticks/kbars 等合計
+                        #          10秒50次的次數上限,3秒一次仍遠低於上限,詳見
+                        #          DECISIONS_ADR094.md) —— 原本每 0.5 秒打一次
+                        #          snapshots,會快速耗盡 shioaji 流量配額。
                         # 【修正2】shioaji snapshot「只有整股資料」,零股模式下不再拿整股
                         #          快照冒充零股報價 (這正是零股數據看起來錯亂的主因)。
                         now_time = time.time()
-                        if now_time - self.last_fallback_snap_time >= 5:
+                        if now_time - self.last_fallback_snap_time >= 3:
                             self.last_fallback_snap_time = now_time
                             try:
                                 snaps = self.sj_api.snapshots([contract])
@@ -2919,7 +2926,7 @@ class StockTradingAppPro(tk.Tk):
                                         txt = f"[零股] 無串流,整股參考價: {norm_str}  (今日零股收盤 shioaji 盤後無法回補)"
                                         self.safe_after(0, lambda t=txt: self.lbl_rt_quote.config(text=t))
                 except Exception: pass
-            time.sleep(0.25)  # 【ADR-044】報價上屏 0.5→0.25 秒 (tick 是推播,加快上屏無 API 成本)
+            time.sleep(0.1)  # 【新ADR 報價加速】報價上屏 0.25→0.1 秒 (tick 是推播,加快上屏無 API 成本)
 
     def start_fetch_thread(self):
         # 【ADR-011】移除「未登入且未開YF備援就整個擋下」的舊檢查:
