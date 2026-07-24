@@ -2135,6 +2135,7 @@ class StockTradingAppPro(tk.Tk):
         tree.tag_configure('qt_on', foreground='#FF1744', background='#12161A')     # 實單紅
         tree.tag_configure('qt_sim', foreground='#29B6F6', background='#12161A')    # 模擬藍
         tree.tag_configure('qt_off', foreground='#8A99AD', background='#12161A')    # 停用灰
+        tree.tag_configure('qt_mismatch', foreground='#FFB300', background='#2A1F0A')  # 持倉與帳戶不同步警示黃
         sb = tk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=tree.yview)
         tree.configure(yscrollcommand=sb.set)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
@@ -5951,12 +5952,23 @@ class StockTradingAppPro(tk.Tk):
                     conds = "; ".join(strategy_engine.condition_label(c) for c in s.get('entry', [])) or '--'
                 pos = '--'
                 unreal_pnl_str = '--'
+                is_mismatch = False
                 if rt.get('state') in ('LONG', 'SHORT'):
                     pos = f"{'多' if rt['state']=='LONG' else '空'} {rt.get('qty',0)} @ {rt.get('entry_price',0):g}"
                     sym = s.get('symbol', '')
                     acct = self._qt_paper_acct_for(s, warn=False)
                     p = acct['positions'].get(sym)
-                    if p:
+                    # 【新ADR 持倉核對】清單顯示的「持倉」原本完全信任 rt (策略自己
+                    # 記錄的狀態),帳戶被重置/刪除過而跟 rt 對不上時,清單會很有
+                    # 自信地顯示一筆帳戶裡其實不存在的部位——這裡改成先核對,不一致
+                    # 就用醒目的方式標示出來,而不是悄悄顯示錯誤資料 (實單模式的
+                    # 部位在券商端,不適用這項核對)。
+                    mm = strategy_engine.position_mismatch(s, rt, p) if s.get('mode') != '實單' else None
+                    if mm is not None:
+                        is_mismatch = True
+                        acct_txt = '無' if not mm['acct_direction'] else f"{mm['acct_direction']}{mm['acct_qty']}"
+                        pos = f"⚠{pos}(帳戶:{acct_txt})"
+                    elif p:
                         import core.paper_account as paper_account
                         d = 1.0 if rt['state'] == 'LONG' else -1.0
                         diff = (float(p.get('mark_price', rt['entry_price'])) - rt['entry_price']) * d
@@ -5966,14 +5978,17 @@ class StockTradingAppPro(tk.Tk):
                             mult, _ = paper_account._fut_multiplier(sym)
                             u = diff * mult * rt.get('qty', 0)
                         unreal_pnl_str = _fmt_amt_signed(u)
-                        
+
                 status = '啟用' if s.get('enabled') else '停用'
                 # 【新增】「狀態」只反映策略本身有沒有勾啟用,不代表現在真的有沒有
                 # 在跑——啟用的策略若碰上總開關(自動交易)還沒開,一樣不會被評估。
                 # 這裡把「策略啟用」與「總開關是否運轉中」合併成一眼看得出的欄位。
                 running = bool(s.get('enabled')) and bool(self._qt_running)
                 running_disp = '🟢 運轉中' if running else '⏸ 停止'
-                tag = 'qt_off' if not s.get('enabled') else ('qt_on' if s.get('mode') == '實單' else 'qt_sim')
+                if is_mismatch:
+                    tag = 'qt_mismatch'
+                else:
+                    tag = 'qt_off' if not s.get('enabled') else ('qt_on' if s.get('mode') == '實單' else 'qt_sim')
                 tt = strategy_engine.trade_type_of(s)
                 sym_disp = f"{s.get('symbol','')} ({tt})"
                 sym_name = self._wl_display_name(s.get('symbol','')) if s.get('symbol','') else ''
