@@ -5224,14 +5224,45 @@ class StockTradingAppPro(tk.Tk):
         tk.Button(btn_frame, text="確認送出", bg=action_color, fg="white" if action == "買進" else "black", font=('微軟正黑體', 10, 'bold'), relief="flat", command=_on_confirm).pack(side=tk.RIGHT, expand=True, fill=tk.X, padx=(5, 0))
 
     def _confirm_and_place_order(self, ctx):
-        """【ADR-013】使用者在確認視窗按下「確認送出」後，才會執行到這裡真正呼叫 shioaji place_order()。"""
+        """【ADR-013/找到的bug 下單改背景執行緒】使用者在確認視窗按下「確認
+        送出」後，才會執行到這裡真正呼叫 shioaji place_order()。
+
+        【修正】place_order() 是同步的網路呼叫，原本直接在主執行緒 (按鈕
+        點擊的 callback) 呼叫——shioaji 連線不穩、券商端回應慢、甚至網路
+        卡住時，這一行會讓整個 Tk 事件迴圈停擺，所有視窗 (含關閉鈕) 在
+        等待期間完全沒反應，使用者回報過「好像當機」、等了好幾分鐘都沒
+        動靜，根因就是這裡。改成背景執行緒呼叫，拿到結果 (或例外) 後才
+        用 safe_after() 排回主執行緒處理其餘邏輯 (見 _apply_order_result)
+        ——等待券商回應期間 UI 仍可正常操作/關閉，不會被單一筆委託的
+        網路延遲拖累整個程式。"""
+        threading.Thread(target=self._place_order_worker, args=(ctx,), daemon=True).start()
+
+    def _place_order_worker(self, ctx):
+        """背景執行緒:只做 place_order() 這個可能較慢的網路呼叫，完成
+        (含失敗) 都排回主執行緒 _apply_order_result 處理——這個函式本身
+        絕對不能碰任何 tkinter widget (背景執行緒不可以操作 UI)。"""
+        try:
+            trade = self.sj_api.place_order(ctx["contract"], ctx["order"])
+        except Exception as e:
+            self.safe_after(0, self._apply_order_result, ctx, None, e)
+            return
+        self.safe_after(0, self._apply_order_result, ctx, trade, None)
+
+    def _apply_order_result(self, ctx, trade, place_error):
+        """【新ADR】place_order() 的結果 (成功的 trade 物件,或失敗的例外)
+        一律排回主執行緒才處理——邏輯跟改動前完全相同 (逐段防護/重複
+        委託防race/寫入「我的委託單」清單),唯一差別是 place_order()
+        本身已經在背景執行緒做完,不會再卡住 UI。place_error 不為 None
+        時直接視同原本 place_order() 那一行拋例外,走同一個「下單異常」
+        分支,行為與改動前一致。"""
         contract = ctx["contract"]; order = ctx["order"]; action = ctx["action"]; raw_sym = ctx["raw_sym"]
         mode = ctx["mode"]; mode_labels = ctx["mode_labels"]; cond_labels = ctx["cond_labels"]
         is_lot_restricted = ctx["is_lot_restricted"]; use_daytrade = ctx["use_daytrade"]
         qty = ctx["qty"]; qty_unit = ctx["qty_unit"]; price_disp = ctx["price_disp"]
         effective_cond = ctx["effective_cond"]; effective_tif = ctx["effective_tif"]
         try:
-            trade = self.sj_api.place_order(contract, order)
+            if place_error is not None:
+                raise place_error
             status_name = "已委託"
             try:
                 status_name = trade.status.status.name if hasattr(trade.status.status, 'name') else str(trade.status.status).split('.')[-1]
@@ -11035,6 +11066,11 @@ class StockTradingAppPro(tk.Tk):
         取不到 seed 保存的 Trade 時的備援:用 list_trades() 依 order id 找回 Trade。
         這是「為了刪改單一委託而取一次委託列表」,不是輪詢狀態,不違反主動回報原則。
         不同 shioaji 版本 update_status 簽名可能不同,逐一 try,失敗就放棄並誠實回報。
+
+        【找到的bug/修正】update_status()/list_trades() 都是同步網路呼叫,這個
+        函式只會從背景執行緒 (_send_order_modification_worker) 呼叫,裡面的
+        log_message() 不能直接呼叫 (會在背景執行緒操作 tkinter widget),
+        一律要用 safe_after() 排回主執行緒。
         """
         try:
             for attempt in (
@@ -11050,7 +11086,7 @@ class StockTradingAppPro(tk.Tk):
                 if tid and tid == order_id:
                     return t
         except Exception as e:
-            self.log_message(f"【刪改】嘗試取得委託物件失敗: {type(e).__name__}: {e}")
+            self.safe_after(0, self.log_message, f"【刪改】嘗試取得委託物件失敗: {type(e).__name__}: {e}")
         return None
 
     def _send_order_modification(self, o, kind, new_value):
@@ -11063,36 +11099,56 @@ class StockTradingAppPro(tk.Tk):
         並在送出前把「意圖 (10→7)」與「實際 API 參數 (qty=3)」都印進日誌,
         首次實機請用最小差距 (例如 10→9) 測試,並比對券商 App 的結果是否吻合;
         若發現方向相反,只需改這一處的 reduce/new_total 傳法。
+
+        【找到的bug/修正 下單改背景執行緒同一批】find_trade_for_order (可能牽涉
+        list_trades() 網路查詢) 跟 cancel_order()/update_order() 原本都直接在
+        主執行緒 (確認視窗按鈕 callback) 呼叫——這幾個都是同步網路呼叫,券商
+        端回應慢或網路卡住時會讓整個 Tk 事件迴圈停擺 (跟 ADR 記錄的下單當機
+        是同一種根因)。改成背景執行緒做,完成後才用 safe_after() 排回主執行緒
+        記錄結果。
         """
         if not (self.api_logged_in and HAS_SJ and self.sj_api):
             self.log_message("【刪改】券商 API 未登入,無法送出刪改。")
             return
+        threading.Thread(target=self._send_order_modification_worker,
+                         args=(o, kind, new_value), daemon=True).start()
+
+    def _send_order_modification_worker(self, o, kind, new_value):
+        """背景執行緒:找 Trade 物件 + 真正送出 cancel_order/update_order (皆為
+        網路呼叫) 都在這裡做,完成 (含失敗) 都用 safe_after() 排回主執行緒
+        記錄結果——這個函式不能碰任何 tkinter widget。"""
         trade = o.get('trade') or self._find_trade_for_order(o.get('id'))
         if trade is None:
             msg = "找不到可操作的委託物件 (此委託可能不是本次連線送出的),請改於券商 App 處理。"
-            self.log_message(f"【刪改】{msg}")
-            messagebox.showwarning("無法刪改", msg)
+            self.safe_after(0, self._report_order_mod_not_found, msg)
             return
         try:
             if kind == 'cancel':
-                self.log_message(f"【刪改送出】刪單 → cancel_order(trade)  書號:{o.get('id')}")
+                self.safe_after(0, self.log_message, f"【刪改送出】刪單 → cancel_order(trade)  書號:{o.get('id')}")
                 self.sj_api.cancel_order(trade)
             elif kind == 'qty':
                 cur = self._safe_int(o.get('quantity'))
                 new_total = int(new_value)
                 reduce_qty = cur - new_total
-                self.log_message(f"【刪改送出】改量 意圖 {cur}→{new_total} (減 {reduce_qty})"
-                                 f" → update_order(trade, qty={reduce_qty})  書號:{o.get('id')}")
+                self.safe_after(0, self.log_message, f"【刪改送出】改量 意圖 {cur}→{new_total} (減 {reduce_qty})"
+                                f" → update_order(trade, qty={reduce_qty})  書號:{o.get('id')}")
                 self.sj_api.update_order(trade, qty=reduce_qty)
             elif kind == 'price':
                 new_price = float(new_value)
-                self.log_message(f"【刪改送出】改價 → update_order(trade, price={new_price})  書號:{o.get('id')}")
+                self.safe_after(0, self.log_message, f"【刪改送出】改價 → update_order(trade, price={new_price})  書號:{o.get('id')}")
                 self.sj_api.update_order(trade, price=new_price)
-            self.log_message("【刪改】已送出,請等待委託回報確認 (清單狀態會自動更新)。")
+            self.safe_after(0, self.log_message, "【刪改】已送出,請等待委託回報確認 (清單狀態會自動更新)。")
         except Exception as e:
-            self.log_message(f"【刪改失敗】{type(e).__name__}: {e}")
-            if self._looks_like_session_dead(e):
-                self._mark_session_dead()
+            self.safe_after(0, self._report_order_mod_error, e)
+
+    def _report_order_mod_not_found(self, msg):
+        self.log_message(f"【刪改】{msg}")
+        messagebox.showwarning("無法刪改", msg)
+
+    def _report_order_mod_error(self, e):
+        self.log_message(f"【刪改失敗】{type(e).__name__}: {e}")
+        if self._looks_like_session_dead(e):
+            self._mark_session_dead()
 
     def on_order_deal_callback(self, stat, msg):
         """
