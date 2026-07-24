@@ -1051,6 +1051,36 @@ def apply_fill(strategy, runtime, intent, now_ts, exec_price=None):
         runtime['qty'] = 0
 
 
+def position_mismatch(strategy, runtime, acct_position):
+    """【新ADR 持倉核對】策略要重新啟用前,比對策略自己記錄的持倉狀態
+    (runtime['state']/['qty']) 跟它指定的模擬帳戶內「實際」的部位
+    (acct_position,即 acct['positions'].get(symbol),可能是 None) 是否一致。
+
+    背景:模擬帳戶檔可能因為使用者手動重置/刪除帳戶、或策略中途被改指到
+    別的帳戶等操作,跟策略以為的持倉狀態不同步——這種情況下若讓策略悄悄
+    重新啟用,可能會用一個「以為有部位」但帳戶其實沒有 (或反過來) 的錯誤
+    起點繼續交易,例如平不到根本不存在的倉、或帳戶裡有一筆沒人管的孤兒
+    部位。啟用前先比對一次,不一致就交由呼叫端 (GUI) 通知使用者手動處理。
+
+    一致 (含兩邊都沒有部位) 回傳 None;不一致回傳描述 dict:
+    {'rt_state': 'FLAT'/'LONG'/'SHORT', 'rt_qty': int,
+     'acct_direction': '多'/'空'/None, 'acct_qty': int}。"""
+    rt_state = runtime.get('state', 'FLAT')
+    rt_qty = int(runtime.get('qty', 0) or 0)
+    acct_direction = acct_position.get('direction') if acct_position else None
+    acct_qty = int(acct_position.get('qty', 0)) if acct_position else 0
+    if rt_state == 'FLAT':
+        if not acct_position or acct_qty <= 0:
+            return None
+        return {'rt_state': rt_state, 'rt_qty': 0,
+                'acct_direction': acct_direction, 'acct_qty': acct_qty}
+    rt_direction = '多' if rt_state == 'LONG' else '空'
+    if acct_direction != rt_direction or acct_qty != rt_qty:
+        return {'rt_state': rt_state, 'rt_qty': rt_qty,
+                'acct_direction': acct_direction, 'acct_qty': acct_qty}
+    return None
+
+
 def check_intrabar_futures_stop(strategy, runtime, live_price):
     """【新ADR】期貨即時停損/停利:不等K棒收盤,即時價 (呼叫端傳入下單商品B的
     最新市價快照) 一觸及使用者設定的停損%/停利%/停損點數/停利點數,立刻回傳

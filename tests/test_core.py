@@ -1073,6 +1073,63 @@ class TestTradeTypeAndAbsStops(unittest.TestCase):
         del s['account_id']
         self.assertEqual(strategy_engine.account_id_of(s), 'default')  # 舊策略沒這個欄位
 
+    # ---------- 【新ADR 持倉核對】position_mismatch ----------
+
+    def test_position_mismatch_none_when_both_flat(self):
+        s = strategy_engine.new_strategy()
+        rt = strategy_engine.new_runtime()  # state='FLAT'
+        self.assertIsNone(strategy_engine.position_mismatch(s, rt, None))
+
+    def test_position_mismatch_none_when_match(self):
+        s = strategy_engine.new_strategy()
+        rt = strategy_engine.new_runtime()
+        rt.update({'state': 'LONG', 'qty': 5})
+        acct_pos = {'direction': '多', 'qty': 5, 'avg_price': 100.0}
+        self.assertIsNone(strategy_engine.position_mismatch(s, rt, acct_pos))
+
+    def test_position_mismatch_detects_orphan_account_position(self):
+        """策略記錄無持倉,但帳戶內卻有一筆該商品的部位。"""
+        s = strategy_engine.new_strategy()
+        rt = strategy_engine.new_runtime()  # FLAT
+        acct_pos = {'direction': '空', 'qty': 3, 'avg_price': 44000.0}
+        m = strategy_engine.position_mismatch(s, rt, acct_pos)
+        self.assertIsNotNone(m)
+        self.assertEqual(m['rt_state'], 'FLAT')
+        self.assertEqual(m['rt_qty'], 0)
+        self.assertEqual(m['acct_direction'], '空')
+        self.assertEqual(m['acct_qty'], 3)
+
+    def test_position_mismatch_detects_missing_account_position(self):
+        """策略記錄有持倉,但帳戶內完全沒有這筆部位 (例如帳戶被重置過)。"""
+        s = strategy_engine.new_strategy()
+        rt = strategy_engine.new_runtime()
+        rt.update({'state': 'LONG', 'qty': 2})
+        m = strategy_engine.position_mismatch(s, rt, None)
+        self.assertIsNotNone(m)
+        self.assertEqual(m['rt_state'], 'LONG')
+        self.assertEqual(m['rt_qty'], 2)
+        self.assertIsNone(m['acct_direction'])
+        self.assertEqual(m['acct_qty'], 0)
+
+    def test_position_mismatch_detects_qty_difference(self):
+        s = strategy_engine.new_strategy()
+        rt = strategy_engine.new_runtime()
+        rt.update({'state': 'SHORT', 'qty': 5})
+        acct_pos = {'direction': '空', 'qty': 3, 'avg_price': 100.0}
+        m = strategy_engine.position_mismatch(s, rt, acct_pos)
+        self.assertIsNotNone(m)
+        self.assertEqual(m['rt_qty'], 5)
+        self.assertEqual(m['acct_qty'], 3)
+
+    def test_position_mismatch_detects_direction_difference(self):
+        s = strategy_engine.new_strategy()
+        rt = strategy_engine.new_runtime()
+        rt.update({'state': 'LONG', 'qty': 5})
+        acct_pos = {'direction': '空', 'qty': 5, 'avg_price': 100.0}
+        m = strategy_engine.position_mismatch(s, rt, acct_pos)
+        self.assertIsNotNone(m)
+        self.assertEqual(m['acct_direction'], '空')
+
     # ---------- 【新ADR】委託方式:限價/市價/範圍市價 ----------
 
     def _base_strategy(self, **overrides):

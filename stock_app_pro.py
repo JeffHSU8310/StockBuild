@@ -2077,6 +2077,9 @@ class StockTradingAppPro(tk.Tk):
         tk.Button(bar, text="💰 模擬帳戶", bg="#FFB300", fg="black",
                   relief="flat", font=('微軟正黑體', 9, 'bold'), padx=10, pady=2,
                   command=self._qt_open_paper_window).pack(side=tk.LEFT, padx=6)
+        tk.Button(bar, text="📊 全部帳戶", bg="#26C6DA", fg="black",
+                  relief="flat", font=('微軟正黑體', 9, 'bold'), padx=10, pady=2,
+                  command=self._qt_open_all_accounts_window).pack(side=tk.LEFT, padx=6)
         tk.Button(bar, text="📱 Telegram通知", bg="#26A5E4", fg="white",
                   relief="flat", font=('微軟正黑體', 9, 'bold'), padx=10, pady=2,
                   command=self._qt_open_telegram_settings).pack(side=tk.LEFT, padx=6)
@@ -2102,12 +2105,14 @@ class StockTradingAppPro(tk.Tk):
             for txt, bg, cmd in (("➕ 新增策略", "#29B6F6", self._qt_new_strategy),
                                   ("✏️ 編輯", "#FB8C00", self._qt_edit_strategy),
                                   ("🗑 刪除", "#5A6472", self._qt_delete_strategy),
+                                  ("⬆ 上移", "#546E7A", lambda: self._qt_move_strategy(-1)),
+                                  ("⬇ 下移", "#546E7A", lambda: self._qt_move_strategy(1)),
                                   ("▶ 啟用", "#00C853", lambda: self._qt_set_enabled(True)),
                                   ("⏸ 停用", "#8A99AD", lambda: self._qt_set_enabled(False)),
                                   ("🔬 回測", "#AB47BC", self._qt_backtest_selected),
                                   ("🎯 參數最佳化", "#00ACC1", self._qt_optimize_selected),
                                   ("📊 策略比較", "#7E57C2", self._qt_compare_dialog)):
-                fg = "white" if bg in ("#5A6472", "#AB47BC", "#7E57C2") else "black"
+                fg = "white" if bg in ("#5A6472", "#AB47BC", "#7E57C2", "#546E7A") else "black"
                 tk.Button(btns, text=txt, bg=bg, fg=fg, relief="flat",
                           font=('微軟正黑體', 9, 'bold'), padx=10, pady=3, command=cmd).pack(side=tk.LEFT, padx=2)
             
@@ -6173,6 +6178,27 @@ class StockTradingAppPro(tk.Tk):
         self._qt_save(); self._qt_save_state(); self._qt_refresh_tree()
         self.log_message(f"【自動交易】已刪除策略「{s.get('name')}」。")
 
+    def _qt_move_strategy(self, delta):
+        """【新增】策略清單順序可自行上下移動 (self.strategies 的 list 順序
+        本身就是清單顯示順序,純粹交換相鄰兩個元素即可)。"""
+        s = self._qt_selected()
+        if not s:
+            self.log_message("【自動交易】請先在清單中選取要移動順序的策略。")
+            return
+        idx = next((i for i, x in enumerate(self.strategies) if x['id'] == s['id']), None)
+        if idx is None:
+            return
+        new_idx = idx + delta
+        if new_idx < 0 or new_idx >= len(self.strategies):
+            return
+        self.strategies[idx], self.strategies[new_idx] = self.strategies[new_idx], self.strategies[idx]
+        self._qt_save(); self._qt_refresh_tree()
+        for ui in self._qt_alive_uis():
+            try:
+                ui['tree'].selection_set(s['id']); ui['tree'].focus(s['id'])
+            except Exception:
+                pass
+
     def _qt_set_enabled(self, flag):
         s = self._qt_selected()
         if not s:
@@ -6193,10 +6219,134 @@ class StockTradingAppPro(tk.Tk):
                 if not ok:
                     self.log_message(f"【自動交易】策略「{s.get('name')}」無法啟用: {msg}")
                     return
+            # 【新ADR 持倉核對】重新啟用前,比對策略記錄的持倉狀態跟它指定的
+            # 模擬帳戶內實際部位是否一致——帳戶檔可能因為手動重置/刪除帳戶等
+            # 操作跟策略以為的狀態不同步,不一致就先讓使用者確認/處理,不要
+            # 悄悄地用錯誤的起點繼續運轉 (實單模式的部位在券商端,不是模擬
+            # 帳戶,不適用這項核對)。
+            if s.get('mode') != '實單':
+                rt = self._qt_runtime(s['id'])
+                acct = self._qt_paper_acct_for(s, warn=False)
+                sym = str(s.get('symbol', '')).upper()
+                mismatch = strategy_engine.position_mismatch(s, rt, acct['positions'].get(sym))
+                if mismatch:
+                    self._qt_open_reconcile_dialog(s, rt, acct, mismatch)
+                    return
+        self._qt_finish_set_enabled(s, flag)
+
+    def _qt_finish_set_enabled(self, s, flag):
         s['enabled'] = bool(flag)
         rt = self._qt_runtime(s['id']); rt['error_count'] = 0
-        self._qt_save(); self._qt_refresh_tree(); self._qt_update_status_label()
+        self._qt_save(); self._qt_save_state(); self._qt_refresh_tree(); self._qt_update_status_label()
         self.log_message(f"【自動交易】策略「{s.get('name')}」已{'啟用' if flag else '停用'}。")
+
+    def _qt_open_reconcile_dialog(self, s, rt, acct, mismatch):
+        """【新ADR 持倉核對】策略記錄的持倉跟模擬帳戶內實際部位對不上時的
+        確認視窗:讓使用者選擇「以帳戶為準同步」「手動平倉」「手動加倉」或
+        「忽略差異強制啟用」,而不是悄悄放行一個起點就錯的策略。"""
+        sym = str(s.get('symbol', '')).upper()
+        acct_pos = acct['positions'].get(sym)
+        dlg = tk.Toplevel(self)
+        dlg.title(f"持倉核對 — {s.get('name')}")
+        dlg.configure(bg="#1A2026")
+        self.center_window(dlg, 480, 400)
+        dlg.transient(self)
+        try:
+            dlg.lift(); dlg.focus_force(); dlg.grab_set()
+        except Exception:
+            pass
+        rt_txt = ('無持倉' if mismatch['rt_state'] == 'FLAT'
+                  else f"{'多' if mismatch['rt_state']=='LONG' else '空'} {mismatch['rt_qty']}")
+        acct_txt = ('無持倉' if not mismatch['acct_direction']
+                    else f"{mismatch['acct_direction']} {mismatch['acct_qty']}")
+        tk.Label(dlg, text=f"策略「{s.get('name')}」({sym}) 的持倉記錄\n"
+                            f"跟模擬帳戶「{acct.get('name')}」內的實際部位對不上,\n"
+                            f"請確認後再啟用:",
+                 bg="#1A2026", fg="#FFCA28", font=('微軟正黑體', 10, 'bold'),
+                 justify='left').pack(anchor='w', padx=14, pady=(14, 6))
+        grid = tk.Frame(dlg, bg="#12161A"); grid.pack(fill=tk.X, padx=14, pady=4)
+        tk.Label(grid, text="策略記錄:", bg="#12161A", fg="#8A99AD").grid(row=0, column=0, sticky='w', padx=8, pady=4)
+        tk.Label(grid, text=rt_txt, bg="#12161A", fg="white", font=('微軟正黑體', 10, 'bold')).grid(row=0, column=1, sticky='w', padx=8)
+        tk.Label(grid, text="帳戶實際:", bg="#12161A", fg="#8A99AD").grid(row=1, column=0, sticky='w', padx=8, pady=4)
+        tk.Label(grid, text=acct_txt, bg="#12161A", fg="white", font=('微軟正黑體', 10, 'bold')).grid(row=1, column=1, sticky='w', padx=8)
+
+        price_row = tk.Frame(dlg, bg="#1A2026"); price_row.pack(fill=tk.X, padx=14, pady=(10, 0))
+        tk.Label(price_row, text="手動平倉/加倉的成交價:", bg="#1A2026", fg="white").pack(side=tk.LEFT)
+        if acct_pos:
+            default_price = float(acct_pos.get('mark_price', acct_pos.get('avg_price', 0)) or 0)
+        elif rt.get('entry_price'):
+            default_price = float(rt.get('entry_price') or 0)
+        else:
+            default_price = 0.0
+        e_price = tk.Entry(price_row, width=10, bg="#2A323D", fg="white", justify='center')
+        e_price.insert(0, f"{default_price:g}")
+        e_price.pack(side=tk.LEFT, padx=6)
+
+        def _sync_rt_from_acct():
+            if acct_pos:
+                rt['state'] = 'LONG' if acct_pos.get('direction') == '多' else 'SHORT'
+                rt['qty'] = int(acct_pos.get('qty', 0))
+                rt['entry_price'] = float(acct_pos.get('avg_price', 0) or 0)
+                rt['exec_entry_price'] = rt['entry_price']
+            else:
+                rt['state'] = 'FLAT'; rt['qty'] = 0; rt['entry_price'] = 0.0; rt['exec_entry_price'] = 0.0
+            self.log_message(f"【自動交易】策略「{s.get('name')}」持倉記錄已同步為帳戶實際部位。")
+            dlg.destroy()
+            self._qt_finish_set_enabled(s, True)
+
+        def _manual_close():
+            try:
+                price = float(e_price.get())
+            except ValueError:
+                messagebox.showwarning("格式錯誤", "請輸入正確的價格。", parent=dlg); return
+            if acct_pos:
+                action = '賣出' if acct_pos.get('direction') == '多' else '買進'
+                paper_account.apply_fill(acct, datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                          s.get('market', '台股'), sym, action, 'CLOSE',
+                                          int(acct_pos.get('qty', 0)), price,
+                                          trade_type=strategy_engine.trade_type_of(s))
+                self._qt_save_paper()
+            rt['state'] = 'FLAT'; rt['qty'] = 0; rt['entry_price'] = 0.0; rt['exec_entry_price'] = 0.0
+            self.log_message(f"【自動交易】策略「{s.get('name')}」已手動平倉,帳戶與策略記錄同步為無持倉。")
+            dlg.destroy()
+            self._qt_finish_set_enabled(s, True)
+
+        def _manual_open():
+            try:
+                price = float(e_price.get())
+            except ValueError:
+                messagebox.showwarning("格式錯誤", "請輸入正確的價格。", parent=dlg); return
+            if mismatch['rt_state'] == 'FLAT':
+                messagebox.showwarning("無法加倉", "策略記錄目前無持倉,沒有方向/數量可以補進帳戶。", parent=dlg); return
+            want_dir = '多' if mismatch['rt_state'] == 'LONG' else '空'
+            if acct_pos and acct_pos.get('direction') != want_dir:
+                messagebox.showwarning("方向衝突", "帳戶內已有反方向部位,請先手動平倉再加倉。", parent=dlg); return
+            action = '買進' if mismatch['rt_state'] == 'LONG' else '賣出'
+            paper_account.apply_fill(acct, datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                      s.get('market', '台股'), sym, action, 'OPEN',
+                                      mismatch['rt_qty'], price,
+                                      trade_type=strategy_engine.trade_type_of(s))
+            self._qt_save_paper()
+            self.log_message(f"【自動交易】策略「{s.get('name')}」已在帳戶內補一筆開倉,與策略記錄同步。")
+            dlg.destroy()
+            self._qt_finish_set_enabled(s, True)
+
+        def _force():
+            self.log_message(f"【自動交易】策略「{s.get('name')}」忽略持倉差異,強制啟用 (請自行留意)。")
+            dlg.destroy()
+            self._qt_finish_set_enabled(s, True)
+
+        btns = tk.Frame(dlg, bg="#1A2026"); btns.pack(fill=tk.X, padx=14, pady=(16, 4))
+        tk.Button(btns, text="✅ 以帳戶為準同步後啟用", bg="#00C853", fg="black", relief="flat",
+                  font=('微軟正黑體', 9, 'bold'), command=_sync_rt_from_acct).pack(fill=tk.X, pady=2)
+        tk.Button(btns, text="🔻 手動平倉 (帳戶與記錄都清空持倉)", bg="#FF7043", fg="black", relief="flat",
+                  font=('微軟正黑體', 9, 'bold'), command=_manual_close).pack(fill=tk.X, pady=2)
+        tk.Button(btns, text="🔺 手動加倉 (依策略記錄在帳戶補一筆開倉)", bg="#29B6F6", fg="black", relief="flat",
+                  font=('微軟正黑體', 9, 'bold'), command=_manual_open).pack(fill=tk.X, pady=2)
+        tk.Button(btns, text="⚠ 忽略差異,強制啟用", bg="#5A6472", fg="white", relief="flat",
+                  font=('微軟正黑體', 9), command=_force).pack(fill=tk.X, pady=2)
+        tk.Button(dlg, text="取消", bg="#2A323D", fg="white", relief="flat",
+                  command=dlg.destroy).pack(pady=(4, 12))
 
     # ---------- Runner:背景評估與下單 ----------
     def _qt_resolve(self, strategy):
@@ -6766,7 +6916,10 @@ class StockTradingAppPro(tk.Tk):
 
     def _qt_refresh_paper_account(self):
         """【新ADR 多帳戶】更新模擬帳戶視窗頭部數字 + 持倉表,對象是視窗目前
-        選取的帳戶 (self._paper_win_account_id),不是固定的單一帳戶。"""
+        選取的帳戶 (self._paper_win_account_id),不是固定的單一帳戶。
+        同時順手更新「📊 全部帳戶總覽」視窗 (若開著),兩個視窗共用同一份
+        帳戶資料,呼叫端不用每個地方都記得補一次全帳戶總覽的刷新。"""
+        self._qt_refresh_all_accounts_window()
         try:
             if not getattr(self, '_paper_win', None) or not self._paper_win.winfo_exists():
                 return
@@ -6827,13 +6980,18 @@ class StockTradingAppPro(tk.Tk):
                 self._qt_chukuangren_execute_pass()
 
                 now_ts = _time.time()
-                if self.api_logged_in and HAS_SJ and getattr(self, 'sj_api', None) and getattr(self, 'paper_acct', None):
+                # 【修正】ADR-091 把 self.paper_acct (單一帳戶) 改成 self.paper_accts
+                # (帳戶容器) 之後,這裡沒有同步改名,條件永遠是 None → 整段即時標記價
+                # /未實現損益更新、以及 ADR-087 的期貨即時停損停利都沒有真正在跑。
+                if self.api_logged_in and HAS_SJ and getattr(self, 'sj_api', None) and getattr(self, 'paper_accts', None):
                     if now_ts - last_snap_time >= 3.0:
                         last_snap_time = now_ts
                         if self._qt_update_realtime_pnl():
                             self.safe_after(0, self._qt_refresh_tree)
                             if getattr(self, '_paper_win', None) and self._paper_win.winfo_exists():
                                 self.safe_after(0, self._qt_refresh_paper_account)
+                            if getattr(self, '_all_accts_win', None) and self._all_accts_win.winfo_exists():
+                                self.safe_after(0, self._qt_refresh_all_accounts_window)
             except Exception:
                 pass
             _time.sleep(2)
@@ -9859,10 +10017,48 @@ class StockTradingAppPro(tk.Tk):
             self._qt_refresh_paper_account()
             _render_history()
 
+        def _rename_account():
+            aid = self._paper_win_account_id
+            acct = self.paper_accts.get(aid)
+            if not acct:
+                return
+            name = sd.askstring("重新命名帳戶", "新名稱:", initialvalue=acct.get('name', ''), parent=dlg)
+            if not name or not name.strip():
+                return
+            acct['name'] = name.strip()
+            self._qt_save_paper()
+            self.log_message(f"【模擬帳戶】帳戶已重新命名為「{acct['name']}」。")
+            _refresh_acct_combo(select_id=aid)
+            self._qt_refresh_paper_account(); _render_history()
+
+        def _move_account(delta):
+            """【新增】帳戶順序可自行排列;self.paper_accts 是 dict,順序即
+            插入順序,重排就是照新順序重建一份字典 (Python 3.7+ dict 保序)。"""
+            ids = list(self.paper_accts.keys())
+            aid = self._paper_win_account_id
+            if aid not in ids:
+                return
+            idx = ids.index(aid)
+            new_idx = idx + delta
+            if new_idx < 0 or new_idx >= len(ids):
+                return
+            ids[idx], ids[new_idx] = ids[new_idx], ids[idx]
+            self.paper_accts = {i: self.paper_accts[i] for i in ids}
+            self._qt_save_paper()
+            self.log_message("【模擬帳戶】已調整帳戶順序。")
+            _refresh_acct_combo(select_id=aid)
+            self._qt_refresh_tree()  # 策略清單的「模擬帳戶」欄選項順序也一併更新
+
         tk.Button(acct_row, text="➕ 新增帳戶", bg="#00C853", fg="black", relief="flat",
                   font=('微軟正黑體', 9, 'bold'), padx=8, pady=1, command=_add_account).pack(side=tk.LEFT, padx=4)
         tk.Button(acct_row, text="🗑 刪除此帳戶", bg="#FF5252", fg="white", relief="flat",
                   font=('微軟正黑體', 9, 'bold'), padx=8, pady=1, command=_delete_account).pack(side=tk.LEFT, padx=4)
+        tk.Button(acct_row, text="✏️ 重新命名", bg="#FB8C00", fg="black", relief="flat",
+                  font=('微軟正黑體', 9, 'bold'), padx=8, pady=1, command=_rename_account).pack(side=tk.LEFT, padx=4)
+        tk.Button(acct_row, text="⬆ 上移", bg="#546E7A", fg="white", relief="flat",
+                  font=('微軟正黑體', 9, 'bold'), padx=8, pady=1, command=lambda: _move_account(-1)).pack(side=tk.LEFT, padx=4)
+        tk.Button(acct_row, text="⬇ 下移", bg="#546E7A", fg="white", relief="flat",
+                  font=('微軟正黑體', 9, 'bold'), padx=8, pady=1, command=lambda: _move_account(1)).pack(side=tk.LEFT, padx=4)
         _refresh_acct_combo()
 
         head = tk.Frame(dlg, bg="#12161A"); head.pack(fill=tk.X, padx=10, pady=(10, 4))
@@ -9962,6 +10158,111 @@ class StockTradingAppPro(tk.Tk):
                   font=('微軟正黑體', 10), padx=14, pady=3, command=_reset).pack(side=tk.LEFT, padx=6)
         tk.Button(foot, text="關閉", bg="#2A323D", fg="white", relief="flat",
                   font=('微軟正黑體', 10), padx=20, pady=3, command=dlg.destroy).pack(side=tk.LEFT, padx=6)
+
+    def _qt_open_all_accounts_window(self):
+        """【新增】全部帳戶總覽:「💰 模擬帳戶」視窗一次只能看一個帳戶,切換
+        帳戶才看得到另一個的數字;這裡一次列出所有帳戶的資金/損益,以及
+        跨帳戶合併的完整持倉清單,方便一眼盤點「現在所有模擬倉位長怎樣」。"""
+        try:
+            if getattr(self, '_all_accts_win', None) and self._all_accts_win.winfo_exists():
+                self._all_accts_win.deiconify(); self._all_accts_win.lift(); self._all_accts_win.focus_force()
+                self._qt_refresh_all_accounts_window()
+                return
+        except Exception:
+            pass
+        dlg = tk.Toplevel(self)
+        self._all_accts_win = dlg
+        dlg.title("📊 全部模擬帳戶總覽")
+        dlg.configure(bg="#1A2026")
+        self.center_window(dlg, 1000, 620)
+        dlg.transient(self)
+        try:
+            dlg.lift(); dlg.focus_force()
+        except Exception:
+            pass
+
+        tk.Label(dlg, text="帳戶總覽:", bg="#1A2026", fg="#FFCA28", font=('微軟正黑體', 9, 'bold')).pack(anchor='w', padx=12, pady=(10, 0))
+        acct_cols = ("name", "init", "cash", "eq", "real", "unreal", "ret", "npos")
+        acct_heads = {"name": "帳戶名稱", "init": "初始資金", "cash": "現金", "eq": "權益數",
+                      "real": "已實現損益", "unreal": "未實現損益", "ret": "報酬率", "npos": "持倉檔數"}
+        widths_a = {"name": 120, "init": 100, "cash": 100, "eq": 100, "real": 100, "unreal": 100, "ret": 80, "npos": 70}
+        tva = ttk.Treeview(dlg, columns=acct_cols, show="headings", style='Trades.Treeview', height=6)
+        for c in acct_cols:
+            tva.heading(c, text=acct_heads[c]); tva.column(c, width=widths_a[c], anchor="center")
+        tva.tag_configure('p_win', foreground='#FF1744', background='#12161A')
+        tva.tag_configure('p_loss', foreground='#00E676', background='#12161A')
+        tva.tag_configure('p_flat', foreground='white', background='#12161A')
+        tva.pack(fill=tk.X, padx=10, pady=4)
+        self._all_accts_ui = {'tva': tva}
+
+        tk.Label(dlg, text="全部持倉 (跨帳戶合併):", bg="#1A2026", fg="#FFCA28", font=('微軟正黑體', 9, 'bold')).pack(anchor='w', padx=12, pady=(8, 0))
+        pos_cols = ("acct", "sym", "name", "dir", "qty", "avg", "mark", "unreal")
+        pos_heads = {"acct": "帳戶", "sym": "商品代號", "name": "商品名稱", "dir": "方向", "qty": "數量",
+                     "avg": "均價", "mark": "標記價", "unreal": "未實現"}
+        widths_p = {"acct": 100, "sym": 80, "name": 90, "dir": 50, "qty": 60, "avg": 80, "mark": 80, "unreal": 90}
+        tvp2 = ttk.Treeview(dlg, columns=pos_cols, show="headings", style='Trades.Treeview', height=14)
+        for c in pos_cols:
+            tvp2.heading(c, text=pos_heads[c]); tvp2.column(c, width=widths_p[c], anchor="center")
+        tvp2.tag_configure('p_win', foreground='#FF1744', background='#12161A')
+        tvp2.tag_configure('p_loss', foreground='#00E676', background='#12161A')
+        tvp2.tag_configure('p_flat', foreground='white', background='#12161A')
+        vsb2 = ttk.Scrollbar(dlg, orient="vertical", command=tvp2.yview)
+        tvp2.configure(yscrollcommand=vsb2.set)
+        tvp2.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        self._all_accts_ui['tvp'] = tvp2
+
+        foot = tk.Frame(dlg, bg="#1A2026"); foot.pack(pady=8)
+        tk.Button(foot, text="🔄 重新整理", bg="#5A6472", fg="white", relief="flat",
+                  font=('微軟正黑體', 10), padx=14, pady=3, command=self._qt_refresh_all_accounts_window).pack(side=tk.LEFT, padx=6)
+        tk.Button(foot, text="關閉", bg="#2A323D", fg="white", relief="flat",
+                  font=('微軟正黑體', 10), padx=20, pady=3, command=dlg.destroy).pack(side=tk.LEFT, padx=6)
+        self._qt_refresh_all_accounts_window()
+
+    def _qt_refresh_all_accounts_window(self):
+        """更新「全部帳戶總覽」視窗的兩個表格;沒開著這個視窗時直接跳過。"""
+        try:
+            if not getattr(self, '_all_accts_win', None) or not self._all_accts_win.winfo_exists():
+                return
+            ui = self._all_accts_ui
+            tva = ui['tva']
+            keep_a = tva.focus() or ((tva.selection() or [None])[0])
+            for iid in tva.get_children():
+                tva.delete(iid)
+            for aid, a in self.paper_accts.items():
+                eq = paper_account.equity(a)
+                unreal = paper_account.unrealized_pnl(a)
+                ret_pct = (eq - a['initial_cash']) / a['initial_cash'] * 100.0 if a['initial_cash'] else 0.0
+                total_pnl = a['realized_pnl'] + unreal
+                tag = 'p_win' if total_pnl > 0 else ('p_loss' if total_pnl < 0 else 'p_flat')
+                tva.insert("", tk.END, iid=aid, values=(a.get('name', aid), _fmt_amt(a['initial_cash']),
+                            _fmt_amt(a['cash']), _fmt_amt(eq), _fmt_amt_signed(a['realized_pnl']),
+                            _fmt_amt_signed(unreal), f"{ret_pct:+.2f}%", len(a['positions'])), tags=(tag,))
+            if keep_a and tva.exists(keep_a):
+                tva.selection_set(keep_a); tva.focus(keep_a)
+
+            tvp = ui['tvp']
+            keep_p = tvp.focus() or ((tvp.selection() or [None])[0])
+            for iid in tvp.get_children():
+                tvp.delete(iid)
+            for aid, a in self.paper_accts.items():
+                for sym, p in a['positions'].items():
+                    d = 1.0 if p['direction'] == '多' else -1.0
+                    diff = (float(p.get('mark_price', p['avg_price'])) - p['avg_price']) * d
+                    if p['market'] == '台股':
+                        u = diff * 1000 * p['qty']
+                    else:
+                        mult, _ = paper_account._fut_multiplier(sym)
+                        u = diff * mult * p['qty']
+                    tag = 'p_win' if u > 0 else ('p_loss' if u < 0 else 'p_flat')
+                    name = self._wl_display_name(sym)
+                    iid = f"{aid}|{sym}"
+                    tvp.insert("", tk.END, iid=iid, values=(a.get('name', aid), sym, name, p['direction'], p['qty'],
+                                f"{p['avg_price']:g}", f"{p.get('mark_price', p['avg_price']):g}",
+                                f"{_fmt_amt_signed(u)}"), tags=(tag,))
+            if keep_p and tvp.exists(keep_p):
+                tvp.selection_set(keep_p); tvp.focus(keep_p)
+        except Exception:
+            pass
 
     # ================= 【ADR-041】主圖活K棒 (tick 驅動,零全圖重繪) =================
     def _live_bar_on_tick(self, price):
