@@ -20,16 +20,37 @@ core/paper_account.py — 內建虛擬模擬帳戶 (紙上交易記帳引擎)
   - 未實現損益用「最後標記價」(mark) 計算;equity = 現金 + 未實現。
 
 零 tkinter / 零 shioaji,tests/test_core.py 可完整驗證。
+
+【新ADR 多帳戶】使用者要求「多個模擬帳戶 (可自訂增加),避免同標的在同一個
+帳戶多策略時產生衝突」——根因是 apply_fill() 的 positions 只用 symbol
+當 key,兩個不同策略同時交易同一檔標的、方向不同時,後開倉的會直接覆蓋
+前一筆的部位記錄 (股數/均價全部消失),不是累加也不是分開記。多帳戶的解法
+是「把會衝突的策略分到不同帳戶」,而不是在單一帳戶內部用 (symbol, 策略)
+複合 key 拆分——後者會讓「一個帳戶的權益/現金」失去意義 (兩個策略共用
+一份現金,卻各自以為自己在獨立記帳)。
+
+本模組維持「一個 dict = 一個帳戶」的既有設計不變 (帳戶字典的形狀、
+apply_fill/mark_price/unrealized_pnl/equity 的簽名全部不動);「多帳戶」
+純粹是 GUI 層維護一個 {account_id: 帳戶dict} 的容器,呼叫端各自傳對的
+帳戶 dict 進來,本模組完全不需要知道「有多個帳戶」這件事——這樣才能繼續
+保持零 tkinter/shioaji、可離線單元測試的既有保證 (ADR-009/011)。
 """
+import uuid
 
 STOCK_FEE_RATE = 0.001425     # 券商手續費 (單邊)
 STOCK_TAX_RATE = 0.003        # 證交稅 (賣出)
 FUTURES_FEE_PER_LOT = 50.0    # 期貨手續費估計 (單邊每口,含期交稅概估)
 FUTURES_MULTIPLIER = {'TXF': 200.0, 'MXF': 50.0, 'TMF': 10.0}
 
+DEFAULT_ACCOUNT_ID = 'default'
 
-def new_account(initial_cash=1000000.0):
+
+def new_account(initial_cash=1000000.0, name='預設帳戶', account_id=None):
+    """【新ADR 多帳戶】account_id 不帶時自動產生 (uuid 短碼);呼叫端 (GUI 層)
+    負責把回傳的 dict 存進自己維護的 {account_id: 帳戶} 容器。"""
     return {
+        'id': account_id or uuid.uuid4().hex[:10],
+        'name': str(name or '').strip() or '未命名帳戶',
         'initial_cash': float(initial_cash),
         'cash': float(initial_cash),
         'positions': {},   # key=symbol -> {market, direction(多/空), qty, avg_price, mark_price}

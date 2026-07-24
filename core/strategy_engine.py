@@ -436,6 +436,9 @@ def new_strategy():
         'cooldown_sec': 300,          # 兩次下單間最短間隔 (秒)
         'daily_loss_limit': 0.0,      # 每日虧損熔斷 (價差×數量, 0=停用)
         'mode': '模擬',               # 模擬 / 實單
+        'account_id': 'default',      # 【新ADR 多帳戶】模擬成交要記進哪個模擬帳戶
+                                       # (帳戶容器由 GUI 層維護,這裡只存 id 不存帳戶
+                                       # 本身;'default' 對應遷移舊版單一帳戶檔的那個)
         'enabled': False,
         # 【ADR-070】交易時段閘門:session_gate=True 時,非交易時間自動待命,
         # 進入盤中才評估下單 (無需人工開啟);futures_session 決定期貨要不要含夜盤。
@@ -473,6 +476,13 @@ def trade_type_of(strategy):
 
 def qty_unit_of(strategy):
     return {'股票': '張', '零股': '股', '期貨': '口'}[trade_type_of(strategy)]
+
+
+def account_id_of(strategy):
+    """【新ADR 多帳戶】相容舊策略:沒有 account_id 的一律回傳 'default'
+    (對應遷移舊版單一帳戶檔案時建立的那個帳戶)。"""
+    aid = str(strategy.get('account_id', '') or '').strip()
+    return aid or 'default'
 
 def unit_size(strategy):
     """【ADR-062】一「張/口」等於多少股或多少點乘數 —— 金額換算的共用來源。

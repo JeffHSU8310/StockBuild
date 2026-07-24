@@ -1204,7 +1204,7 @@ def _round20_paper_livebar_speed():
     app.sj_api=FApi(); app.api_logged_in=True
     app._kbars_raw_cache.clear()  # 前案例同商品(2330)的K棒快取會蓋掉本案例假資料
     app.strategies=[]; app.strategy_runtimes={}
-    app.paper_acct=_pa.new_account()
+    app.paper_accts={'default':_pa.new_account(account_id='default')}
     s=_se.new_strategy()
     s.update({'name':'診斷模擬','symbol':'2330','market':'台股','timeframe':'日K','qty':1,'mode':'模擬',
               'enabled':True,'direction':'做多','cooldown_sec':0,
@@ -1212,7 +1212,7 @@ def _round20_paper_livebar_speed():
     app.strategies.append(s); app.strategy_runtimes[s['id']]=_se.new_runtime()
     app._qt_running=True
     app._quant_eval_pass(now_ts=100.0, today_str='2026-06-05'); app.flush_after()
-    assert len(app.paper_acct['positions'])==1 and len(app.paper_acct['history'])==1, "模擬成交未記入虛擬帳戶"
+    assert len(app.paper_accts['default']['positions'])==1 and len(app.paper_accts['default']['history'])==1, "模擬成交未記入虛擬帳戶"
     app._qt_open_paper_window()  # 視窗建構不拋例外
     # 3. 邊界感知:runner自然輪詢同邊界不重複
     calls=[]
@@ -1325,11 +1325,11 @@ def _round21_tradetype_backtest():
                    'mode':'模擬','enabled':True,'direction':'做多','cooldown_sec':0,
                    'entry':[{'type':'ma_cross_up','params':{'fast':3,'slow':10}}],'stop_loss_pct':2.0})
         app.strategies.append(st); app.strategy_runtimes[st['id']]=_se.new_runtime()
-    app.paper_acct=_pa.new_account(); app._qt_running=True
+    app.paper_accts={'default':_pa.new_account(account_id='default')}; app._qt_running=True
     app._quant_eval_pass(now_ts=100.0, today_str='2026-06-05'); app.flush_after()
     states=[app.strategy_runtimes[st['id']]['state'] for st in app.strategies]
     assert states.count('LONG')==2, "兩個不同標的策略應同時各自進場"
-    assert len(app.paper_acct['positions'])==2, "模擬帳戶應同時記錄兩檔"
+    assert len(app.paper_accts['default']['positions'])==2, "模擬帳戶應同時記錄兩檔"
     app._qt_running=False; app.api_logged_in=False
 
 

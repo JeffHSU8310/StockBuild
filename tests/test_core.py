@@ -1023,6 +1023,56 @@ class TestTradeTypeAndAbsStops(unittest.TestCase):
         s2 = dict(s); s2['trade_type'] = '期貨'; s2['market'] = '台期貨'
         self.assertTrue(strategy_engine.validate_strategy(s2)[0])   # 期貨做空放行
 
+    # ---------- 【新ADR 多帳戶】模擬帳戶 id/name、策略的 account_id ----------
+
+    def test_new_account_default_id_and_name(self):
+        a = paper_account.new_account(1000000)
+        self.assertTrue(a['id'])  # 非空 (自動產生的 uuid 短碼)
+        self.assertEqual(a['name'], '預設帳戶')
+
+    def test_new_account_ids_are_unique(self):
+        a = paper_account.new_account()
+        b = paper_account.new_account()
+        self.assertNotEqual(a['id'], b['id'])
+
+    def test_new_account_explicit_name_and_id(self):
+        a = paper_account.new_account(500000, name='策略A專用', account_id='acct-a')
+        self.assertEqual(a['id'], 'acct-a')
+        self.assertEqual(a['name'], '策略A專用')
+
+    def test_new_account_blank_name_falls_back(self):
+        a = paper_account.new_account(name='   ')
+        self.assertEqual(a['name'], '未命名帳戶')
+
+    def test_two_accounts_are_independent(self):
+        """【核心防衝突機制】兩個帳戶各自的 positions/history 完全獨立,
+        同一檔標的在不同帳戶開倉不會互相影響——這是多帳戶存在的意義。"""
+        a = paper_account.new_account(1000000, account_id='a')
+        b = paper_account.new_account(1000000, account_id='b')
+        paper_account.apply_fill(a, 't', '台期貨', 'MXFR1', '買進', 'OPEN', 1, 44000, trade_type='期貨')
+        paper_account.apply_fill(b, 't', '台期貨', 'MXFR1', '賣出', 'OPEN', 1, 44000, trade_type='期貨')
+        self.assertEqual(a['positions']['MXFR1']['direction'], '多')
+        self.assertEqual(b['positions']['MXFR1']['direction'], '空')
+        self.assertEqual(len(a['history']), 1)
+        self.assertEqual(len(b['history']), 1)
+
+    def test_account_id_of_default_when_unset(self):
+        s = strategy_engine.new_strategy()
+        self.assertEqual(s['account_id'], 'default')
+        self.assertEqual(strategy_engine.account_id_of(s), 'default')
+
+    def test_account_id_of_explicit(self):
+        s = strategy_engine.new_strategy()
+        s['account_id'] = 'acct-xyz'
+        self.assertEqual(strategy_engine.account_id_of(s), 'acct-xyz')
+
+    def test_account_id_of_blank_falls_back_to_default(self):
+        s = strategy_engine.new_strategy()
+        s['account_id'] = '   '
+        self.assertEqual(strategy_engine.account_id_of(s), 'default')
+        del s['account_id']
+        self.assertEqual(strategy_engine.account_id_of(s), 'default')  # 舊策略沒這個欄位
+
     # ---------- 【新ADR】委託方式:限價/市價/範圍市價 ----------
 
     def _base_strategy(self, **overrides):

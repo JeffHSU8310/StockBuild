@@ -2047,9 +2047,9 @@ class StockTradingAppPro(tk.Tk):
                   command=dlg.destroy).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
 
     # ================= 【ADR-057】量化交易面板 (分頁精簡版 + 獨立視窗完整版) =================
-    QT_COLS = ("name", "symbol", "symbol_name", "tf", "direction", "conds", "mode", "status", "running", "today", "pos", "unreal")
+    QT_COLS = ("name", "symbol", "symbol_name", "tf", "direction", "conds", "mode", "acct", "status", "running", "today", "pos", "unreal")
     QT_HEADINGS = {"name": "策略名稱", "symbol": "商品代號", "symbol_name": "商品名稱", "tf": "週期", "direction": "方向",
-                   "conds": "進場條件", "mode": "模式", "status": "狀態", "running": "運轉狀態",
+                   "conds": "進場條件", "mode": "模式", "acct": "模擬帳戶", "status": "狀態", "running": "運轉狀態",
                    "today": "今日次數", "pos": "持倉", "unreal": "未實現損益"}
 
     def _build_quant_panel(self, parent, tree_height=4, compact=False):
@@ -2121,9 +2121,9 @@ class StockTradingAppPro(tk.Tk):
         tree = ttk.Treeview(tree_frame, columns=self.QT_COLS, show="headings",
                             height=tree_height, style='Trades.Treeview')
         widths = ({"name": 110, "symbol": 70, "symbol_name": 100, "tf": 55, "direction": 50, "conds": 240,
-                   "mode": 50, "status": 70, "running": 80, "today": 65, "pos": 90, "unreal": 75} if compact else
+                   "mode": 50, "acct": 80, "status": 70, "running": 80, "today": 65, "pos": 90, "unreal": 75} if compact else
                   {"name": 180, "symbol": 120, "symbol_name": 150, "tf": 70, "direction": 80, "conds": 460,
-                   "mode": 70, "status": 80, "running": 100, "today": 80, "pos": 140, "unreal": 90})
+                   "mode": 70, "acct": 110, "status": 80, "running": 100, "today": 80, "pos": 140, "unreal": 90})
         for c in self.QT_COLS:
             tree.heading(c, text=self.QT_HEADINGS[c])
             tree.column(c, width=widths[c], anchor="center")
@@ -5858,16 +5858,26 @@ class StockTradingAppPro(tk.Tk):
         for s in self.strategies:
             if s.get('id') not in self.strategy_runtimes:
                 self.strategy_runtimes[s['id']] = strategy_engine.new_runtime()
-        # 【ADR-041】虛擬模擬帳戶
-        self.paper_acct = None
+        # 【ADR-041/新ADR多帳戶】虛擬模擬帳戶:檔案存的是 {account_id: 帳戶dict}。
+        # 相容舊版單一帳戶檔 (頂層直接是帳戶dict,有 'cash' 鍵) ——讀到舊格式就
+        # 原地搬進新格式當「預設帳戶」(id 固定用 'default',跟 strategy_engine
+        # account_id_of() 的預設值對齊,舊策略不用手動改設定就能接上原本的部位)。
+        self.paper_accts = {}
         try:
             if os.path.exists(self.QT_PAPER_FILE):
                 with open(self.QT_PAPER_FILE, 'r', encoding='utf-8') as f:
-                    self.paper_acct = json.load(f)
+                    raw = json.load(f)
+                if isinstance(raw, dict) and 'cash' in raw:
+                    raw.setdefault('id', paper_account.DEFAULT_ACCOUNT_ID)
+                    raw.setdefault('name', '預設帳戶')
+                    self.paper_accts = {raw['id']: raw}
+                elif isinstance(raw, dict):
+                    self.paper_accts = raw
         except Exception:
-            self.paper_acct = None
-        if not isinstance(self.paper_acct, dict) or 'cash' not in self.paper_acct:
-            self.paper_acct = paper_account.new_account()
+            self.paper_accts = {}
+        if not self.paper_accts:
+            acct = paper_account.new_account(account_id=paper_account.DEFAULT_ACCOUNT_ID)
+            self.paper_accts = {acct['id']: acct}
 
     def _qt_save(self):
         try:
@@ -5887,9 +5897,34 @@ class StockTradingAppPro(tk.Tk):
     def _qt_save_paper(self):
         try:
             with open(self.QT_PAPER_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self.paper_acct, f, ensure_ascii=False, indent=1)
+                json.dump(self.paper_accts, f, ensure_ascii=False, indent=1)
         except Exception:
             pass
+
+    def _qt_paper_acct_for(self, strategy, warn=True):
+        """【新ADR 多帳戶】取得策略設定的模擬帳戶 dict。帳戶被刪除或策略設定
+        壞掉時,退回任一個現有帳戶——絕不能因為帳戶ID失效就讓成交記帳整個
+        炸掉 (寧可記錯帳戶也不要漏記一筆真實成交)。warn=False 給
+        _qt_refresh_tree 這類高頻率的純顯示呼叫用,避免同一個失效帳戶
+        每次刷新畫面就洗一次系統日誌;實際成交路徑 (warn=True,預設) 才記警告。"""
+        aid = strategy_engine.account_id_of(strategy)
+        acct = self.paper_accts.get(aid)
+        if acct is None:
+            if self.paper_accts:
+                acct = next(iter(self.paper_accts.values()))
+                if warn:
+                    self.log_message(f"【模擬帳戶】策略「{strategy.get('name')}」設定的帳戶"
+                                    f"(id={aid}) 已不存在,暫時改記入「{acct.get('name', '?')}」,"
+                                    f"請到策略編輯器重新選擇帳戶。")
+            else:
+                acct = paper_account.new_account(account_id=paper_account.DEFAULT_ACCOUNT_ID)
+                self.paper_accts[acct['id']] = acct
+        return acct
+
+    def _qt_account_choices(self):
+        """【新ADR 多帳戶】回傳 [(account_id, 帳戶名稱), ...],給策略編輯器與
+        模擬帳戶視窗的帳戶下拉選單用。"""
+        return [(aid, a.get('name', aid)) for aid, a in self.paper_accts.items()]
 
     def _qt_runtime(self, sid):
         if sid not in self.strategy_runtimes:
@@ -5914,7 +5949,8 @@ class StockTradingAppPro(tk.Tk):
                 if rt.get('state') in ('LONG', 'SHORT'):
                     pos = f"{'多' if rt['state']=='LONG' else '空'} {rt.get('qty',0)} @ {rt.get('entry_price',0):g}"
                     sym = s.get('symbol', '')
-                    p = self.paper_acct['positions'].get(sym)
+                    acct = self._qt_paper_acct_for(s, warn=False)
+                    p = acct['positions'].get(sym)
                     if p:
                         import core.paper_account as paper_account
                         d = 1.0 if rt['state'] == 'LONG' else -1.0
@@ -5941,8 +5977,10 @@ class StockTradingAppPro(tk.Tk):
                     dir_disp = '程式決定'
                 else:
                     dir_disp = s.get('direction', '')
+                # 【新ADR 多帳戶】只有模擬模式才有意義 (實單直接下到真實券商帳戶)
+                acct_disp = self._qt_paper_acct_for(s, warn=False).get('name', '') if s.get('mode') != '實單' else '--'
                 prepared.append((s['id'], (s.get('name',''), sym_disp, sym_name, s.get('timeframe',''),
-                                            dir_disp, conds, s.get('mode','模擬'), status, running_disp,
+                                            dir_disp, conds, s.get('mode','模擬'), acct_disp, status, running_disp,
                                             rt.get('trades_today', 0), pos, unreal_pnl_str), tag))
             # 【ADR-057】更新「所有」存活的量化面板 (分頁 + 獨立視窗),
             # 並保留各自原本的選取項,免得清單一刷新使用者選的策略就跑掉。
@@ -6498,20 +6536,22 @@ class StockTradingAppPro(tk.Tk):
                     else:
                         strategy_engine.apply_fill(s, rt, intent, now_ts, exec_price=exec_px)
                         changed = True
-                        # 【ADR-041】模擬成交記進虛擬模擬帳戶 (完整記帳:資金/持倉/損益)
+                        # 【ADR-041/新ADR多帳戶】模擬成交記進策略指定的模擬帳戶
+                        # (完整記帳:資金/持倉/損益;帳戶容器由 _qt_paper_acct_for 解析)
                         try:
+                            acct = self._qt_paper_acct_for(s)
                             rec = paper_account.apply_fill(
-                                self.paper_acct, datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                acct, datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                                 s.get('market', '台股'), s.get('symbol', ''),
                                 intent['action'], intent['kind'], intent['qty'], exec_px,
                                 trade_type=strategy_engine.trade_type_of(s))
-                            paper_account.mark_price(self.paper_acct, s.get('symbol', ''), exec_px)
+                            paper_account.mark_price(acct, s.get('symbol', ''), exec_px)
                             self._qt_save_paper()
                             pnl_txt = f",此筆已實現 {_fmt_amt_signed(rec['pnl'])}" if intent['kind'] == 'CLOSE' else ""
-                            eq = paper_account.equity(self.paper_acct)
+                            eq = paper_account.equity(acct)
                             self.safe_after(0, self.log_message,
                                             f"【自動交易-模擬】🧪 {label} | {intent['reason']} → 已記入模擬帳戶"
-                                            f" (權益 {_fmt_amt(eq)}{pnl_txt})")
+                                            f"「{acct.get('name','?')}」(權益 {_fmt_amt(eq)}{pnl_txt})")
                         except Exception:
                             self.safe_after(0, self.log_message, f"【自動交易-模擬】🧪 {label} | {intent['reason']} (模擬)")
                 rt['error_count'] = 0
@@ -6542,18 +6582,21 @@ class StockTradingAppPro(tk.Tk):
                     if c:
                         needed[s.get('symbol')] = c
             
-            for sym, p in self.paper_acct['positions'].items():
-                if sym not in needed:
-                    try:
-                        c = self._resolve_futures_contract(sym) if p['market'] == '期貨' else self.sj_api.Contracts.Stocks.get(sym)
-                        if c:
-                            needed[sym] = c
-                    except Exception:
-                        pass
-                        
+            # 【新ADR 多帳戶】所有帳戶的持倉都要納入標記價更新範圍,不是只看
+            # 單一帳戶——不同策略可能把部位分散記在不同帳戶裡。
+            for acct in self.paper_accts.values():
+                for sym, p in acct['positions'].items():
+                    if sym not in needed:
+                        try:
+                            c = self._resolve_futures_contract(sym) if p['market'] == '期貨' else self.sj_api.Contracts.Stocks.get(sym)
+                            if c:
+                                needed[sym] = c
+                        except Exception:
+                            pass
+
             if not needed:
                 return False
-                
+
             contracts = list(needed.values())
             snaps = self.sj_api.snapshots(contracts)
             if snaps:
@@ -6563,10 +6606,12 @@ class StockTradingAppPro(tk.Tk):
                     code = getattr(snap, 'code', '')
                     close = getattr(snap, 'close', 0)
                     if code and close > 0:
-                        paper_account.mark_price(self.paper_acct, code, float(close))
+                        for acct in self.paper_accts.values():
+                            paper_account.mark_price(acct, code, float(close))
                         for sym, c in needed.items():
                             if getattr(c, 'code', '') == code or getattr(c, 'symbol', '') == code:
-                                paper_account.mark_price(self.paper_acct, sym, float(close))
+                                for acct in self.paper_accts.values():
+                                    paper_account.mark_price(acct, sym, float(close))
                                 live_price_by_symbol[sym] = float(close)
                 # 【新ADR 期貨即時停損停利】沿用這次已經打過的 snapshots() 結果,
                 # 不額外呼叫 API (鐵則5:snapshots() 節流)——期貨標的一旦價格觸及
@@ -6620,11 +6665,12 @@ class StockTradingAppPro(tk.Tk):
                     self.safe_after(0, self.log_message, f"【自動交易-實單】🔥 {label} | {intent['reason']} | {msg}")
                 else:
                     strategy_engine.apply_fill(s, rt, intent, time.time(), exec_price=live_price)
+                    acct = self._qt_paper_acct_for(s)
                     rec = paper_account.apply_fill(
-                        self.paper_acct, datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        acct, datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                         s.get('market', '台股'), sym, intent['action'], intent['kind'],
                         intent['qty'], live_price, trade_type=strategy_engine.trade_type_of(s))
-                    paper_account.mark_price(self.paper_acct, sym, live_price)
+                    paper_account.mark_price(acct, sym, live_price)
                     self._qt_save_paper()
                     pnl_txt = f",此筆已實現 {_fmt_amt_signed(rec['pnl'])}" if intent['kind'] == 'CLOSE' else ""
                     self.safe_after(0, self.log_message,
@@ -6693,15 +6739,16 @@ class StockTradingAppPro(tk.Tk):
                         strategy_engine.apply_fill(s, rt, intent, now_ts, exec_price=exec_px)
                         changed = True
                         try:
+                            acct = self._qt_paper_acct_for(s)
                             rec = paper_account.apply_fill(
-                                self.paper_acct, datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                acct, datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                                 s.get('market', '台股'), s.get('symbol', ''),
                                 intent['action'], intent['kind'], intent['qty'], exec_px,
                                 trade_type=strategy_engine.trade_type_of(s))
-                            paper_account.mark_price(self.paper_acct, s.get('symbol', ''), exec_px)
+                            paper_account.mark_price(acct, s.get('symbol', ''), exec_px)
                             self._qt_save_paper()
                             pnl_txt = f",此筆已實現 {_fmt_amt_signed(rec['pnl'])}" if intent['kind'] == 'CLOSE' else ""
-                            eq = paper_account.equity(self.paper_acct)
+                            eq = paper_account.equity(acct)
                             self.safe_after(0, self.log_message,
                                             f"【自動交易-模擬】🧪 {label} | {intent['reason']} → 已記入模擬帳戶"
                                             f" (權益 {_fmt_amt(eq)}{pnl_txt})")
@@ -6718,10 +6765,14 @@ class StockTradingAppPro(tk.Tk):
             self.safe_after(0, self._qt_refresh_tree)
 
     def _qt_refresh_paper_account(self):
+        """【新ADR 多帳戶】更新模擬帳戶視窗頭部數字 + 持倉表,對象是視窗目前
+        選取的帳戶 (self._paper_win_account_id),不是固定的單一帳戶。"""
         try:
             if not getattr(self, '_paper_win', None) or not self._paper_win.winfo_exists():
                 return
-            a = self.paper_acct
+            a = self.paper_accts.get(getattr(self, '_paper_win_account_id', None))
+            if a is None:
+                return
             import core.paper_account as paper_account
             eq = paper_account.equity(a)
             unreal = paper_account.unrealized_pnl(a)
@@ -6729,10 +6780,14 @@ class StockTradingAppPro(tk.Tk):
             
             if hasattr(self, '_paper_ui'):
                 ui = self._paper_ui
+                ui['init'].config(text=f"{_fmt_amt(a['initial_cash'])}")
+                ui['cash'].config(text=f"{_fmt_amt(a['cash'])}")
                 ui['eq'].config(text=f"{_fmt_amt(eq)}")
+                ui['real'].config(text=f"{_fmt_amt_signed(a['realized_pnl'])}",
+                                  fg='#FF1744' if a['realized_pnl'] > 0 else ('#00E676' if a['realized_pnl'] < 0 else 'white'))
                 ui['unreal'].config(text=f"{_fmt_amt_signed(unreal)}", fg='#FF1744' if unreal > 0 else ('#00E676' if unreal < 0 else 'white'))
                 ui['ret'].config(text=f"{ret_pct:+.2f}%", fg='#FF1744' if ret_pct > 0 else ('#00E676' if ret_pct < 0 else 'white'))
-                
+
                 tvp = ui['tvp']
                 keep = tvp.focus() or ((tvp.selection() or [None])[0])
                 for iid in tvp.get_children():
@@ -6866,6 +6921,17 @@ class StockTradingAppPro(tk.Tk):
         _lbl(top, '特定進場時間').grid(row=6, column=0, sticky='w', pady=(6, 0))
         e_sp_en = _ent(top, s.get('specific_entry_time', ''), 8); e_sp_en.grid(row=6, column=1, padx=4, pady=(6, 0))
         tk.Label(top, text="(格式: HH:MM 或 HH:MM:SS)", bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8)).grid(row=6, column=2, columnspan=2, sticky='w', pady=(6, 0))
+        # 【新ADR 多帳戶】模擬成交要記進哪個模擬帳戶
+        _lbl(top, "模擬帳戶").grid(row=7, column=0, sticky='w', pady=(6, 0))
+        _acct_choices = self._qt_account_choices()
+        cb_acct2 = ttk.Combobox(top, width=16, state='readonly', style="BlackText.TCombobox",
+                                values=[name for _aid, name in _acct_choices])
+        _ids2 = [aid for aid, _name in _acct_choices]
+        _cur_aid = strategy_engine.account_id_of(s)
+        cb_acct2.current(_ids2.index(_cur_aid) if _cur_aid in _ids2 else 0)
+        cb_acct2.grid(row=7, column=1, padx=4, pady=(6, 0), sticky='w')
+        tk.Label(top, text="(只在「模式=模擬」時有意義)", bg="#1A2026", fg="#8A99AD",
+                 font=('微軟正黑體', 8)).grid(row=7, column=2, columnspan=3, sticky='w', pady=(6, 0))
         # 【ADR-074】自訂 Python 策略也能看A做B:on_bar 看 A 的 K 棒,下單到 B。
         watch_ui = self._qt_build_watch_panel(dlg, s)
 
@@ -6971,6 +7037,7 @@ class StockTradingAppPro(tk.Tk):
             s['exit_time_end'] = e_ex_ed.get().strip()
             s['specific_entry_time'] = e_sp_en.get().strip()
             s['mode'] = cb_mode.get()
+            s['account_id'] = _ids2[cb_acct2.current()] if cb_acct2.current() >= 0 else 'default'
             s['custom_params'] = _parse_params()
             s['source_code'] = txt.get('1.0', 'end-1c')
             s.update(watch_ui['get']())  # 【ADR-074】看A做B 設定
@@ -7436,6 +7503,18 @@ class StockTradingAppPro(tk.Tk):
         cb_tt.bind('<<ComboboxSelected>>', lambda e: _sync_ptype_options(), add='+')
         _sync_ptype_options()
 
+        # 【新ADR 多帳戶】模擬成交要記進哪個模擬帳戶
+        _lbl(top, "模擬帳戶").grid(row=6, column=0, sticky='w', pady=(8, 0))
+        _acct_choices = self._qt_account_choices()
+        cb_acct2 = ttk.Combobox(top, width=16, state='readonly', style="BlackText.TCombobox",
+                                values=[name for _aid, name in _acct_choices])
+        _ids2 = [aid for aid, _name in _acct_choices]
+        _cur_aid = strategy_engine.account_id_of(s)
+        cb_acct2.current(_ids2.index(_cur_aid) if _cur_aid in _ids2 else 0)
+        cb_acct2.grid(row=6, column=1, padx=4, pady=(8, 0), sticky='w')
+        tk.Label(top, text="(只在「模式=模擬」時有意義)", bg="#1A2026", fg="#8A99AD",
+                 font=('微軟正黑體', 8)).grid(row=6, column=2, columnspan=3, sticky='w', padx=(8, 0), pady=(8, 0))
+
         watch_fr = tk.Frame(dlg, bg="#12181F"); watch_fr.pack(fill=tk.X, padx=12, pady=(8, 4))
         tk.Label(watch_fr, text="看盤(A) — 固定看指數,決定進出場方向 (不下單)", bg="#12181F",
                  fg="#29B6F6", font=('微軟正黑體', 9, 'bold')).grid(row=0, column=0, columnspan=4, sticky='w', pady=(4, 2))
@@ -7498,6 +7577,7 @@ class StockTradingAppPro(tk.Tk):
                 s['qty'] = 0
             s['mode'] = cb_mode.get()
             s['price_type'] = cb_ptype.get() or '限價'
+            s['account_id'] = _ids2[cb_acct2.current()] if cb_acct2.current() >= 0 else 'default'
             s['watch_enabled'] = True
             s['watch_symbol'] = e_wsym.get().strip().upper() or '^TWII'
             s['watch_trade_type'] = '指數'
@@ -7813,6 +7893,25 @@ class StockTradingAppPro(tk.Tk):
         cb_tt.bind('<<ComboboxSelected>>', lambda e: _sync_ptype_options(), add='+')
         _sync_ptype_options()
 
+        # 【新ADR 多帳戶】模擬成交要記進哪個模擬帳戶——不同策略選不同帳戶,
+        # 同一檔標的在不同策略下的部位才不會互相覆蓋 (見 core/paper_account.py
+        # 頂部說明:positions 是用 symbol 當 key,同帳戶同symbol會互相覆蓋)。
+        # 只在編輯器開的當下讀一次帳戶清單,存檔時只存 account_id (不是名稱),
+        # 帳戶改名不影響已設定好的策略。
+        _acct_row = tk.Frame(top, bg="#1A2026")
+        _acct_row.grid(row=13, column=0, columnspan=7, sticky='w', pady=(2, 0))
+        tk.Label(_acct_row, text="模擬帳戶", bg="#1A2026", fg="white",
+                 font=('微軟正黑體', 9)).pack(side=tk.LEFT)
+        _acct_choices = self._qt_account_choices()
+        cb_acct2 = ttk.Combobox(_acct_row, width=20, state='readonly', style="BlackText.TCombobox",
+                                values=[name for _aid, name in _acct_choices])
+        _cur_aid = strategy_engine.account_id_of(s)
+        _ids2 = [aid for aid, _name in _acct_choices]
+        cb_acct2.current(_ids2.index(_cur_aid) if _cur_aid in _ids2 else 0)
+        cb_acct2.pack(side=tk.LEFT, padx=6)
+        tk.Label(_acct_row, text="(只在「模式=模擬」時有意義;實單直接下到真實券商帳戶)",
+                 bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8)).pack(side=tk.LEFT, padx=(6, 0))
+
         # --- 【ADR-074】看A做B ---
         watch_ui = self._qt_build_watch_panel(dlg, s)
 
@@ -8040,6 +8139,7 @@ class StockTradingAppPro(tk.Tk):
             try: s['slippage_ticks'] = int(e_slip.get().strip())
             except (TypeError, ValueError): s['slippage_ticks'] = 2
             s['price_type'] = cb_ptype.get() or '限價'
+            s['account_id'] = _ids2[cb_acct2.current()] if cb_acct2.current() >= 0 else 'default'
             try: s['max_trades_per_day'] = int(e_maxd.get().strip())
             except (TypeError, ValueError): s['max_trades_per_day'] = 3
             s['entry_time_start'] = e_en_st.get().strip()
@@ -9666,34 +9766,111 @@ class StockTradingAppPro(tk.Tk):
                   font=('微軟正黑體', 10), padx=20, pady=3, command=dlg.destroy).pack(pady=(0, 8))
 
     def _qt_open_paper_window(self):
-        """【ADR-041】模擬帳戶視窗:資金/權益/持倉/交易史/重置。"""
+        """【ADR-041/新ADR多帳戶】模擬帳戶視窗:帳戶選單/資金/權益/持倉/交易史/重置。
+        新增/刪除帳戶都在這個視窗做,策略編輯器只負責「選哪個帳戶」。"""
         try:
             if getattr(self, '_paper_win', None) and self._paper_win.winfo_exists():
                 self._paper_win.deiconify(); self._paper_win.lift(); self._paper_win.focus_force()
                 return
         except Exception:
             pass
-        a = self.paper_acct
+        # 記住上次選的帳戶 (視窗重開時延續);若已不存在就退回第一個。
+        if getattr(self, '_paper_win_account_id', None) not in self.paper_accts:
+            self._paper_win_account_id = next(iter(self.paper_accts.keys()))
         dlg = tk.Toplevel(self)
         self._paper_win = dlg
         dlg.title("💰 模擬帳戶 (虛擬資金,僅供策略驗證)")
         dlg.configure(bg="#1A2026")
-        self.center_window(dlg, 940, 560)
+        self.center_window(dlg, 940, 600)
         dlg.transient(self)
         try:
             dlg.lift(); dlg.focus_force()
         except Exception:
             pass
-        eq = paper_account.equity(a)
-        unreal = paper_account.unrealized_pnl(a)
-        ret_pct = (eq - a['initial_cash']) / a['initial_cash'] * 100.0 if a['initial_cash'] else 0.0
+
+        acct_row = tk.Frame(dlg, bg="#1A2026"); acct_row.pack(fill=tk.X, padx=10, pady=(8, 0))
+        tk.Label(acct_row, text="帳戶", bg="#1A2026", fg="white", font=('微軟正黑體', 9, 'bold')).pack(side=tk.LEFT)
+        cb_acct = ttk.Combobox(acct_row, width=24, state='readonly', style="BlackText.TCombobox")
+        cb_acct.pack(side=tk.LEFT, padx=6)
+
+        def _acct_values():
+            return self._qt_account_choices()
+
+        def _refresh_acct_combo(select_id=None):
+            choices = _acct_values()
+            cb_acct['values'] = [name for _aid, name in choices]
+            ids = [aid for aid, _name in choices]
+            target = select_id or self._paper_win_account_id
+            if target not in ids and ids:
+                target = ids[0]
+            self._paper_win_account_id = target
+            if target in ids:
+                cb_acct.current(ids.index(target))
+
+        def _on_acct_selected(*_a):
+            choices = _acct_values()
+            idx = cb_acct.current()
+            if 0 <= idx < len(choices):
+                self._paper_win_account_id = choices[idx][0]
+                self._qt_refresh_paper_account()
+                _render_history()
+        cb_acct.bind('<<ComboboxSelected>>', _on_acct_selected)
+
+        def _add_account():
+            name = sd.askstring("新增模擬帳戶", "帳戶名稱:", parent=dlg)
+            if not name or not name.strip():
+                return
+            cash_str = sd.askstring("新增模擬帳戶", "初始資金:", initialvalue="1000000", parent=dlg)
+            try:
+                cash = float(cash_str) if cash_str else 0
+                if cash <= 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                self.log_message("【模擬帳戶】初始資金格式錯誤,未新增帳戶。")
+                return
+            acct = paper_account.new_account(cash, name=name.strip())
+            self.paper_accts[acct['id']] = acct
+            self._qt_save_paper()
+            self.log_message(f"【模擬帳戶】已新增帳戶「{acct['name']}」(初始資金 {_fmt_amt(cash)})。")
+            _refresh_acct_combo(select_id=acct['id'])
+            self._qt_refresh_paper_account()
+            _render_history()
+
+        def _delete_account():
+            if len(self.paper_accts) <= 1:
+                messagebox.showwarning("無法刪除", "至少要保留一個模擬帳戶。", parent=dlg)
+                return
+            aid = self._paper_win_account_id
+            acct = self.paper_accts.get(aid)
+            if not acct:
+                return
+            using = [s.get('name', '?') for s in self.strategies
+                    if strategy_engine.account_id_of(s) == aid]
+            warn = (f"還有 {len(using)} 個策略 ({'、'.join(using)}) 設定用這個帳戶,"
+                    f"刪除後它們會在下次成交時自動改記到其他帳戶,請自行到策略編輯器"
+                    f"重新指定。\n\n" if using else "")
+            if not messagebox.askyesno("確認刪除", f"{warn}確定要刪除帳戶「{acct.get('name')}」嗎?"
+                                       f"(裡面的模擬交易紀錄會一併消失,無法復原)", parent=dlg):
+                return
+            del self.paper_accts[aid]
+            self._qt_save_paper()
+            self.log_message(f"【模擬帳戶】已刪除帳戶「{acct.get('name')}」。")
+            _refresh_acct_combo()
+            self._qt_refresh_paper_account()
+            _render_history()
+
+        tk.Button(acct_row, text="➕ 新增帳戶", bg="#00C853", fg="black", relief="flat",
+                  font=('微軟正黑體', 9, 'bold'), padx=8, pady=1, command=_add_account).pack(side=tk.LEFT, padx=4)
+        tk.Button(acct_row, text="🗑 刪除此帳戶", bg="#FF5252", fg="white", relief="flat",
+                  font=('微軟正黑體', 9, 'bold'), padx=8, pady=1, command=_delete_account).pack(side=tk.LEFT, padx=4)
+        _refresh_acct_combo()
+
         head = tk.Frame(dlg, bg="#12161A"); head.pack(fill=tk.X, padx=10, pady=(10, 4))
-        cells = [("初始資金", f"{_fmt_amt(a['initial_cash'])}", 'white', 'init'),
-                 ("現金", f"{_fmt_amt(a['cash'])}", 'white', 'cash'),
-                 ("權益數", f"{_fmt_amt(eq)}", '#FFCA28', 'eq'),
-                 ("已實現損益", f"{_fmt_amt_signed(a['realized_pnl'])}", '#FF1744' if a['realized_pnl'] > 0 else ('#00E676' if a['realized_pnl'] < 0 else 'white'), 'real'),
-                 ("未實現損益", f"{_fmt_amt_signed(unreal)}", '#FF1744' if unreal > 0 else ('#00E676' if unreal < 0 else 'white'), 'unreal'),
-                 ("報酬率", f"{ret_pct:+.2f}%", '#FF1744' if ret_pct > 0 else ('#00E676' if ret_pct < 0 else 'white'), 'ret')]
+        # 實際數值由下面的 self._qt_refresh_paper_account() 依目前選取的帳戶填入,
+        # 這裡只建立骨架 (支援稍後切換帳戶時原地更新,不用整個視窗重建)。
+        cells = [("初始資金", '', 'white', 'init'), ("現金", '', 'white', 'cash'),
+                 ("權益數", '', '#FFCA28', 'eq'), ("已實現損益", '', 'white', 'real'),
+                 ("未實現損益", '', 'white', 'unreal'), ("報酬率", '', 'white', 'ret')]
         self._paper_ui = {}
         for i, (lab, val, col, key) in enumerate(cells):
             cell = tk.Frame(head, bg="#12161A"); cell.grid(row=0, column=i, padx=12, pady=6)
@@ -9740,20 +9917,33 @@ class StockTradingAppPro(tk.Tk):
             if sym not in _name_cache:
                 _name_cache[sym] = self._wl_display_name(sym)
             return _name_cache[sym]
-        for rec in reversed(a['history'][-200:]):
-            kind_txt = '開倉' if rec['kind'] == 'OPEN' else '平倉'
-            is_long = (rec['kind'] == 'OPEN' and rec['action'] == '買進') or \
-                      (rec['kind'] == 'CLOSE' and rec['action'] == '賣出')
-            dir_txt = '做多' if is_long else '做空'
-            tag = 'p_win' if rec['pnl'] > 0 else ('p_loss' if rec['pnl'] < 0 else 'p_flat')
-            tvh.insert("", tk.END, values=(rec['ts'], rec['symbol'], _sym_name(rec['symbol']), dir_txt,
-                                            rec['action'], kind_txt, rec['qty'], f"{rec['price']:g}",
-                                            f"{_fmt_amt(rec['fee'])}",
-                                            f"{_fmt_amt_signed(rec['pnl'])}" if rec['kind'] == 'CLOSE' else '--'), tags=(tag,))
+
+        def _render_history():
+            """【新ADR 多帳戶】重繪交易紀錄表,對象是視窗目前選取的帳戶。"""
+            for iid in tvh.get_children():
+                tvh.delete(iid)
+            acct = self.paper_accts.get(self._paper_win_account_id)
+            if not acct:
+                return
+            for rec in reversed(acct['history'][-200:]):
+                kind_txt = '開倉' if rec['kind'] == 'OPEN' else '平倉'
+                is_long = (rec['kind'] == 'OPEN' and rec['action'] == '買進') or \
+                          (rec['kind'] == 'CLOSE' and rec['action'] == '賣出')
+                dir_txt = '做多' if is_long else '做空'
+                tag = 'p_win' if rec['pnl'] > 0 else ('p_loss' if rec['pnl'] < 0 else 'p_flat')
+                tvh.insert("", tk.END, values=(rec['ts'], rec['symbol'], _sym_name(rec['symbol']), dir_txt,
+                                                rec['action'], kind_txt, rec['qty'], f"{rec['price']:g}",
+                                                f"{_fmt_amt(rec['fee'])}",
+                                                f"{_fmt_amt_signed(rec['pnl'])}" if rec['kind'] == 'CLOSE' else '--'), tags=(tag,))
+        _render_history()
         foot = tk.Frame(dlg, bg="#1A2026"); foot.pack(pady=8)
         def _reset():
+            aid = self._paper_win_account_id
+            old = self.paper_accts.get(aid)
+            if not old:
+                return
             try:
-                cash_str = sd.askstring("重置模擬帳戶", "輸入新的初始資金 (清空持倉與歷史):", parent=dlg)
+                cash_str = sd.askstring("重置模擬帳戶", f"輸入「{old.get('name')}」的新初始資金 (清空持倉與歷史):", parent=dlg)
                 if not cash_str:
                     return
                 cash = float(cash_str)
@@ -9762,10 +9952,12 @@ class StockTradingAppPro(tk.Tk):
             except (TypeError, ValueError):
                 self.log_message("【模擬帳戶】初始資金格式錯誤,未重置。")
                 return
-            self.paper_acct = paper_account.new_account(cash)
+            # 保留原本的 id/name,只重置資金/持倉/歷史,不影響策略對這個帳戶的
+            # account_id 設定 (策略不用因為重置就重新選帳戶)。
+            self.paper_accts[aid] = paper_account.new_account(cash, name=old.get('name'), account_id=aid)
             self._qt_save_paper()
-            self.log_message(f"【模擬帳戶】已重置,初始資金 {_fmt_amt(cash)}。")
-            dlg.destroy(); self._qt_open_paper_window()
+            self.log_message(f"【模擬帳戶】「{old.get('name')}」已重置,初始資金 {_fmt_amt(cash)}。")
+            self._qt_refresh_paper_account(); _render_history()
         tk.Button(foot, text="🔄 重置帳戶", bg="#5A6472", fg="white", relief="flat",
                   font=('微軟正黑體', 10), padx=14, pady=3, command=_reset).pack(side=tk.LEFT, padx=6)
         tk.Button(foot, text="關閉", bg="#2A323D", fg="white", relief="flat",
