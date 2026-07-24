@@ -497,6 +497,52 @@ class StockTradingAppPro(tk.Tk):
         y = self.winfo_y() + (self.winfo_height() // 2) - (height // 2)
         win.geometry(f"{width}x{height}+{x}+{y}")
 
+    def _make_scrollable(self, parent, bg="#1A2026"):
+        """【新增】建立一個可垂直捲動的容器,回傳「內容要放進去的 Frame」。
+        用途:編輯器類對話框內容會隨功能增加越疊越高,若都直接塞進固定
+        高度的視窗,超出視窗高度的部分會被擠壓甚至跟底部固定的按鈕列
+        (儲存/取消) 疊在一起看不到——這裡讓「中間內容」可以用滑鼠滾輪/
+        捲軸捲動,底部固定的按鈕列永遠不會被擠出視窗外。呼叫端要先把
+        底部固定的按鈕列 (foot/lbl_status 之類) 用 side=BOTTOM pack 好,
+        再呼叫這個函式建立可捲動區塊 (內部用 side=TOP, fill=BOTH,
+        expand=True 填滿剩餘空間),回傳的 Frame 才把其餘內容當作父容器
+        塞進去——pack 呼叫順序必須底部固定的先、可捲動的後,底部才能
+        真的固定佔住空間,不會被 expand=True 的捲動區塊擠壓。"""
+        outer = tk.Frame(parent, bg=bg)
+        outer.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(outer, bg=bg, highlightthickness=0)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        inner = tk.Frame(canvas, bg=bg)
+        win_id = canvas.create_window((0, 0), window=inner, anchor='nw')
+
+        def _on_inner_configure(_e=None):
+            try:
+                canvas.configure(scrollregion=canvas.bbox("all"))
+            except Exception:
+                pass
+        inner.bind("<Configure>", _on_inner_configure)
+
+        def _on_canvas_configure(e):
+            try:
+                canvas.itemconfig(win_id, width=e.width)
+            except Exception:
+                pass
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_mousewheel(e):
+            try:
+                canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+            except Exception:
+                pass
+        # 滑鼠移進這個捲動區域才綁全域滾輪事件,移出就解綁——不然開著這個
+        # 視窗時,滾輪會連主視窗或其他視窗的內容都一起捲動。
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+        return inner
+
     def load_config(self):
         # 【ADR-009】檔案 I/O 移到 data/config_store.py。
         return config_store.load_broker_config(self.config_file)
@@ -7758,7 +7804,7 @@ class StockTradingAppPro(tk.Tk):
         title_suffix = " (唯讀 - 策略執行中)" if readonly else ""
         dlg.title("終極波段策略" + ("" if is_new else f" — {s.get('name')}{title_suffix}"))
         dlg.configure(bg="#1A2026")
-        self.center_window(dlg, 660, 920)
+        self.center_window(dlg, 660, 780)
         dlg.transient(self)
         try:
             dlg.lift(); dlg.focus_force()
@@ -7770,13 +7816,43 @@ class StockTradingAppPro(tk.Tk):
                             "確認成立後不會立刻下單，會等約1分鐘 (12:01) 依當時最新價才真正送單，"
                             "確認與下單是兩個不同時間點。"),
                  bg="#12181F", fg="#FFCA28", font=('微軟正黑體', 9), wraplength=600,
-                 justify='left').pack(fill=tk.X, padx=10, pady=(10, 4))
+                 justify='left').pack(side=tk.TOP, fill=tk.X, padx=10, pady=(10, 4))
+
+        # 【版面修正】不論之後再新增多少參數/區塊,「儲存/取消」按鈕跟狀態列
+        # 一定要固定在視窗最下方看得到——這裡先用 side=BOTTOM pack 好佔住
+        # 底部空間,下面才建可捲動區塊放其餘所有內容 (見 _make_scrollable);
+        # 內容再怎麼加,超出視窗高度的部分用滑鼠滾輪/捲軸捲動,不會把按鈕
+        # 擠出視窗外或跟內容疊在一起。_save 這裡還沒定義 (在後面),用
+        # lambda 延後到真正點擊時才查找,不影響按鈕先建立。
+        lbl_status = tk.Label(dlg, text="", bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 9),
+                              wraplength=600, justify='left', anchor='w')
+        lbl_status.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(0, 4))
+
+        def _set_status(msg, color="#8A99AD"):
+            try:
+                if dlg.winfo_exists():
+                    lbl_status.config(text=msg, fg=color)
+            except Exception:
+                pass
+
+        foot = tk.Frame(dlg, bg="#1A2026"); foot.pack(side=tk.BOTTOM, pady=8)
+        if readonly:
+            tk.Button(foot, text="唯讀無法儲存", bg="#2A323D", fg="#8A99AD", relief="flat", state=tk.DISABLED,
+                      font=('微軟正黑體', 11, 'bold'), padx=18, pady=4).pack(side=tk.LEFT, padx=6)
+        else:
+            tk.Button(foot, text="儲存策略", bg="#29B6F6", fg="black", relief="flat",
+                      font=('微軟正黑體', 11, 'bold'), padx=18, pady=4,
+                      command=lambda: _save()).pack(side=tk.LEFT, padx=6)
+        tk.Button(foot, text="關閉" if readonly else "取消", bg="#2A323D", fg="white", relief="flat",
+                  font=('微軟正黑體', 11), padx=18, pady=4, command=dlg.destroy).pack(side=tk.LEFT, padx=6)
+
+        body = self._make_scrollable(dlg)
 
         def _lbl(p, t): return tk.Label(p, text=t, bg="#1A2026", fg="white", font=('微軟正黑體', 9))
         def _ent(p, v, w=10):
             e = tk.Entry(p, width=w, bg="#2A323D", fg="white", justify="center"); e.insert(0, str(v)); return e
 
-        top = tk.Frame(dlg, bg="#1A2026"); top.pack(fill=tk.X, padx=12, pady=2)
+        top = tk.Frame(body, bg="#1A2026"); top.pack(fill=tk.X, padx=12, pady=2)
         _lbl(top, "策略名稱").grid(row=0, column=0, sticky='w')
         e_name = _ent(top, s.get('name', chukuangren_band.STRATEGY_NAME), 20); e_name.grid(row=0, column=1, padx=4, columnspan=2, sticky='w')
 
@@ -7851,7 +7927,7 @@ class StockTradingAppPro(tk.Tk):
         tk.Label(top, text="(只在「模式=模擬」時有意義)", bg="#1A2026", fg="#8A99AD",
                  font=('微軟正黑體', 8)).grid(row=6, column=2, columnspan=3, sticky='w', padx=(8, 0), pady=(8, 0))
 
-        watch_fr = tk.Frame(dlg, bg="#12181F"); watch_fr.pack(fill=tk.X, padx=12, pady=(8, 4))
+        watch_fr = tk.Frame(body, bg="#12181F"); watch_fr.pack(fill=tk.X, padx=12, pady=(8, 4))
         tk.Label(watch_fr, text="看盤(A) — 固定看指數,決定進出場方向 (不下單)", bg="#12181F",
                  fg="#29B6F6", font=('微軟正黑體', 9, 'bold')).grid(row=0, column=0, columnspan=4, sticky='w', pady=(4, 2))
         tk.Label(watch_fr, text="指數代碼", bg="#12181F", fg="white", font=('微軟正黑體', 9)).grid(row=1, column=0, sticky='w', padx=(4, 0))
@@ -7869,7 +7945,7 @@ class StockTradingAppPro(tk.Tk):
 
         # 參數區:X/C/F 兩方向共用;Y/Z 只做多顯示、S1/S2 只做空顯示 (ADR-085)。
         # 依「方向」下拉選單動態切換要顯示的那組停損參數。
-        pcontainer = tk.Frame(dlg, bg="#1A2026"); pcontainer.pack(fill=tk.X, padx=12, pady=(6, 4))
+        pcontainer = tk.Frame(body, bg="#1A2026"); pcontainer.pack(fill=tk.X, padx=12, pady=(6, 4))
         tk.Label(pcontainer, text="參數 (加權指數點位/點數,依你的判斷自行設定)", bg="#1A2026",
                  fg="#FFCA28", font=('微軟正黑體', 9, 'bold')).pack(anchor='w', pady=(0, 4))
         param_entries = {}
@@ -7903,7 +7979,7 @@ class StockTradingAppPro(tk.Tk):
         # 【新ADR 盤勢型態提醒】獨立於進出場邏輯之外的提醒功能:抓看盤(A,加權
         # 指數) 的日K,判斷盤勢 (區間整理/上升/下降) 跟常見技術型態,只通知
         # 不下單。預設關閉,使用者要自己勾選啟用。
-        pattern_fr = tk.Frame(dlg, bg="#12181F"); pattern_fr.pack(fill=tk.X, padx=12, pady=(8, 4))
+        pattern_fr = tk.Frame(body, bg="#12181F"); pattern_fr.pack(fill=tk.X, padx=12, pady=(8, 4))
         tk.Label(pattern_fr, text="📈 盤勢/型態提醒 (選用,只通知不下單;以日K為主,60分K為輔做盤中預告)",
                  bg="#12181F", fg="#29B6F6", font=('微軟正黑體', 9, 'bold')).grid(
                  row=0, column=0, columnspan=6, sticky='w', pady=(4, 2))
@@ -7991,17 +8067,6 @@ class StockTradingAppPro(tk.Tk):
             s['pattern_list'] = [pid for pid, v in pat_vars.items() if v.get()]
             return s
 
-        lbl_status = tk.Label(dlg, text="", bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 9),
-                              wraplength=600, justify='left', anchor='w')
-        lbl_status.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(0, 4))
-
-        def _set_status(msg, color="#8A99AD"):
-            try:
-                if dlg.winfo_exists():
-                    lbl_status.config(text=msg, fg=color)
-            except Exception:
-                pass
-
         def _save():
             strat = _collect()
             ok, msg = chukuangren_band.validate(strat)
@@ -8026,15 +8091,6 @@ class StockTradingAppPro(tk.Tk):
             dlg.destroy()
 
         _clook()
-        foot = tk.Frame(dlg, bg="#1A2026"); foot.pack(side=tk.BOTTOM, pady=8)
-        if readonly:
-            tk.Button(foot, text="唯讀無法儲存", bg="#2A323D", fg="#8A99AD", relief="flat", state=tk.DISABLED,
-                      font=('微軟正黑體', 11, 'bold'), padx=18, pady=4).pack(side=tk.LEFT, padx=6)
-        else:
-            tk.Button(foot, text="儲存策略", bg="#29B6F6", fg="black", relief="flat",
-                      font=('微軟正黑體', 11, 'bold'), padx=18, pady=4, command=_save).pack(side=tk.LEFT, padx=6)
-        tk.Button(foot, text="關閉" if readonly else "取消", bg="#2A323D", fg="white", relief="flat",
-                  font=('微軟正黑體', 11), padx=18, pady=4, command=dlg.destroy).pack(side=tk.LEFT, padx=6)
 
     def _qt_build_watch_panel(self, parent, s):
         """【ADR-074】建立「看A做B」設定面板 (內建/自訂策略編輯器共用)。
