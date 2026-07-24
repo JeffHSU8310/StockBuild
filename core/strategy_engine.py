@@ -16,6 +16,7 @@ core/strategy_engine.py — 量化自動交易引擎 (純邏輯層)
 
 本模組不做的事 (由 GUI 層負責):合約解析、實際下單、執行緒、UI 更新。
 """
+import re
 import uuid
 import pandas as pd
 
@@ -618,7 +619,31 @@ def new_runtime():
         'time_window_skips': [],      # 【ADR-066】最近一次評估時,有哪些 intent 被進/出場時間窗設定排除
     }
 
-VALID_TIMEFRAMES = ("1分K", "5分K", "15分K", "30分K", "60分K", "日K")
+VALID_TIMEFRAMES = ("1分K", "5分K", "15分K", "30分K", "60分K", "日K", "周K", "月K")
+
+_CUSTOM_TIMEFRAME_RE = re.compile(r'^(\d+)(分|時)K$')
+
+def timeframe_minutes(tf):
+    """【新增 自訂週期】把週期字串換算成分鐘數:涵蓋 VALID_TIMEFRAMES 既有的
+    「N分K」預設值,也涵蓋使用者自訂的任意「N分K」/「N時K」(N為正整數)——
+    後者統一先換算成分鐘 (N時K = N*60分K),盤中 resample 本來就是以分鐘為
+    最小單位,不需要另外處理小時級的 resample 規則。日K/周K/月K 或無法
+    解析回傳 None (呼叫端用這個分辨「這是日以上的週期,還是分鐘週期」)。"""
+    m = _CUSTOM_TIMEFRAME_RE.match(str(tf or ''))
+    if not m:
+        return None
+    n = int(m.group(1))
+    if n <= 0:
+        return None
+    return n * 60 if m.group(2) == '時' else n
+
+def is_valid_timeframe(tf):
+    """【新增 自訂週期】取代舊版「只能是 VALID_TIMEFRAMES 裡的固定字串」——
+    日K/周K/月K,或任何正整數的自訂 N分K/N時K (含 VALID_TIMEFRAMES 既有的
+    預設分鐘週期,本身就符合 N分K 格式),都視為合法週期。"""
+    if tf in ('日K', '周K', '月K'):
+        return True
+    return timeframe_minutes(tf) is not None
 
 def validate_strategy(s):
     """存檔/啟用前的完整驗證。回傳 (ok, 錯誤訊息)。"""
@@ -636,8 +661,8 @@ def validate_strategy(s):
         return False, "範圍市價僅期貨支援 (股票/零股交易所規則沒有這個委託方式)"
     if tt == '零股' and pt != '限價':
         return False, "零股依交易所規則只能限價 (鐵則6,不可用市價/範圍市價)"
-    if s.get('timeframe') not in VALID_TIMEFRAMES:
-        return False, f"週期僅支援 {'/'.join(VALID_TIMEFRAMES)}"
+    if not is_valid_timeframe(s.get('timeframe')):
+        return False, f"週期格式不正確 (可選 {'/'.join(VALID_TIMEFRAMES)},或自訂 N分K/N時K,例如 45分K、3時K)"
     if s.get('direction') not in ('做多', '做空'):
         return False, "方向僅支援 做多 / 做空"
     if s.get('direction') == '做空' and tt != '期貨':
@@ -698,8 +723,8 @@ def validate_strategy(s):
             return False, "已啟用「看A做B」,但『看A』的商品代碼不可空白"
         if watch_trade_type_of(s) not in WATCH_TRADE_TYPES:
             return False, f"『看A』的種類僅支援 {'/'.join(WATCH_TRADE_TYPES)}"
-        if watch_timeframe_of(s) not in VALID_TIMEFRAMES:
-            return False, f"『看A』的週期僅支援 {'/'.join(VALID_TIMEFRAMES)}"
+        if not is_valid_timeframe(watch_timeframe_of(s)):
+            return False, f"『看A』的週期格式不正確 (可選 {'/'.join(VALID_TIMEFRAMES)},或自訂 N分K/N時K)"
     return True, ""
 
 

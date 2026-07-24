@@ -498,7 +498,9 @@ class TestStrategyEngine(unittest.TestCase):
         s_bad2 = self._base_strategy()
         s_bad2.update({'watch_enabled': True, 'watch_symbol': '', 'watch_trade_type': '指數'})
         # watch_symbol 空會退回 symbol(2330),仍算合法;明確測「A 週期非法」
-        s_bad2['watch_symbol'] = '^TWII'; s_bad2['watch_timeframe'] = '3分K'
+        # (【新ADR 自訂週期】任意正整數的 N分K/N時K 現在都合法,這裡改用真正
+        # 不合法的格式測試,不能再用 '3分K' 這種其實合法的自訂週期當反例)
+        s_bad2['watch_symbol'] = '^TWII'; s_bad2['watch_timeframe'] = '亂七八糟'
         self.assertFalse(strategy_engine.validate_strategy(s_bad2)[0])
 
     def test_evaluate_all_on_A_sl_tp_on_A(self):
@@ -1129,6 +1131,49 @@ class TestTradeTypeAndAbsStops(unittest.TestCase):
         m = strategy_engine.position_mismatch(s, rt, acct_pos)
         self.assertIsNotNone(m)
         self.assertEqual(m['acct_direction'], '空')
+
+    # ---------- 【新ADR 自訂週期】timeframe_minutes / is_valid_timeframe ----------
+
+    def test_timeframe_minutes_presets(self):
+        self.assertEqual(strategy_engine.timeframe_minutes('1分K'), 1)
+        self.assertEqual(strategy_engine.timeframe_minutes('5分K'), 5)
+        self.assertEqual(strategy_engine.timeframe_minutes('60分K'), 60)
+
+    def test_timeframe_minutes_custom_minute(self):
+        self.assertEqual(strategy_engine.timeframe_minutes('45分K'), 45)
+
+    def test_timeframe_minutes_custom_hour(self):
+        self.assertEqual(strategy_engine.timeframe_minutes('3時K'), 180)
+
+    def test_timeframe_minutes_day_class_returns_none(self):
+        for tf in ('日K', '周K', '月K'):
+            self.assertIsNone(strategy_engine.timeframe_minutes(tf))
+
+    def test_timeframe_minutes_invalid_returns_none(self):
+        for tf in ('', '0分K', '-5分K', '亂七八糟', '5分', None):
+            self.assertIsNone(strategy_engine.timeframe_minutes(tf))
+
+    def test_is_valid_timeframe_day_class(self):
+        for tf in ('日K', '周K', '月K'):
+            self.assertTrue(strategy_engine.is_valid_timeframe(tf))
+
+    def test_is_valid_timeframe_custom(self):
+        self.assertTrue(strategy_engine.is_valid_timeframe('45分K'))
+        self.assertTrue(strategy_engine.is_valid_timeframe('3時K'))
+
+    def test_is_valid_timeframe_rejects_garbage(self):
+        for tf in ('', '亂七八糟', '0分K', None):
+            self.assertFalse(strategy_engine.is_valid_timeframe(tf))
+
+    def test_validate_strategy_accepts_custom_timeframe(self):
+        s = self._base_strategy(timeframe='45分K')
+        self.assertTrue(strategy_engine.validate_strategy(s)[0])
+
+    def test_validate_strategy_rejects_bad_timeframe(self):
+        s = self._base_strategy(timeframe='亂七八糟')
+        ok, msg = strategy_engine.validate_strategy(s)
+        self.assertFalse(ok)
+        self.assertIn('週期', msg)
 
     # ---------- 【新ADR】委託方式:限價/市價/範圍市價 ----------
 
@@ -3287,6 +3332,45 @@ class TestChukuangrenBand(unittest.TestCase):
         self.assertEqual(intents[0]['kind'], 'CLOSE')
         self.assertEqual(intents[0]['qty'], 5)
         self.assertEqual(intents[0]['price'], 90.5)
+
+    # ---------- 【找到的bug/修正】armed_intent 過期作廢 (max_age_sec) ----------
+
+    def test_execute_armed_discards_stale_intent_past_max_age(self):
+        """12:00確認成立後,若因為停用/總開關關閉/程式重啟等原因太久沒真正
+        執行 (超過 max_age_sec),不應該用『現在』的價格補送一筆委託——那已經
+        跟這個策略『12:00確認、12:01立刻執行』的設計語意不符。"""
+        rt = strategy_engine.new_runtime()
+        rt['pending_entry'] = {'dir': 'LONG', 'date': '2026-01-01'}
+        params = self._params()
+        chukuangren_band.on_noon_confirm(params, rt, 105.0, '2026-01-02', now_ts=1000.0, qty=3)
+        self.assertIsNotNone(rt['armed_intent'])
+        # 超過 max_age_sec (預設600秒) 才第一次被評估到 (例如總開關關了很久)
+        intents = chukuangren_band.on_execute_armed(rt, 999.0, now_ts=1000.0 + 601.0)
+        self.assertEqual(intents, [])
+        self.assertIsNone(rt['armed_intent'])   # 已作廢清空,不會殘留等下次補送
+        self.assertEqual(rt['armed_at_ts'], 0.0)
+        self.assertIsNotNone(rt.get('last_discarded_stale_intent'))
+        self.assertEqual(rt['last_discarded_stale_intent']['kind'], 'OPEN')
+
+    def test_execute_armed_still_fires_within_max_age(self):
+        """確認一下修正沒有誤傷正常情況:延遲60秒內、也還沒超過 max_age_sec
+        的正常執行,行為要跟修正前完全一樣。"""
+        rt = strategy_engine.new_runtime()
+        rt['pending_entry'] = {'dir': 'LONG', 'date': '2026-01-01'}
+        params = self._params()
+        chukuangren_band.on_noon_confirm(params, rt, 105.0, '2026-01-02', now_ts=1000.0, qty=3)
+        intents = chukuangren_band.on_execute_armed(rt, 108.0, now_ts=1060.0)
+        self.assertEqual(len(intents), 1)
+        self.assertIsNone(rt.get('last_discarded_stale_intent'))
+
+    def test_execute_armed_custom_max_age(self):
+        rt = strategy_engine.new_runtime()
+        rt['pending_entry'] = {'dir': 'LONG', 'date': '2026-01-01'}
+        params = self._params()
+        chukuangren_band.on_noon_confirm(params, rt, 105.0, '2026-01-02', now_ts=1000.0, qty=3)
+        intents = chukuangren_band.on_execute_armed(rt, 999.0, now_ts=1000.0 + 70.0, max_age_sec=65.0)
+        self.assertEqual(intents, [])
+        self.assertIsNotNone(rt.get('last_discarded_stale_intent'))
 
     # ---------- 固定停損:觸發→隔天確認/作廢 ----------
 

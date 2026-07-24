@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-core/chukuangren_band.py — 「楚狂人之終極波段」內建策略 (純邏輯層)
+core/chukuangren_band.py — 「終極波段策略」內建策略 (純邏輯層,原名「楚狂人之終極波段」)
 
 【ADR-084/ADR-085】設計原則 (比照 ADR-035 strategy_engine.py 的規範):
 1. 零 tkinter / 零 shioaji 依賴,所有狀態機邏輯都是純函式,可離線單元測試。
@@ -90,7 +90,7 @@ PARAM_HELP = {
 }
 
 KIND = 'chukuangren_band'
-STRATEGY_NAME = '楚狂人之終極波段'
+STRATEGY_NAME = '終極波段策略'
 DIRECTIONS = ('做多', '做空')
 
 
@@ -328,7 +328,7 @@ def on_noon_confirm(params, rt, confirm_price, today_key, now_ts, qty=1):
             dname = '多單D' if d == 'LONG' else '空單E'
             rt['armed_intent'] = {
                 'kind': 'OPEN', 'action': action, 'qty': int(qty),
-                'reason': f"楚狂人進場確認 (隔日12點指數{confirm_price:g} "
+                'reason': f"終極波段策略進場確認 (隔日12點指數{confirm_price:g} "
                           f"{'>' if d == 'LONG' else '<'} X={X:g}),"
                           f"記錄進場加權指數點位 {dname}={confirm_price:g}",
             }
@@ -352,7 +352,7 @@ def on_noon_confirm(params, rt, confirm_price, today_key, now_ts, qty=1):
             action = '賣出' if position == 'LONG' else '買進'
             rt['armed_intent'] = {
                 'kind': 'CLOSE', 'action': action,
-                'reason': f"楚狂人出場確認 ({_REASON_LABEL.get(reason, reason)})",
+                'reason': f"終極波段策略出場確認 ({_REASON_LABEL.get(reason, reason)})",
             }
             rt['armed_at_ts'] = float(now_ts)
             rt['trail_armed'] = False
@@ -362,19 +362,38 @@ def on_noon_confirm(params, rt, confirm_price, today_key, now_ts, qty=1):
         rt['pending_exit'] = None
 
 
-def on_execute_armed(rt, exec_price, now_ts, delay_sec=60.0):
+def on_execute_armed(rt, exec_price, now_ts, delay_sec=60.0, max_age_sec=600.0):
     """confirm 後延遲下單:rt['armed_intent'] 存在且已經過了 delay_sec 秒
     (預設60秒,即12:00確認→12:01下單) 才真正組出要送出的 intent (格式與
     strategy_engine.evaluate_strategy 相同,可直接丟給 risk_check/apply_fill)。
 
     exec_price:真正下單那一刻 (執行商品B) 的最新價,不是12:00確認當下的A價
     (confirm_price)——確認與下單本來就是兩個時間點,價格自然也各自取當下的。
-    還沒到時間就回傳空 list,呼叫端每次評估都可以放心呼叫 (冪等)。"""
+    還沒到時間就回傳空 list,呼叫端每次評估都可以放心呼叫 (冪等)。
+
+    【找到的bug/修正】max_age_sec (預設600秒=10分鐘):armed_intent 存在超過
+    這個秒數還沒執行,視為過期作廢 (清掉 armed_intent,不送單)。根因:如果
+    策略在12:00確認成立、還沒到12:01真正執行前被停用、或總開關被關閉、或
+    程式重啟,評估會整段暫停;使用者晚一點 (甚至隔天) 才重新啟用/開總開關
+    時,原本的判斷只看「有沒有超過 delay_sec」,會把一個用「當下」全新價格
+    執行的委託,冠上一個其實是好幾小時甚至隔天才確認的舊訊號——跟這個策略
+    『12:00確認、12:01立刻執行』的設計語意完全不符,可能用一個已經過時、
+    市場條件早就變了的訊號送出一筆使用者沒預期到的委託。過期作廢後,若原本
+    是出場確認,部位會維持原狀,等下一次日K收盤重新評估出場條件 (正常機制
+    接手,不需要人工處理);若是進場確認,就等下一次日K收盤重新出現訊號。
+    呼叫端可以用 rt.pop('last_discarded_stale_intent', None) 讀取被作廢的
+    intent (讀取後即消失,只會通知一次) 來記錄警告訊息。"""
     ensure_runtime(rt)
     ai = rt.get('armed_intent')
     if ai is None:
         return []
-    if float(now_ts) - float(rt.get('armed_at_ts', 0) or 0) < float(delay_sec):
+    age = float(now_ts) - float(rt.get('armed_at_ts', 0) or 0)
+    if age >= float(max_age_sec):
+        rt['armed_intent'] = None
+        rt['armed_at_ts'] = 0.0
+        rt['last_discarded_stale_intent'] = ai
+        return []
+    if age < float(delay_sec):
         return []
     if ai['kind'] == 'OPEN':
         qty = int(ai.get('qty', 1))

@@ -3260,9 +3260,19 @@ class StockTradingAppPro(tk.Tk):
             if col in sj_df.columns:
                 sj_df = sj_df[sj_df[col] > 0]
 
-        resample_map = {"1分K": '1min', "5分K": '5min', "15分K": '15min', "30分K": '30min',
-                        "60分K": '60min', "日K": 'D', "周K": 'W-MON', "月K": 'MS'}
+        # 【新ADR 自訂週期】日/周/月K 是固定的 3 個特例規則;分鐘級週期一律靠
+        # strategy_engine.timeframe_minutes() 換算,不再各寫一份「1分K→1,
+        # 5分K→5,...」的對照表——這樣自訂的 N分K/N時K (量化策略編輯器新增
+        # 的功能) 不用另外加規則就能直接算,也不會有兩份清單各自維護、遲早
+        # 分歧的風險 (P-67 教訓)。主圖既有的固定週期下拉選單不受影響:
+        # 傳進來的 tf 字串本來就都在 timeframe_minutes() 涵蓋範圍內。
+        resample_map = {"日K": 'D', "周K": 'W-MON', "月K": 'MS'}
         rule = resample_map.get(tf)
+        mins = 0
+        if not rule:
+            mins = strategy_engine.timeframe_minutes(tf) or 0
+            if mins > 0:
+                rule = f'{mins}min'
         if not rule:
             return sj_df
         agg_dict = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}
@@ -3272,7 +3282,6 @@ class StockTradingAppPro(tk.Tk):
                 return self._resample_future_session(sj_df, tf, agg_dict, session_basis=session_basis)
             return sj_df.resample(rule, label='left', closed='left').agg(agg_dict).dropna()
         out = sj_df.resample(rule, label='left', closed='left').agg(agg_dict).dropna()
-        mins = {"1分K": 1, "5分K": 5, "15分K": 15, "30分K": 30, "60分K": 60}.get(tf, 0)
         if mins > 0:
             out.index = out.index + pd.Timedelta(minutes=mins)
         return out
@@ -5843,7 +5852,8 @@ class StockTradingAppPro(tk.Tk):
     QT_STRATEGY_FILE = app_path("quant_strategies.json")   # 【ADR-060】絕對路徑
     QT_STATE_FILE = app_path("quant_state.json")      # 【ADR-060】絕對路徑
     QT_PAPER_FILE = app_path("paper_account.json")    # 【ADR-060】絕對路徑
-    QT_TF_DAYS = {"1分K": 4, "5分K": 7, "15分K": 14, "30分K": 21, "60分K": 35, "日K": 300}
+    QT_TF_DAYS = {"1分K": 4, "5分K": 7, "15分K": 14, "30分K": 21, "60分K": 35, "日K": 300,
+                  "周K": 700, "月K": 1500}  # 【新增】週期擴充:周K/月K 要夠長的原始資料才湊得出夠多根
 
     def _qt_load(self):
         """載入策略與持倉狀態。總開關 _qt_running 絕不持久化——每次啟動一律關閉。"""
@@ -5946,7 +5956,7 @@ class StockTradingAppPro(tk.Tk):
                 if s.get('kind') == 'custom':
                     conds = "🐍 自訂 Python (on_bar)"
                 elif s.get('kind') == chukuangren_band.KIND:
-                    conds = (f"🎯 楚狂人之終極波段 (看{strategy_engine.watch_symbol_of(s)},"
+                    conds = (f"🎯 終極波段策略 (看{strategy_engine.watch_symbol_of(s)},"
                             f"X={s.get('ck_x', 0):g})")
                 else:
                     conds = "; ".join(strategy_engine.condition_label(c) for c in s.get('entry', [])) or '--'
@@ -6160,7 +6170,7 @@ class StockTradingAppPro(tk.Tk):
         tk.Button(dlg, text="🐍 自訂 Python 策略 (自己寫 on_bar)", bg="#AB47BC", fg="white",
                   relief="flat", font=('微軟正黑體', 10, 'bold'), padx=10, pady=6,
                   command=_custom).pack(fill=tk.X, padx=30, pady=4)
-        tk.Button(dlg, text="🎯 楚狂人之終極波段 (看大盤,做自選商品)", bg="#FF7043", fg="black",
+        tk.Button(dlg, text="🎯 終極波段策略 (看大盤,做自選商品)", bg="#FF7043", fg="black",
                   relief="flat", font=('微軟正黑體', 10, 'bold'), padx=10, pady=6,
                   command=_chukuangren).pack(fill=tk.X, padx=30, pady=4)
 
@@ -6410,7 +6420,20 @@ class StockTradingAppPro(tk.Tk):
         K棒 (A 的週期、A 的代碼);不帶時就抓策略本身 (執行商品 B) 的設定。
         """
         tf = tf or strategy.get('timeframe', '5分K')
-        days = self.QT_TF_DAYS.get(tf, 7)
+        days = self.QT_TF_DAYS.get(tf)
+        if days is None:
+            # 【新增 自訂週期】不在固定表裡的自訂 N分K/N時K:抓的天數跟既有
+            # 預設週期的級距對齊,分鐘數越大要越多天原始資料才湊得出足夠根數
+            # 給 MA/BB 等指標算——不求精確,只求「跟同量級的預設週期一樣堪用」。
+            mins = strategy_engine.timeframe_minutes(tf) or 5
+            if mins <= 15:
+                days = 10
+            elif mins <= 60:
+                days = 30
+            elif mins <= 240:
+                days = 60
+            else:
+                days = 120
         end_dt = datetime.now()
         start_dt = end_dt - timedelta(days=days)
         _sym = (cache_sym or str(strategy.get('symbol'))).upper()
@@ -6571,11 +6594,21 @@ class StockTradingAppPro(tk.Tk):
             # 【ADR-041】邊界感知:只有該策略週期的K棒剛收盤才評估 (測試/手動觸發不受限)
             # 【ADR-074】看A做B 時,訊號來自 A,節奏依 A 的週期 (watch_timeframe)。
             if not _forced:
-                tf_mins = {'1分K': 1, '5分K': 5, '15分K': 15, '30分K': 30, '60分K': 60}.get(strategy_engine.watch_timeframe_of(s))
+                # 【新ADR 自訂週期】改用 strategy_engine.timeframe_minutes()
+                # (涵蓋任意正整數的自訂 N分K/N時K,不再只認 1/5/15/30/60 這
+                # 5個固定值)。邊界改算「距當日0點的總分鐘數」取模,而不是
+                # 只對 now_dt.minute (0-59) 取模——後者只在週期<=60分鐘且
+                # 整除60時才對,自訂的時K (例如3時K=180分鐘) 用分鐘取模永遠
+                # 只會對齊到整點,對不齊真正的3小時邊界。這個算法對既有的
+                # 1/5/15/30/60分K算出來的邊界時間跟原本完全一樣 (60分鐘以內
+                # 的整除週期,「距0點總分鐘數取模」等於「該小時內取模」),
+                # 只是同時把大於60分鐘、或不能整除60的自訂週期也算對。
+                tf_mins = strategy_engine.timeframe_minutes(strategy_engine.watch_timeframe_of(s))
                 now_dt = datetime.now()
                 if tf_mins:
-                    boundary = now_dt.replace(second=0, microsecond=0)
-                    boundary -= timedelta(minutes=boundary.minute % tf_mins)
+                    midnight = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+                    elapsed_min = int((now_dt - midnight).total_seconds() // 60)
+                    boundary = midnight + timedelta(minutes=(elapsed_min // tf_mins) * tf_mins)
                     boundary_key = str(boundary)
                     # 給資料源 2 秒緩衝再抓,避免最後一根還沒生出來
                     if (now_dt - boundary).total_seconds() < 2:
@@ -6596,14 +6629,14 @@ class StockTradingAppPro(tk.Tk):
                     raise RuntimeError(f"執行商品(做B)合約解析失敗: {s.get('symbol')}")
 
                 if s.get('kind') == chukuangren_band.KIND:
-                    # 【新ADR 楚狂人之終極波段】獨立分派:A固定用日K做突破/停損/停利
+                    # 【新ADR 終極波段策略】獨立分派:A固定用日K做突破/停損/停利
                     # 訊號判斷,5分K做「隔天中午12:00」二次確認 (只確認,不下單)。
                     # 【新ADR 確認/下單分兩個時間點】確認成立後不會在這裡立刻下單,
                     # 而是記進 rt['armed_intent'],真正送單延後約60秒 (12:01) 由
                     # _qt_chukuangren_execute_pass() 獨立檢查執行——那個節奏不受
                     # 這裡5分K邊界閘門限制 (5分K邊界只在整5分鐘觸發,不會剛好落在
                     # 12:01)。intents 這裡永遠是空的,下面共用的intent處理迴圈對
-                    # 楚狂人策略是no-op,合乎預期。
+                    # 終極波段策略是no-op,合乎預期。
                     w_contract, w_asset, w_sym, w_mkt = self._qt_resolve_watch(s)
                     if w_contract is None:
                         raise RuntimeError(f"看盤商品(看A)合約解析失敗: {strategy_engine.watch_symbol_of(s)}")
@@ -6849,11 +6882,11 @@ class StockTradingAppPro(tk.Tk):
                                 f"【自動交易-即時停損異常】策略「{s.get('name')}」: {type(e).__name__}: {e}")
 
     def _qt_chukuangren_execute_pass(self):
-        """【新ADR 確認/下單分兩個時間點】楚狂人策略12:00確認成立後不會立刻
+        """【新ADR 確認/下單分兩個時間點】終極波段策略12:00確認成立後不會立刻
         下單,而是記進 rt['armed_intent']——真正送單要等
         chukuangren_band.on_execute_armed 判斷『已過60秒』(約12:01) 才發生。
 
-        這個檢查獨立於 _quant_eval_pass 的5分K邊界閘門之外:楚狂人的5分K
+        這個檢查獨立於 _quant_eval_pass 的5分K邊界閘門之外:終極波段策略的5分K
         邊界只在每5分鐘整點觸發一次 (12:00/12:05/...),不會剛好落在12:01,
         所以延遲下單無法沿用同一套邊界機制,得另外掛在 quant_runner_worker
         既有的2秒輪詢節奏上,每次都呼叫、沒有 armed_intent 的策略一律
@@ -6883,6 +6916,20 @@ class StockTradingAppPro(tk.Tk):
                     continue
                 exec_px = float(b_df['Close'].iloc[-1])
                 intents = chukuangren_band.on_execute_armed(rt, exec_px, now_ts)
+                # 【找到的bug/修正】12:00確認成立後若因為停用/總開關關閉/程式重啟
+                # 等原因太久沒真正執行 (超過 on_execute_armed 的 max_age_sec,預設
+                # 10分鐘),chukuangren_band 會把它作廢而不是用現在的價格補送——
+                # 不然會變成拿一個好幾小時甚至隔天才確認的舊訊號,用完全不相干的
+                # 當下價格下單,語意跟「12:00確認、12:01立刻執行」完全不符。這裡
+                # 補上通知,讓使用者知道有一筆確認被作廢,不是系統沒反應。
+                stale = rt.pop('last_discarded_stale_intent', None)
+                if stale:
+                    self.safe_after(0, self.log_message,
+                                    f"【自動交易-警示】策略「{s.get('name')}」的12:00確認"
+                                    f" ({stale.get('reason')}) 因為評估中斷太久 (超過10分鐘"
+                                    f"未執行) 已作廢,不會用現在的價格補送;部位/訊號會在"
+                                    f"下一次日K收盤重新評估,無需手動處理。")
+                    self._qt_save_state()
                 if not intents:
                     continue  # 還沒過60秒,下一輪(2秒後)再檢查
                 for intent in intents:
@@ -7068,8 +7115,10 @@ class StockTradingAppPro(tk.Tk):
         _bt = (dlg, e_sym, cb_tt, _clook, 'B')
         self._qt_editor_symbol_target = _bt
         e_sym.bind('<FocusIn>', lambda *_a: setattr(self, '_qt_editor_symbol_target', _bt), add='+')
-        _lbl(top, "週期").grid(row=1, column=0, sticky='w', pady=(6, 0))
-        cb_tf = ttk.Combobox(top, values=list(strategy_engine.VALID_TIMEFRAMES), width=7, state='readonly', style="BlackText.TCombobox")
+        _lbl(top, "週期(可自訂)").grid(row=1, column=0, sticky='w', pady=(6, 0))
+        # 【新ADR 自訂週期】state='normal':可從下拉點選常用值,也可直接打字
+        # 輸入自訂週期 (例如 45分K、3時K),存檔前 validate_strategy() 會擋格式錯誤。
+        cb_tf = ttk.Combobox(top, values=list(strategy_engine.VALID_TIMEFRAMES), width=7, state='normal', style="BlackText.TCombobox")
         cb_tf.set(s.get('timeframe', '5分K')); cb_tf.grid(row=1, column=1, padx=4, pady=(6, 0))
         _lbl(top, "數量").grid(row=1, column=2, sticky='w', padx=(8, 0), pady=(6, 0))
         e_qty = _ent(top, s.get('qty', 1), 6); e_qty.grid(row=1, column=3, padx=4, pady=(6, 0))
@@ -7585,7 +7634,7 @@ class StockTradingAppPro(tk.Tk):
             _notify(f"❌ 執行失敗: {e}", False)
 
     def _qt_open_chukuangren_editor(self, strategy, readonly=False):
-        """【新ADR】「楚狂人之終極波段」專屬編輯器:看加權指數(A)訊號,做自選商品(B),
+        """【新ADR】「終極波段策略」專屬編輯器:看加權指數(A)訊號,做自選商品(B),
         含隔天中午12:00二次確認的進出場/停損/點數移動停利→SMA20移動停利。
         獨立編輯器 (不沿用 _qt_open_editor 的條件組合UI),因為這個策略的邏輯是
         寫死的狀態機 (core/chukuangren_band.py),不是 AND/OR 條件拼出來的。"""
@@ -7593,7 +7642,7 @@ class StockTradingAppPro(tk.Tk):
         s = chukuangren_band.default_strategy() if is_new else json.loads(json.dumps(strategy))
         dlg = tk.Toplevel(self)
         title_suffix = " (唯讀 - 策略執行中)" if readonly else ""
-        dlg.title("楚狂人之終極波段" + ("" if is_new else f" — {s.get('name')}{title_suffix}"))
+        dlg.title("終極波段策略" + ("" if is_new else f" — {s.get('name')}{title_suffix}"))
         dlg.configure(bg="#1A2026")
         self.center_window(dlg, 660, 820)
         dlg.transient(self)
@@ -7780,7 +7829,7 @@ class StockTradingAppPro(tk.Tk):
             ok, msg = chukuangren_band.validate(strat)
             if not ok:
                 _set_status(f"✗ 儲存失敗:\n{msg}", "#FF5252")
-                self.log_message(f"【楚狂人之終極波段】儲存失敗: {msg}")
+                self.log_message(f"【終極波段策略】儲存失敗: {msg}")
                 return
             if strat['mode'] == '實單' and is_new:
                 strat['mode'] = '模擬'
@@ -7794,7 +7843,7 @@ class StockTradingAppPro(tk.Tk):
                     if x['id'] == strat['id']:
                         self.strategies[i] = strat; break
             self._qt_save(); self._qt_save_state(); self._qt_refresh_tree()
-            self.log_message(f"【楚狂人之終極波段】「{strat['name']}」已儲存 ({strat['mode']}),已加入「量化交易」分頁清單。")
+            self.log_message(f"【終極波段策略】「{strat['name']}」已儲存 ({strat['mode']}),已加入「量化交易」分頁清單。")
             messagebox.showinfo("儲存成功", f"策略「{strat['name']}」已儲存 ({strat['mode']} 模式)。", parent=self)
             dlg.destroy()
 
@@ -7830,10 +7879,13 @@ class StockTradingAppPro(tk.Tk):
                               state='readonly', style="BlackText.TCombobox")
         cb_wtt.set(s.get('watch_trade_type', '指數')); cb_wtt.pack(side=tk.LEFT, padx=4)
         tk.Label(rowA, text="看A週期", bg="#12181F", fg="white", font=('微軟正黑體', 9)).pack(side=tk.LEFT, padx=(8, 0))
+        # 【新ADR 自訂週期】state='normal' (可編輯) 而非 readonly:下拉仍列出常用
+        # 預設值方便點選,但也可以直接打字輸入自訂週期 (例如 45分K、3時K),
+        # 存檔前 validate_strategy() 的 is_valid_timeframe() 會擋下格式不正確的輸入。
         cb_wtf = ttk.Combobox(rowA, values=list(strategy_engine.VALID_TIMEFRAMES), width=6,
-                              state='readonly', style="BlackText.TCombobox")
+                              state='normal', style="BlackText.TCombobox")
         cb_wtf.set(s.get('watch_timeframe', '30分K')); cb_wtf.pack(side=tk.LEFT, padx=4)
-        tk.Label(rowA, text="(點一下此欄再點左側自選股即可帶入A並自動判斷指數/期貨/股票;訊號看A週期,下單看B最新價)",
+        tk.Label(rowA, text="(可自訂輸入,如45分K/3時K;點一下此欄再點左側自選股即可帶入A並自動判斷指數/期貨/股票;訊號看A週期,下單看B最新價)",
                  bg="#12181F", fg="#8A99AD", font=('微軟正黑體', 8)).pack(side=tk.LEFT, padx=(8, 0))
         lbl_wname = tk.Label(wf, text="", bg="#12181F", fg="#00E676", font=('微軟正黑體', 8))
         lbl_wname.pack(anchor='w', padx=4, pady=(0, 4))
@@ -7926,8 +7978,10 @@ class StockTradingAppPro(tk.Tk):
         _bt = (dlg, e_sym, cb_tt, _lookup_name, 'B')
         self._qt_editor_symbol_target = _bt
         e_sym.bind('<FocusIn>', lambda *_a: setattr(self, '_qt_editor_symbol_target', _bt), add='+')
-        _lbl(top, "週期").grid(row=1, column=0, sticky='w', pady=(6, 0))
-        cb_tf = ttk.Combobox(top, values=list(strategy_engine.VALID_TIMEFRAMES), width=7, state='readonly', style="BlackText.TCombobox")
+        _lbl(top, "週期(可自訂)").grid(row=1, column=0, sticky='w', pady=(6, 0))
+        # 【新ADR 自訂週期】state='normal':可從下拉點選常用值,也可直接打字
+        # 輸入自訂週期 (例如 45分K、3時K),存檔前 validate_strategy() 會擋格式錯誤。
+        cb_tf = ttk.Combobox(top, values=list(strategy_engine.VALID_TIMEFRAMES), width=7, state='normal', style="BlackText.TCombobox")
         cb_tf.set(s.get('timeframe', '5分K')); cb_tf.grid(row=1, column=1, padx=4, pady=(6, 0))
         _lbl(top, "方向").grid(row=1, column=2, sticky='w', padx=(10, 0), pady=(6, 0))
         cb_dir = ttk.Combobox(top, values=['做多', '做空'], width=7, state='readonly', style="BlackText.TCombobox")
@@ -8917,7 +8971,7 @@ class StockTradingAppPro(tk.Tk):
             # 【新ADR】v1 尚未支援回測/最佳化:隔天中午12點二次確認的雙時間週期
             # (日K訊號 + 5分K確認) 狀態機無法套進現有單一 df 的回測迴圈,需要
             # 另外設計才能支援;先誠實告知,只支援模擬/實單監控。
-            self.log_message(f"【回測】「{s.get('name')}」(楚狂人之終極波段) 目前尚未支援回測/最佳化,"
+            self.log_message(f"【回測】「{s.get('name')}」(終極波段策略) 目前尚未支援回測/最佳化,"
                              "僅支援模擬/實單監控 (雙時間週期的狀態機需要另外設計回測邏輯)。")
             return
         else:
@@ -8973,7 +9027,7 @@ class StockTradingAppPro(tk.Tk):
                     '加碼' if st.get('bnh_mode') == 'accumulate' else
                     '定期定額') if st.get('buy_and_hold') else (
                     '自訂' if st.get('kind') == 'custom' else
-                    '楚狂人(不支援回測)' if st.get('kind') == chukuangren_band.KIND else '條件')
+                    '終極波段(不支援回測)' if st.get('kind') == chukuangren_band.KIND else '條件')
             tk.Checkbutton(chk_frame, variable=v, bg="#12161A", fg="#E6EDF3", selectcolor="#2A323D",
                            font=('微軟正黑體', 9), activebackground="#12161A",
                            text=f"{st.get('name','')}  [{st.get('symbol','')} {st.get('timeframe','')} / {kind}]"
@@ -9106,7 +9160,7 @@ class StockTradingAppPro(tk.Tk):
                         '累積加碼' if st.get('bnh_mode') == 'accumulate' else
                         '定期定額') if st.get('buy_and_hold') else (
                         '自訂Python' if st.get('kind') == 'custom' else
-                        '楚狂人波段' if st.get('kind') == chukuangren_band.KIND else '條件策略')
+                        '終極波段策略' if st.get('kind') == chukuangren_band.KIND else '條件策略')
                 if st.get('kind') == chukuangren_band.KIND:
                     rows.append({'name': st.get('name'), 'mode': mode, 'ok': False,
                                  'err': '尚未支援回測 (僅支援模擬/實單監控)'})
