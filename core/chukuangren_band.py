@@ -120,6 +120,7 @@ def default_strategy():
     (共用 symbol/qty/mode/enabled/session_gate/看A做B 等既有欄位與持久化格式),
     只額外疊加 ck_* 參數與固定的看A做B設定 (A 固定看加權指數)。"""
     from . import strategy_engine
+    from . import market_pattern
     s = strategy_engine.new_strategy()
     s['kind'] = KIND
     s['name'] = STRATEGY_NAME
@@ -130,6 +131,13 @@ def default_strategy():
     s['watch_timeframe'] = '5分K'   # 驅動 _quant_eval_pass 每5分鐘評估一次 (隔日中午確認需要這個頻率)
     for k in PARAM_KEYS:
         s[f'ck_{k}'] = 0.0
+    # 【新ADR 盤勢型態提醒】預設關閉 (不要沒問過使用者就多送通知);
+    # 使用者在編輯器打開後,才會依 pattern_lookback/pattern_near_pct/
+    # pattern_list 跑 core/market_pattern.py 的判斷並用 Telegram/日誌提醒。
+    s['pattern_enabled'] = False
+    s['pattern_lookback'] = market_pattern.DEFAULT_PARAMS['lookback']
+    s['pattern_near_pct'] = market_pattern.DEFAULT_PARAMS['near_pct']
+    s['pattern_list'] = list(market_pattern.DEFAULT_PARAMS['enabled_patterns'])
     return s
 
 

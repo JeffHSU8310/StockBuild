@@ -43,6 +43,7 @@ from core import market_session
 from core import secure_store
 from core import chukuangren_band
 from core import telegram_notify
+from core import market_pattern
 from data import config_store
 from data import taifex_store
 
@@ -5855,6 +5856,18 @@ class StockTradingAppPro(tk.Tk):
     QT_TF_DAYS = {"1分K": 4, "5分K": 7, "15分K": 14, "30分K": 21, "60分K": 35, "日K": 300,
                   "周K": 700, "月K": 1500}  # 【新增】週期擴充:周K/月K 要夠長的原始資料才湊得出夠多根
 
+    # 【新ADR 盤勢型態提醒】這幾種訊號代表「目前的持續狀態」(盤勢分類/是否
+    # 接近邊界/三角形楔形),不是一次性事件——同一個狀態沒變之前,每天重新
+    # 評估都會再算出同一個結果,若照一般型態一樣照樣通知會每天洗一次頻道。
+    # 只有這幾種才需要「內容有變才通知」的額外去重;其餘型態 (M頭/W底/
+    # 頭肩頂底/破底翻/假突破/島型反轉/區間突破跌破/N字形) 本身的判斷邏輯
+    # 就只在型態confirm的那一天觸發一次,不需要額外去重。
+    QT_PATTERN_PERSISTENT_IDS = frozenset({
+        'regime', 'near_range_high', 'near_range_low',
+        'triangle_symmetrical', 'triangle_ascending', 'triangle_descending',
+        'wedge_rising', 'wedge_falling',
+    })
+
     def _qt_load(self):
         """載入策略與持倉狀態。總開關 _qt_running 絕不持久化——每次啟動一律關閉。"""
         self.strategies = []
@@ -6644,6 +6657,10 @@ class StockTradingAppPro(tk.Tk):
                                                           cache_sym=w_sym, cache_market=w_mkt)
                     if daily_df is None or daily_df.empty:
                         continue  # 沒資料不算錯誤 (可能休市/剛登入還沒建立快取)
+                    # 【新ADR 盤勢型態提醒】跟進出場邏輯完全獨立,共用同一份剛抓到
+                    # 的日K,不用多打一次 API;只提醒不影響下面的進出場判斷。
+                    self._qt_pattern_check(s, rt, daily_df)
+                    self._qt_pattern_intraday_preview(s, rt, daily_df, w_contract, w_asset, w_sym, w_mkt)
                     params = chukuangren_band.params_of(s)
                     chukuangren_band.on_daily_close(params, rt, daily_df,
                                                     chukuangren_band.direction_of(s))
@@ -6880,6 +6897,91 @@ class StockTradingAppPro(tk.Tk):
             except Exception as e:
                 self.safe_after(0, self.log_message,
                                 f"【自動交易-即時停損異常】策略「{s.get('name')}」: {type(e).__name__}: {e}")
+
+    def _qt_pattern_check(self, s, rt, daily_df):
+        """【新ADR 盤勢型態提醒】終極波段策略專屬,一天只跑一次 (跟 daily_df
+        最後一根的日期綁定,不受5分K邊界節奏影響——這個評估跟進出場邏輯
+        完全independent)。用 core/market_pattern.py 的純函式判斷,新出現的
+        訊號用 log_message('【自動交易-盤勢】...') 通知——這個前綴會被
+        telegram_notify.is_quant_message() 抓到,總開關開著時自動額外推播
+        Telegram,不用另外接線。只提醒,不影響任何進出場邏輯/委託。"""
+        if not s.get('pattern_enabled'):
+            return
+        try:
+            today_date = str(daily_df.index[-1]).split(' ')[0]
+        except Exception:
+            return
+        if rt.get('pattern_last_eval_date') == today_date:
+            return
+        rt['pattern_last_eval_date'] = today_date
+        params = {
+            'lookback': int(s.get('pattern_lookback', 60) or 60),
+            'near_pct': float(s.get('pattern_near_pct', 3.0) or 3.0),
+            'enabled_patterns': s.get('pattern_list') or list(market_pattern.DEFAULT_PARAMS['enabled_patterns']),
+        }
+        try:
+            signals = market_pattern.evaluate_all(daily_df, params)
+        except Exception as e:
+            self.safe_after(0, self.log_message,
+                            f"【自動交易-盤勢異常】策略「{s.get('name')}」型態偵測失敗: {type(e).__name__}: {e}")
+            return
+        if not signals:
+            return
+        prev = rt.get('pattern_last_notified') or {}
+        new_notified = {}
+        msgs = []
+        for sig in signals:
+            pid = sig.get('pattern', '')
+            label = sig.get('label', pid)
+            bias = f"[{sig['bias']}]" if sig.get('bias') else ''
+            if pid in self.QT_PATTERN_PERSISTENT_IDS:
+                new_notified[pid] = label
+                if prev.get(pid) == label:
+                    continue  # 持續狀態沒有變化,不重複通知
+            msgs.append(f"{label}{bias}")
+        rt['pattern_last_notified'] = new_notified
+        if msgs:
+            self.safe_after(0, self.log_message,
+                            f"【自動交易-盤勢】策略「{s.get('name')}」"
+                            f"({strategy_engine.watch_symbol_of(s)}) {today_date} 日K偵測到:"
+                            + "；".join(msgs))
+
+    def _qt_pattern_intraday_preview(self, s, rt, daily_df, w_contract, w_asset, w_sym, w_mkt):
+        """【使用者需求:60分K為輔】日K還沒收盤前,先用最新60分K收盤看一眼是否
+        已經接近日K算出來的區間邊界,給一個『留意』等級的盤中預告——正式的
+        盤勢/型態判定永遠只看日K收盤 (_qt_pattern_check),這裡只是提早提醒,
+        不是正式結論,每天每個方向最多提醒一次。"""
+        if not s.get('pattern_enabled'):
+            return
+        try:
+            lookback = int(s.get('pattern_lookback', 60) or 60)
+            near_pct = float(s.get('pattern_near_pct', 3.0) or 3.0)
+            regime = market_pattern.classify_regime(daily_df, lookback=lookback, near_pct=near_pct)
+            if not regime:
+                return
+            intraday_df = self._qt_fetch_closed_bars(s, w_contract, w_asset, tf='60分K',
+                                                      cache_sym=w_sym, cache_market=w_mkt)
+            if intraday_df is None or intraday_df.empty:
+                return
+            live_close = float(intraday_df['Close'].iloc[-1])
+            span = regime['range_high'] - regime['range_low']
+            if span <= 0:
+                return
+            today_date = str(daily_df.index[-1]).split(' ')[0]
+            near_high = (regime['range_high'] - live_close) / span * 100.0 <= near_pct
+            near_low = (live_close - regime['range_low']) / span * 100.0 <= near_pct
+            if near_high and not regime['near_high'] and rt.get('pattern_intraday_high_date') != today_date:
+                rt['pattern_intraday_high_date'] = today_date
+                self.safe_after(0, self.log_message,
+                                f"【自動交易-盤勢】策略「{s.get('name')}」60分K盤中已接近{lookback}天區間高點"
+                                f" (現價{live_close:g},高點{regime['range_high']:g}),留意日K是否收在附近。")
+            if near_low and not regime['near_low'] and rt.get('pattern_intraday_low_date') != today_date:
+                rt['pattern_intraday_low_date'] = today_date
+                self.safe_after(0, self.log_message,
+                                f"【自動交易-盤勢】策略「{s.get('name')}」60分K盤中已接近{lookback}天區間低點"
+                                f" (現價{live_close:g},低點{regime['range_low']:g}),留意日K是否收在附近。")
+        except Exception:
+            pass
 
     def _qt_chukuangren_execute_pass(self):
         """【新ADR 確認/下單分兩個時間點】終極波段策略12:00確認成立後不會立刻
@@ -7644,7 +7746,7 @@ class StockTradingAppPro(tk.Tk):
         title_suffix = " (唯讀 - 策略執行中)" if readonly else ""
         dlg.title("終極波段策略" + ("" if is_new else f" — {s.get('name')}{title_suffix}"))
         dlg.configure(bg="#1A2026")
-        self.center_window(dlg, 660, 820)
+        self.center_window(dlg, 660, 920)
         dlg.transient(self)
         try:
             dlg.lift(); dlg.focus_force()
@@ -7786,6 +7888,60 @@ class StockTradingAppPro(tk.Tk):
         cb_dir.bind('<<ComboboxSelected>>', _refresh_dir)
         _refresh_dir()
 
+        # 【新ADR 盤勢型態提醒】獨立於進出場邏輯之外的提醒功能:抓看盤(A,加權
+        # 指數) 的日K,判斷盤勢 (區間整理/上升/下降) 跟常見技術型態,只通知
+        # 不下單。預設關閉,使用者要自己勾選啟用。
+        pattern_fr = tk.Frame(dlg, bg="#12181F"); pattern_fr.pack(fill=tk.X, padx=12, pady=(8, 4))
+        tk.Label(pattern_fr, text="📈 盤勢/型態提醒 (選用,只通知不下單;以日K為主,60分K為輔做盤中預告)",
+                 bg="#12181F", fg="#29B6F6", font=('微軟正黑體', 9, 'bold')).grid(
+                 row=0, column=0, columnspan=6, sticky='w', pady=(4, 2))
+        var_pattern = tk.BooleanVar(value=bool(s.get('pattern_enabled', False)))
+        tk.Checkbutton(pattern_fr, text="啟用", variable=var_pattern, bg="#12181F", fg="#29B6F6",
+                       selectcolor="#2A323D", activebackground="#12181F",
+                       font=('微軟正黑體', 9)).grid(row=1, column=0, sticky='w', padx=(4, 0))
+        tk.Label(pattern_fr, text="區間天數", bg="#12181F", fg="white", font=('微軟正黑體', 9)).grid(
+                 row=1, column=1, sticky='e', padx=(8, 0))
+        e_pat_lookback = tk.Entry(pattern_fr, width=6, bg="#2A323D", fg="white", justify="center")
+        e_pat_lookback.insert(0, str(s.get('pattern_lookback', market_pattern.DEFAULT_PARAMS['lookback'])))
+        e_pat_lookback.grid(row=1, column=2, padx=4)
+        tk.Label(pattern_fr, text="接近邊界%", bg="#12181F", fg="white", font=('微軟正黑體', 9)).grid(
+                 row=1, column=3, sticky='e', padx=(8, 0))
+        e_pat_near = tk.Entry(pattern_fr, width=6, bg="#2A323D", fg="white", justify="center")
+        e_pat_near.insert(0, str(s.get('pattern_near_pct', market_pattern.DEFAULT_PARAMS['near_pct'])))
+        e_pat_near.grid(row=1, column=4, padx=4)
+
+        def _show_pattern_catalog():
+            info = tk.Toplevel(dlg)
+            info.title("盤勢/型態判斷清單 (共{}種)".format(len(market_pattern.PATTERN_CATALOG)))
+            info.configure(bg="#1A2026")
+            self.center_window(info, 640, 480)
+            info.transient(dlg)
+            try:
+                info.lift(); info.focus_force()
+            except Exception:
+                pass
+            txt = tk.Text(info, bg="#12161A", fg="white", font=('微軟正黑體', 9), wrap='word', relief='flat')
+            txt.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            for item in market_pattern.PATTERN_CATALOG:
+                txt.insert(tk.END, f"【{item['category']}】{item['label']}\n{item['desc']}\n\n")
+            txt.config(state='disabled')
+            tk.Button(info, text="關閉", bg="#2A323D", fg="white", relief="flat",
+                      command=info.destroy).pack(pady=(0, 10))
+
+        tk.Button(pattern_fr, text="查看型態說明", bg="#5A6472", fg="white", relief="flat",
+                  font=('微軟正黑體', 8), command=_show_pattern_catalog).grid(row=1, column=5, padx=(10, 4))
+
+        pat_vars = {}
+        grid_fr = tk.Frame(pattern_fr, bg="#12181F")
+        grid_fr.grid(row=2, column=0, columnspan=6, sticky='w', pady=(4, 6))
+        enabled_now = set(s.get('pattern_list') or market_pattern.DEFAULT_PARAMS['enabled_patterns'])
+        for i, item in enumerate(market_pattern.PATTERN_CATALOG):
+            v = tk.BooleanVar(value=item['id'] in enabled_now)
+            pat_vars[item['id']] = v
+            tk.Checkbutton(grid_fr, text=item['label'], variable=v, bg="#12181F", fg="white",
+                           selectcolor="#2A323D", activebackground="#12181F",
+                           font=('微軟正黑體', 8)).grid(row=i // 3, column=i % 3, sticky='w', padx=6, pady=1)
+
         def _collect():
             s['kind'] = chukuangren_band.KIND
             s['name'] = e_name.get().strip() or chukuangren_band.STRATEGY_NAME
@@ -7811,6 +7967,16 @@ class StockTradingAppPro(tk.Tk):
                     s[f'ck_{k}'] = 0.0
             s['entry'] = s.get('entry') or []
             s['exit_signals'] = s.get('exit_signals') or []
+            s['pattern_enabled'] = bool(var_pattern.get())
+            try:
+                s['pattern_lookback'] = max(10, int(e_pat_lookback.get().strip()))
+            except (TypeError, ValueError):
+                s['pattern_lookback'] = market_pattern.DEFAULT_PARAMS['lookback']
+            try:
+                s['pattern_near_pct'] = max(0.1, float(e_pat_near.get().strip()))
+            except (TypeError, ValueError):
+                s['pattern_near_pct'] = market_pattern.DEFAULT_PARAMS['near_pct']
+            s['pattern_list'] = [pid for pid, v in pat_vars.items() if v.get()]
             return s
 
         lbl_status = tk.Label(dlg, text="", bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 9),

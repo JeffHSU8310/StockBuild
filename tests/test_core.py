@@ -41,6 +41,7 @@ from core import paper_account
 from core import taifex_daily
 from core import chukuangren_band
 from core import telegram_notify
+from core import market_pattern
 from data import config_store
 from data import taifex_store
 
@@ -3578,6 +3579,236 @@ class TestChukuangrenBand(unittest.TestCase):
         self.assertEqual(intents2[0]['kind'], 'CLOSE')
         strategy_engine.apply_fill({'buy_and_hold': False}, rt, intents2[0], now_ts=0)
         self.assertEqual(rt['state'], 'FLAT')
+
+
+class TestMarketPattern(unittest.TestCase):
+    """【新ADR 盤勢型態提醒】core/market_pattern.py 的離線測試:每個型態至少
+    一個「應該觸發」+ 一個「不應該觸發」的案例,確保規則跟文件描述一致。"""
+
+    def _mk_df(self, closes, highs=None, lows=None, opens=None, start='2026-01-01'):
+        n = len(closes)
+        idx = pd.date_range(start, periods=n, freq='D')
+        return pd.DataFrame({
+            'Open': opens or closes, 'High': highs or closes,
+            'Low': lows or closes, 'Close': closes,
+        }, index=idx)
+
+    def _zigzag(self, anchors, seg_len=4):
+        prices = [float(anchors[0])]
+        for a, b in zip(anchors, anchors[1:]):
+            for k in range(1, seg_len + 1):
+                prices.append(a + (b - a) * k / seg_len)
+        return prices
+
+    # ---------- classify_regime ----------
+
+    def test_classify_regime_range_bound(self):
+        closes = ([100, 110] * 30)[:60]
+        df = self._mk_df(closes)
+        r = market_pattern.classify_regime(df, lookback=60, near_pct=3.0)
+        self.assertIsNotNone(r)
+        self.assertEqual(r['regime'], '區間整理')
+
+    def test_classify_regime_uptrend(self):
+        closes = [100 + i for i in range(60)]
+        df = self._mk_df(closes)
+        r = market_pattern.classify_regime(df, lookback=60, near_pct=3.0)
+        self.assertEqual(r['regime'], '上升趨勢')
+
+    def test_classify_regime_downtrend(self):
+        closes = [160 - i for i in range(60)]
+        df = self._mk_df(closes)
+        r = market_pattern.classify_regime(df, lookback=60, near_pct=3.0)
+        self.assertEqual(r['regime'], '下降趨勢')
+
+    def test_classify_regime_near_high_and_low(self):
+        closes = [100] * 30 + [200] * 29 + [199]
+        df = self._mk_df(closes)
+        r = market_pattern.classify_regime(df, lookback=60, near_pct=3.0)
+        self.assertTrue(r['near_high'])
+        closes2 = [200] * 30 + [100] * 29 + [101]
+        df2 = self._mk_df(closes2)
+        r2 = market_pattern.classify_regime(df2, lookback=60, near_pct=3.0)
+        self.assertTrue(r2['near_low'])
+
+    # ---------- double_top / double_bottom ----------
+
+    def test_double_top_confirmed_on_neckline_break(self):
+        closes = [100, 105, 110, 105, 100, 95, 100, 105, 110, 105, 100, 95, 90]
+        df = self._mk_df(closes)
+        r = market_pattern.detect_double_top(df, swing_window=2, tolerance_pct=3.0, lookback=60)
+        self.assertIsNotNone(r)
+        self.assertEqual(r['pattern'], 'double_top')
+        self.assertEqual(r['neckline'], 95.0)
+
+    def test_double_top_not_yet_broken(self):
+        closes = [100, 105, 110, 105, 100, 95, 100, 105, 110, 105, 100, 95]
+        df = self._mk_df(closes)
+        r = market_pattern.detect_double_top(df, swing_window=2, tolerance_pct=3.0, lookback=60)
+        self.assertIsNone(r)
+
+    def test_double_bottom_confirmed_on_neckline_break(self):
+        closes = [100, 95, 90, 95, 100, 105, 100, 95, 90, 95, 100, 105, 110]
+        df = self._mk_df(closes)
+        r = market_pattern.detect_double_bottom(df, swing_window=2, tolerance_pct=3.0, lookback=60)
+        self.assertIsNotNone(r)
+        self.assertEqual(r['pattern'], 'double_bottom')
+        self.assertEqual(r['neckline'], 105.0)
+
+    # ---------- head_shoulders_top / bottom ----------
+
+    def test_head_shoulders_top_confirmed(self):
+        closes = [100, 105, 110, 105, 100, 95, 100, 105, 130, 105, 100, 95, 100, 105, 110, 105, 100, 95, 90]
+        df = self._mk_df(closes)
+        r = market_pattern.detect_head_shoulders_top(df, swing_window=2, tolerance_pct=5.0,
+                                                       head_margin_pct=1.0, lookback=90)
+        self.assertIsNotNone(r)
+        self.assertEqual(r['pattern'], 'head_shoulders_top')
+        self.assertEqual(r['head'], 130.0)
+
+    def test_head_shoulders_top_no_signal_on_plain_uptrend(self):
+        closes = [100 + i for i in range(30)]
+        df = self._mk_df(closes)
+        r = market_pattern.detect_head_shoulders_top(df, swing_window=2, tolerance_pct=5.0,
+                                                       head_margin_pct=1.0, lookback=90)
+        self.assertIsNone(r)
+
+    def test_head_shoulders_bottom_confirmed(self):
+        closes = [200 - c + 100 for c in
+                  [100, 105, 110, 105, 100, 95, 100, 105, 130, 105, 100, 95, 100, 105, 110, 105, 100, 95, 90]]
+        df = self._mk_df(closes)
+        r = market_pattern.detect_head_shoulders_bottom(df, swing_window=2, tolerance_pct=5.0,
+                                                          head_margin_pct=1.0, lookback=90)
+        self.assertIsNotNone(r)
+        self.assertEqual(r['pattern'], 'head_shoulders_bottom')
+
+    # ---------- undercut_reverse / false_breakout ----------
+
+    def test_undercut_reverse_confirmed(self):
+        closes = [100] * 25 + [98, 96, 94, 96, 101]
+        df = self._mk_df(closes)
+        r = market_pattern.detect_undercut_reverse(df, lookback=60, recover_bars=5)
+        self.assertIsNotNone(r)
+        self.assertEqual(r['pattern'], 'undercut_reverse')
+        self.assertEqual(r['support'], 100.0)
+
+    def test_undercut_reverse_no_breach_no_signal(self):
+        closes = [100] * 25 + [101, 102, 101, 102, 103]
+        df = self._mk_df(closes)
+        r = market_pattern.detect_undercut_reverse(df, lookback=60, recover_bars=5)
+        self.assertIsNone(r)
+
+    def test_false_breakout_confirmed(self):
+        closes = [100] * 25 + [102, 103, 104, 102, 99]
+        df = self._mk_df(closes)
+        r = market_pattern.detect_false_breakout(df, lookback=60, recover_bars=5)
+        self.assertIsNotNone(r)
+        self.assertEqual(r['pattern'], 'false_breakout')
+        self.assertEqual(r['resistance'], 100.0)
+
+    # ---------- island_reversal ----------
+
+    def test_island_reversal_down_confirmed(self):
+        highs = [98, 100, 102, 115, 116, 117, 118, 105]
+        lows = [93, 95, 97, 110, 111, 112, 113, 100]
+        closes = [(h + l) / 2 for h, l in zip(highs, lows)]
+        df = self._mk_df(closes, highs=highs, lows=lows)
+        r = market_pattern.detect_island_reversal(df, lookback=30, gap_pct=0.5, max_island_bars=5)
+        self.assertIsNotNone(r)
+        self.assertEqual(r['pattern'], 'island_reversal_down')
+
+    def test_island_reversal_none_on_continuous_move(self):
+        highs = [100 + i for i in range(10)]
+        lows = [95 + i for i in range(10)]
+        closes = [(h + l) / 2 for h, l in zip(highs, lows)]
+        df = self._mk_df(closes, highs=highs, lows=lows)
+        r = market_pattern.detect_island_reversal(df, lookback=30, gap_pct=0.5, max_island_bars=5)
+        self.assertIsNone(r)
+
+    # ---------- range_breakout / range_breakdown ----------
+
+    def test_range_breakout_confirmed(self):
+        closes = [100] * 11 + [105]
+        df = self._mk_df(closes)
+        r = market_pattern.detect_range_breakout(df, lookback=10)
+        self.assertIsNotNone(r)
+        self.assertEqual(r['range_high'], 100.0)
+
+    def test_range_breakout_not_first_day_no_repeat(self):
+        closes = [100] * 10 + [105, 106]
+        df = self._mk_df(closes)
+        r = market_pattern.detect_range_breakout(df, lookback=10)
+        self.assertIsNone(r)  # 105已經是第一天突破,106這天不是「第一次」
+
+    def test_range_breakdown_confirmed(self):
+        closes = [100] * 11 + [95]
+        df = self._mk_df(closes)
+        r = market_pattern.detect_range_breakdown(df, lookback=10)
+        self.assertIsNotNone(r)
+        self.assertEqual(r['range_low'], 100.0)
+
+    # ---------- N字形 ----------
+
+    def test_n_pattern_up_confirmed(self):
+        closes = [100, 95, 90, 95, 100, 105, 110, 105, 100, 96, 92, 97, 102, 107, 112]
+        df = self._mk_df(closes)
+        r = market_pattern.detect_n_pattern_up(df, swing_window=2, lookback=90)
+        self.assertIsNotNone(r)
+        self.assertEqual(r['pattern'], 'n_up')
+        self.assertEqual(r['high_a'], 110.0)
+
+    def test_n_pattern_down_confirmed(self):
+        base = [100, 95, 90, 95, 100, 105, 110, 105, 100, 96, 92, 97, 102, 107, 112]
+        closes = [200 - c for c in base]
+        df = self._mk_df(closes)
+        r = market_pattern.detect_n_pattern_down(df, swing_window=2, lookback=90)
+        self.assertIsNotNone(r)
+        self.assertEqual(r['pattern'], 'n_down')
+
+    def test_n_pattern_up_none_when_lower_low(self):
+        closes = [100, 95, 90, 95, 100, 105, 110, 105, 100, 92, 88, 93, 98, 103, 108]
+        df = self._mk_df(closes)
+        r = market_pattern.detect_n_pattern_up(df, swing_window=2, lookback=90)
+        self.assertIsNone(r)  # low2(88) < low1(90),沒有墊高,不是N字
+
+    # ---------- triangle / wedge ----------
+
+    def test_triangle_symmetrical(self):
+        anchors = [115, 130, 100, 122, 108, 115, 112, 113]
+        closes = self._zigzag(anchors, seg_len=4)
+        df = self._mk_df(closes)
+        r = market_pattern.detect_triangle_wedge(df, swing_window=2, lookback=len(closes), flat_pct=0.05)
+        self.assertIsNotNone(r)
+        self.assertEqual(r['pattern'], 'triangle_symmetrical')
+
+    def test_triangle_none_on_plain_uptrend(self):
+        closes = [100 + i for i in range(30)]
+        df = self._mk_df(closes)
+        r = market_pattern.detect_triangle_wedge(df, swing_window=2, lookback=30, flat_pct=0.05)
+        self.assertIsNone(r)  # 單純上升,沒有波段低點可以組出三角形
+
+    # ---------- evaluate_all ----------
+
+    def test_evaluate_all_returns_list_and_respects_enabled_patterns(self):
+        closes = [100] * 25 + [98, 96, 94, 96, 101]
+        df = self._mk_df(closes)
+        signals = market_pattern.evaluate_all(df, {'enabled_patterns': ['undercut_reverse']})
+        self.assertEqual(len(signals), 1)
+        self.assertEqual(signals[0]['pattern'], 'undercut_reverse')
+        signals_none = market_pattern.evaluate_all(df, {'enabled_patterns': ['double_top']})
+        self.assertEqual(signals_none, [])
+
+    def test_evaluate_all_handles_insufficient_data(self):
+        df = self._mk_df([100, 101, 102])
+        self.assertEqual(market_pattern.evaluate_all(df), [])
+
+    def test_pattern_catalog_structure(self):
+        self.assertGreaterEqual(len(market_pattern.PATTERN_CATALOG), 10)
+        for entry in market_pattern.PATTERN_CATALOG:
+            self.assertIn('id', entry)
+            self.assertIn('label', entry)
+            self.assertIn('category', entry)
+            self.assertIn('desc', entry)
 
 
 if __name__ == "__main__":
