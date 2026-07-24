@@ -11146,7 +11146,15 @@ class StockTradingAppPro(tk.Tk):
         messagebox.showwarning("無法刪改", msg)
 
     def _report_order_mod_error(self, e):
-        self.log_message(f"【刪改失敗】{type(e).__name__}: {e}")
+        # 【找到的bug/修正】原本只寫進系統日誌,使用者若沒切去那個分頁就看不到
+        # 失敗原因,只會覺得「按了沒反應」。改成一定跳出訊息框,錯誤訊息才不會
+        # 被漏看——這是實盤刪改委託失敗,使用者需要明確知道有沒有真的送成功。
+        msg = f"{type(e).__name__}: {e}"
+        self.log_message(f"【刪改失敗】{msg}")
+        try:
+            messagebox.showerror("刪改失敗", f"送出刪改時發生錯誤,請確認委託實際狀態:\n\n{msg}")
+        except Exception:
+            pass
         if self._looks_like_session_dead(e):
             self._mark_session_dead()
 
