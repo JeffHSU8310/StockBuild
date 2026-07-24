@@ -11126,6 +11126,7 @@ class StockTradingAppPro(tk.Tk):
             if kind == 'cancel':
                 self.safe_after(0, self.log_message, f"【刪改送出】刪單 → cancel_order(trade)  書號:{o.get('id')}")
                 self.sj_api.cancel_order(trade)
+                self.safe_after(0, self._apply_order_mod_success, o.get('id'), kind, None)
             elif kind == 'qty':
                 cur = self._safe_int(o.get('quantity'))
                 new_total = int(new_value)
@@ -11133,13 +11134,37 @@ class StockTradingAppPro(tk.Tk):
                 self.safe_after(0, self.log_message, f"【刪改送出】改量 意圖 {cur}→{new_total} (減 {reduce_qty})"
                                 f" → update_order(trade, qty={reduce_qty})  書號:{o.get('id')}")
                 self.sj_api.update_order(trade, qty=reduce_qty)
+                self.safe_after(0, self._apply_order_mod_success, o.get('id'), kind, new_total)
             elif kind == 'price':
                 new_price = float(new_value)
                 self.safe_after(0, self.log_message, f"【刪改送出】改價 → update_order(trade, price={new_price})  書號:{o.get('id')}")
                 self.sj_api.update_order(trade, price=new_price)
-            self.safe_after(0, self.log_message, "【刪改】已送出,請等待委託回報確認 (清單狀態會自動更新)。")
+                self.safe_after(0, self._apply_order_mod_success, o.get('id'), kind, new_price)
+            self.safe_after(0, self.log_message, "【刪改】券商已受理,請等待委託回報確認最終狀態。")
         except Exception as e:
             self.safe_after(0, self._report_order_mod_error, e)
+
+    def _apply_order_mod_success(self, order_id, kind, new_value):
+        """【找到的bug/修正】cancel_order()/update_order() 呼叫本身沒有丟例外,
+        代表券商已經受理這個刪改請求,但清單上的正式狀態文字完全依賴後續的
+        on_order_deal_callback 推播才會更新——使用者實測回報:在非交易時段
+        送出的「預約單」,這個推播沒有確實送達,清單狀態停在原本的
+        PendingSubmit 不動,讓人誤以為刪改沒有生效而重複送出,結果收到
+        券商回的「已取消的預約單」(其實是在告知『上一次已經成功了』,
+        不是真的失敗)。這裡比照 ADR-023 對「新委託」已經採用的做法
+        (送出成功先樂觀更新清單,不用等推播才顯示):呼叫沒丟例外就先把
+        本地狀態文字更新成對應的『已送出』字樣,之後如果真的等到委託回報,
+        _handle_order_event 還是會再覆蓋成更精確的狀態,兩邊不衝突。"""
+        entry = self.my_orders.get(order_id)
+        if not entry:
+            return
+        if kind == 'cancel':
+            entry['status_display'] = '已送出取消(等券商確認)'
+        elif kind == 'qty':
+            entry['status_display'] = f'已送出改量至{new_value}(等券商確認)'
+        elif kind == 'price':
+            entry['status_display'] = f'已送出改價至{new_value:g}(等券商確認)'
+        self._refresh_my_orders_ui()
 
     def _report_order_mod_not_found(self, msg):
         self.log_message(f"【刪改】{msg}")
@@ -11149,10 +11174,22 @@ class StockTradingAppPro(tk.Tk):
         # 【找到的bug/修正】原本只寫進系統日誌,使用者若沒切去那個分頁就看不到
         # 失敗原因,只會覺得「按了沒反應」。改成一定跳出訊息框,錯誤訊息才不會
         # 被漏看——這是實盤刪改委託失敗,使用者需要明確知道有沒有真的送成功。
+        # 【找到的bug/修正2】使用者實測發現:如果上一次刪改其實已經成功,
+        # 但清單狀態沒更新 (見 _apply_order_mod_success 的說明) 而重複送出,
+        # 券商會回「已取消的預約單」這類「其實是成功、不是失敗」的錯誤——
+        # 這裡偵測訊息裡有沒有「已取消」/「已收單」/「已完成」這類字樣,
+        # 用比較不嚇人的措辭提示使用者,而不是統一都顯示成刺眼的「刪改失敗」。
         msg = f"{type(e).__name__}: {e}"
         self.log_message(f"【刪改失敗】{msg}")
         try:
-            messagebox.showerror("刪改失敗", f"送出刪改時發生錯誤,請確認委託實際狀態:\n\n{msg}")
+            if any(kw in str(e) for kw in ("已取消", "已完成", "已收單")):
+                messagebox.showwarning(
+                    "委託可能已處理過",
+                    f"券商回覆這筆委託「已經處理過」,很可能是上一次刪改其實已經成功,\n"
+                    f"畫面狀態還沒更新才會看起來像沒生效。請重新整理/確認委託實際狀態,\n"
+                    f"不需要再重複送出。\n\n券商原始訊息:\n{msg}")
+            else:
+                messagebox.showerror("刪改失敗", f"送出刪改時發生錯誤,請確認委託實際狀態:\n\n{msg}")
         except Exception:
             pass
         if self._looks_like_session_dead(e):
