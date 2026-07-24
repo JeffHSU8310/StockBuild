@@ -2224,6 +2224,24 @@ class StockTradingAppPro(tk.Tk):
                 return ui
         return uis[0]
 
+    def _qt_dialog_parent(self):
+        """【修正】量化交易面板 (_build_quant_panel) 同時可能嵌在主視窗底部
+        分頁、也可能嵌在獨立視窗 (open_quant_window),同一段程式碼兩邊共用。
+        從這段共用程式碼跳出的 messagebox 若寫死 parent=self (主視窗根),
+        使用者實際在看的卻是獨立視窗時,訊息框會以主視窗為中心產生、可能被
+        獨立視窗擋在後面而『看不見』——但 messagebox 是整個應用程式共用的
+        modal grab,看不見不代表沒有跳出來,使用者會覺得所有視窗 (含獨立
+        量化視窗的關閉鈕) 通通沒反應,像是卡死關不掉,其實只是有一個藏在
+        後面的訊息框在等你按確定。回傳目前真正該當 parent 的視窗:獨立
+        視窗還開著就用它,否則用主視窗。"""
+        win = getattr(self, '_quant_win', None)
+        try:
+            if win is not None and win.winfo_exists():
+                return win
+        except Exception:
+            pass
+        return self
+
     def open_quant_window(self):
         """【ADR-057】開啟量化交易獨立視窗 (完整畫面)。
 
@@ -7502,7 +7520,7 @@ class StockTradingAppPro(tk.Tk):
                                 "策略已加入「量化交易」分頁清單。下一步:\n"
                                 "1. 在清單選取它 → 按「🔬 回測」看歷史績效\n"
                                 "2. 按「▶ 啟用」→ 按「🟢 啟動自動交易」開始跑模擬\n"
-                                "3. 模擬訊號觀察沒問題後,再考慮改「實單」。", parent=self)
+                                "3. 模擬訊號觀察沒問題後,再考慮改「實單」。", parent=dlg)
             dlg.destroy()
 
         _clook()
@@ -8094,7 +8112,7 @@ class StockTradingAppPro(tk.Tk):
                         self.strategies[i] = strat; break
             self._qt_save(); self._qt_save_state(); self._qt_refresh_tree()
             self.log_message(f"【終極波段策略】「{strat['name']}」已儲存 ({strat['mode']}),已加入「量化交易」分頁清單。")
-            messagebox.showinfo("儲存成功", f"策略「{strat['name']}」已儲存 ({strat['mode']} 模式)。", parent=self)
+            messagebox.showinfo("儲存成功", f"策略「{strat['name']}」已儲存 ({strat['mode']} 模式)。", parent=dlg)
             dlg.destroy()
 
         _clook()
@@ -8827,12 +8845,14 @@ class StockTradingAppPro(tk.Tk):
         s = self._qt_selected()
         if not s:
             self.log_message("【最佳化】請先在清單中選取策略。")
-            messagebox.showinfo("請先選取策略", "請先在「量化交易」清單中點選一個策略,再按「🎯 參數最佳化」。", parent=self)
+            messagebox.showinfo("請先選取策略", "請先在「量化交易」清單中點選一個策略,再按「🎯 參數最佳化」。",
+                                parent=self._qt_dialog_parent())
             return
         if s.get('kind') != 'custom':
             messagebox.showinfo("僅支援自訂策略",
                                 "參數最佳化目前只支援「自訂 Python 策略」——\n"
-                                "因為要掃描的參數是程式碼裡用 ctx.param('名稱', 預設值) 讀取的那些。", parent=self)
+                                "因為要掃描的參數是程式碼裡用 ctx.param('名稱', 預設值) 讀取的那些。",
+                                parent=self._qt_dialog_parent())
             return
         if not (self.api_logged_in and HAS_SJ and self.sj_api):
             self.log_message("【最佳化】需要先登入券商 API 以取得歷史K線資料。")
@@ -9241,7 +9261,7 @@ class StockTradingAppPro(tk.Tk):
         不一樣,比較就沒有意義 —— 所以這裡強制所有策略共用同一組設定。
         """
         if not self.strategies:
-            messagebox.showinfo("策略比較", "目前沒有任何策略可比較。", parent=self)
+            messagebox.showinfo("策略比較", "目前沒有任何策略可比較。", parent=self._qt_dialog_parent())
             return
         if getattr(self, '_backtest_running', False):
             self._qt_offer_abort_backtest("比較")
@@ -9505,7 +9525,7 @@ class StockTradingAppPro(tk.Tk):
             "要強制終止它嗎?\n\n"
             "• 按「是」:送出取消訊號並解除鎖定,你可以立刻重新開始。\n"
             "  (若舊工作正卡在券商下載 API 上,它會在該次下載結束後才真正停止)\n"
-            "• 按「否」:繼續等待目前這個完成。", parent=self)
+            "• 按「否」:繼續等待目前這個完成。", parent=self._qt_dialog_parent())
         if not ans:
             return
         self._backtest_cancel = True
