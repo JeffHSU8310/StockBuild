@@ -6020,9 +6020,18 @@ class StockTradingAppPro(tk.Tk):
                     dir_disp = '程式決定'
                 else:
                     dir_disp = s.get('direction', '')
+                # 【修正】終極波段策略的訊號一律看日K收盤 (core/chukuangren_band.py
+                # 內部寫死,不受 s['timeframe'] 影響——那個欄位對這個策略種類其實
+                # 沒有作用,只是沿用 new_strategy() 的預設值殘留)。清單週期欄位
+                # 顯示殘留的「5分K」會讓人誤以為策略是照5分K在判斷,容易誤解;
+                # 固定顯示「日K」才符合實際行為。
+                if s.get('kind') == chukuangren_band.KIND:
+                    tf_disp = '日K'
+                else:
+                    tf_disp = s.get('timeframe', '')
                 # 【新ADR 多帳戶】只有模擬模式才有意義 (實單直接下到真實券商帳戶)
                 acct_disp = self._qt_paper_acct_for(s, warn=False).get('name', '') if s.get('mode') != '實單' else '--'
-                prepared.append((s['id'], (s.get('name',''), sym_disp, sym_name, s.get('timeframe',''),
+                prepared.append((s['id'], (s.get('name',''), sym_disp, sym_name, tf_disp,
                                             dir_disp, conds, s.get('mode','模擬'), acct_disp, status, running_disp,
                                             rt.get('trades_today', 0), pos, unreal_pnl_str), tag))
             # 【ADR-057】更新「所有」存活的量化面板 (分頁 + 獨立視窗),
@@ -6121,7 +6130,10 @@ class StockTradingAppPro(tk.Tk):
                 dir_disp = '程式決定'
             else:
                 dir_disp = s.get('direction')
-            box.insert(tk.END, f"[{s.get('mode')}] {s.get('name')} — {s.get('symbol')} {s.get('timeframe')} {dir_disp} x{s.get('qty')}")
+            # 【修正】跟策略清單一致:終極波段策略固定顯示「日K」,不要顯示
+            # 對它其實沒有作用的 s['timeframe'] 殘留值 (見 _qt_refresh_tree 註解)。
+            tf_disp = '日K' if s.get('kind') == chukuangren_band.KIND else s.get('timeframe')
+            box.insert(tk.END, f"[{s.get('mode')}] {s.get('name')} — {s.get('symbol')} {tf_disp} {dir_disp} x{s.get('qty')}")
         if live:
             tk.Label(dlg, text=f"⚠ 注意:有 {len(live)} 個「實單」策略,啟動後將自動送出真實委託,無人工確認!",
                      bg="#1A2026", fg="#FF1744", font=('微軟正黑體', 10, 'bold')).pack(anchor='w', padx=14, pady=(8, 0))
