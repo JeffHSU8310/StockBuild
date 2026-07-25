@@ -278,7 +278,7 @@ def _perf_cache_progressive_and_seq_guard():
         def get(s,k): return s.m.get(k)
     class FApi:
         def __init__(s):
-            s.quote=FQ(); s.calls=[]
+            s.quote=FQ(); s.calls=[]; s.call_src=[]
             class C: pass
             s.Contracts=C(); s.Contracts.Stocks=FS()
             class F: pass
@@ -287,7 +287,16 @@ def _perf_cache_progressive_and_seq_guard():
             class TSE: TSE001=FC('001',symbol='TSE001')
             s.Contracts.Indexs=IT(); s.Contracts.Indexs.TSE=TSE
         def kbars(s,c,start=None,end=None):
-            s.calls.append((getattr(c,'code','?'),start)); return make_kbars(start,end)
+            # 【ADR-100】記錄呼叫來源:背景 daemon thread (主圖自動更新/報價
+            # worker) 也會呼叫 kbars,把它們算進「下載次數」會讓斷言隨執行緒
+            # 時序時而 PASS 時而 FAIL。chart_calls() 只數手動查詢路徑。
+            import traceback as _tb
+            s.calls.append((getattr(c,'code','?'),start))
+            s.call_src.append(''.join(_tb.format_stack()))
+            return make_kbars(start,end)
+        def chart_calls(s):
+            """只數 fetch_data_worker (手動查詢) 觸發的下載。"""
+            return [c for c,t in zip(s.calls,s.call_src) if 'fetch_data_worker' in t]
     api=FApi(); app.sj_api=api; app.api_logged_in=True
     app._kbars_raw_cache.clear(); app.current_contract=None; app._last_fetch_raw_sym=None
     draws={'n':0}; orig=app.draw_chart
@@ -299,19 +308,20 @@ def _perf_cache_progressive_and_seq_guard():
         # 預期;分段補全是刻意的優化 (P-36:kbars 只回分K,長週期一次抓太多天會慢
         # 到不行),所以這裡改驗「有下載且每段起點不重複」,而不是寫死次數。
         app._fetch_seq=1; app.fetch_data_worker('0050','日K',1); app.flush_after()
-        assert len(api.calls)>=1, f"首載應至少下載1次,實際{len(api.calls)}"
-        starts=[c[1] for c in api.calls]
+        assert len(api.chart_calls())>=1, f"首載應至少下載1次,實際{len(api.chart_calls())}"
+        starts=[c[1] for c in api.chart_calls()]
         assert len(starts)==len(set(starts)), f"分段下載不應重複抓同一起點: {starts}"
-        n_first=len(api.calls)
+        n_first=len(api.chart_calls())
         subs=api.quote.chart_subs()
         app._fetch_seq=2; app.fetch_data_worker('0050','5分K',2); app.flush_after()
-        assert len(api.calls)==n_first, "快取涵蓋時不應重新下載"
+        assert len(api.chart_calls())==n_first, \
+            f"快取涵蓋時不應重新下載 (手動查詢路徑 {n_first}→{len(api.chart_calls())})"
         assert api.quote.chart_subs()==subs and api.quote.unsub==0, \
             f"同商品換週期不應重訂閱/退訂 (主圖訂閱 {subs}→{api.quote.chart_subs()}, 退訂 {api.quote.unsub})"
         # TXF 日K 首載 → 兩段式 (2次下載,2次出圖)
-        k0=len(api.calls); d0=draws['n']
+        k0=len(api.chart_calls()); d0=draws['n']
         app._fetch_seq=3; app.fetch_data_worker('TXF','日K',3); app.flush_after()
-        assert len(api.calls)-k0==2, f"期貨首載應兩段式下載2次,實際{len(api.calls)-k0}"
+        assert len(api.chart_calls())-k0==2, f"期貨首載應兩段式下載2次,實際{len(api.chart_calls())-k0}"
         assert draws['n']-d0==2, f"應出圖2次(搶先+補全),實際{draws['n']-d0}"
         # 過期序號不可蓋圖
         d0=draws['n']; app._fetch_seq=99
@@ -510,6 +520,7 @@ def _market_selector_and_watchlist_quotes():
         def kbars(s,c,start=None,end=None): return _mk(start,end)
         def snapshots(s,cs):
             s.snap_calls.append(len(cs))
+
             return [Snap(106.65,0.90,0.85) if getattr(c,'code','')=='0050' else Snap(23150.0,120.0,0.52) for c in cs]
     api=FApi(); app.sj_api=api; app.api_logged_in=True
     app._kbars_raw_cache.clear(); app._wl_contract_cache.clear(); app.current_contract=None
@@ -529,8 +540,13 @@ def _market_selector_and_watchlist_quotes():
     # 自選股報價:批次 snapshot、值與顏色正確、更新不重建
     app.watchlists={'T':['0050','TXF']}; app.current_wl_name.set('T')
     app.on_wl_change(); app.flush_after()
+    # 【ADR-100】只檢查「這次呼叫」新增的批次,不看 snap_calls[-1]。
+    # fetch_realtime_worker 是背景 daemon thread,會不定時自己 snapshots(1檔),
+    # 用「最後一筆」斷言會隨執行緒時序時而 PASS 時而 FAIL (實測 [1,2,1])。
+    _n0 = len(api.snap_calls)
     app._wl_fetch_quotes_once(); app.flush_after()
-    assert api.snap_calls and api.snap_calls[-1]==2, "應一次批次抓 2 檔"
+    _mine = api.snap_calls[_n0:]
+    assert 2 in _mine, f"應一次批次抓 2 檔,本次呼叫實際批次: {_mine}"
     rows={i: app.tree_wl.item(i,'values') for i in app.tree_wl.get_children()}
     # 【第九輪】自選股加「名稱」欄 (index 1),報價位移到 [2:]
     assert rows['0050'][2:]==('106.65','+0.90','+0.85%'), f"0050 顯示錯誤: {rows['0050']}"
@@ -1767,6 +1783,72 @@ def _quant_tree_running_column():
         app.strategies, app.strategy_runtimes, app._qt_running = old_strats, old_rts, old_running
 
 run_case("運轉狀態欄: 需同時看總開關與策略啟用旗標", _quant_tree_running_column)
+
+
+def _chips_tab_and_views():
+    """【ADR-100】籌碼分頁:四種檢視都能在無資料/有資料下正常填表,
+    切分頁不觸發任何網路下載,買超紅/賣超綠 (鐵則1)。"""
+    import tempfile as _tf
+    from data import chips_store as _chipstore
+    import pandas as _pd
+
+    # 切到籌碼分頁不可觸發任何 HTTP (下載只能由使用者按鈕發動)
+    net_calls = []
+    orig_json, orig_taifex = app._chips_http_json, app._chips_http_taifex
+    app._chips_http_json = lambda *a, **k: net_calls.append('json')
+    app._chips_http_taifex = lambda *a, **k: net_calls.append('taifex')
+    old_base = app.CHIPS_BASE_DIR
+    tmp = _tf.mkdtemp()
+    try:
+        app.CHIPS_BASE_DIR = tmp
+        app.set_bottom_tab("chips")
+        assert not net_calls, f"切到籌碼分頁不應發出網路請求,實際: {net_calls}"
+        # 無資料時四種檢視都要能顯示提示而不是拋例外
+        for key, _label in app.CHIPS_VIEWS:
+            app._chips_view.set(key)
+            app._chips_refresh_view()
+            assert '請按' in app.lbl_chips_status.cget('text') or \
+                   app.lbl_chips_status.cget('text') != '', f"{key} 無資料時應顯示提示"
+
+        # 寫入兩檔個股籌碼:一檔買超、一檔賣超
+        day = _pd.DataFrame([
+            {'Date': '2026-07-24', 'Code': '2330', 'Name': '台積電',
+             'Foreign': 1000, 'Trust': 200, 'Dealer': 300, 'InstTotal': 1500},
+            {'Date': '2026-07-24', 'Code': '2317', 'Name': '鴻海',
+             'Foreign': -800, 'Trust': -100, 'Dealer': -100, 'InstTotal': -1000},
+        ])
+        _chipstore.upsert(_chipstore.stock_inst_path(tmp, '2026-07-24'), day)
+        app._chips_view.set('stock')
+        app.entry_chips_code.delete(0, 'end')
+        app._chips_refresh_view()
+        rows = app.tree_chips.get_children()
+        assert len(rows) == 2, f"個股檢視應顯示 2 列,實際 {len(rows)}"
+        # 【鐵則1】買超紅、賣超綠
+        tags = {app.tree_chips.item(r, 'values')[1]: app.tree_chips.item(r, 'tags') for r in rows}
+        assert 'buy' in tuple(tags['2330']), f"買超應標紅 (buy),實際 {tags['2330']}"
+        assert 'sell' in tuple(tags['2317']), f"賣超應標綠 (sell),實際 {tags['2317']}"
+
+        # 代號查詢只回該檔
+        app.entry_chips_code.delete(0, 'end'); app.entry_chips_code.insert(0, '2330')
+        app._chips_refresh_view()
+        rows = app.tree_chips.get_children()
+        assert len(rows) == 1 and app.tree_chips.item(rows[0], 'values')[1] == '2330', "代號查詢應只回該檔"
+
+        # 已抓過的日期不可重複下載 (「日後不用重複抓取」的核心保證)
+        from datetime import datetime as _dt
+        missing = app._chips_missing_days(_dt(2026, 7, 24), _dt(2026, 7, 24))
+        assert missing == [], f"已存在的日期不應再列入待抓,實際 {missing}"
+        missing2 = app._chips_missing_days(_dt(2026, 7, 20), _dt(2026, 7, 24))
+        assert _dt(2026, 7, 24) not in missing2, "已抓過的 7/24 不該再出現"
+        assert all(d.weekday() < 5 for d in missing2), "週末不應列入待抓"
+        assert not net_calls, "整個流程都不該發出網路請求"
+    finally:
+        app._chips_http_json, app._chips_http_taifex = orig_json, orig_taifex
+        app.CHIPS_BASE_DIR = old_base
+        app.set_bottom_tab("log")
+
+
+run_case("ADR-100: 籌碼分頁四檢視/紅漲綠跌/切頁不下載/不重複抓取", _chips_tab_and_views)
 
 print(f"{'案例':60s} 結果")
 print("-" * 76)

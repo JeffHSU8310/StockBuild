@@ -44,8 +44,11 @@ from core import secure_store
 from core import chukuangren_band
 from core import telegram_notify
 from core import market_pattern
+# 【ADR-100】籌碼資料:解析純邏輯在 core/,本地 CSV 存取在 data/。
+from core import chips_parser
 from data import config_store
 from data import taifex_store
+from data import chips_store
 # 【ADR-097 階段0】券商連線生命週期抽到 brokers/ 套件,詳見 DECISIONS_ADR097.md。
 from brokers.sinopac import SinopacBroker
 
@@ -1295,7 +1298,7 @@ class StockTradingAppPro(tk.Tk):
         bottom_tab_bar = tk.Frame(log_outer, bg="#1A2026")
         bottom_tab_bar.pack(fill=tk.X, side=tk.TOP)
         self.bottom_tab_buttons = {}
-        for key, label in [("log", "系統日誌與回報"), ("orders", "我的委託單"), ("fills", "我的已成交"), ("positions", "我的庫存"), ("quant", "量化交易")]:
+        for key, label in [("log", "系統日誌與回報"), ("orders", "我的委託單"), ("fills", "我的已成交"), ("positions", "我的庫存"), ("quant", "量化交易"), ("chips", "籌碼")]:
             btn = tk.Button(bottom_tab_bar, text=label, font=('微軟正黑體', 9, 'bold'), relief="flat",
                              command=lambda k=key: self.set_bottom_tab(k))
             btn.pack(side=tk.LEFT, padx=(2, 0), pady=1)
@@ -1397,6 +1400,10 @@ class StockTradingAppPro(tk.Tk):
         self._qt_uis = []   # 所有存活中的量化面板 (分頁一份、獨立視窗一份)
         self._quant_win = None
         self._build_quant_panel(self.quant_tab_frame, tree_height=4, compact=True)
+
+        # --- 分頁6:籌碼 (ADR-100) ---
+        self.chips_tab_frame = tk.Frame(self.bottom_content_frame, bg="#1A2026")
+        self._build_chips_panel(self.chips_tab_frame)
 
         self.bottom_tab = "log"
         self.set_bottom_tab("log")
@@ -3773,6 +3780,409 @@ class StockTradingAppPro(tk.Tk):
                 span = f"{merged.index[0]:%Y-%m-%d} ~ {merged.index[-1]:%Y-%m-%d}"
         self._taifex_extend_noted.discard(tx_id)
         return n_new, span
+
+    # ======================================================================
+    # 【ADR-100】籌碼資料:下載 / 儲存 / 顯示
+    #
+    # 資料源全部是官方一手來源 (證交所/櫃買/期交所),不經第三方彙整——這是
+    # ADR-011 移除 FinMind 時留下的條件 (「要恢復籌碼需先找到新資料源並另開
+    # ADR」)。解析在 core/chips_parser.py、存檔在 data/chips_store.py,
+    # 這裡只負責「HTTP 下載 + 背景執行緒 + 排回 UI」,分工同 ADR-049。
+    #
+    # 【與 shioaji 的關係】完全無關:籌碼與行情是兩條獨立路徑,不動 shioaji
+    # 任何呼叫,鐵則 12「台股行情一律 shioaji」不受影響。
+    # ======================================================================
+    CHIPS_BASE_DIR = APP_DIR        # 與 broker_config.json 同層,存 chips/ 子目錄
+    CHIPS_TWSE_MARKET_URL = 'https://www.twse.com.tw/rwd/zh/fund/BFI82U'
+    CHIPS_TWSE_STOCK_URL = 'https://www.twse.com.tw/rwd/zh/fund/T86'
+    CHIPS_TWSE_MARGIN_URL = 'https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN'
+    CHIPS_TPEX_STOCK_URL = 'https://www.tpex.org.tw/www/zh-tw/insti/dailyTrade'
+    CHIPS_TAIFEX_URL = 'https://www.taifex.com.tw/cht/3/futContractsDateDown'
+    # 禮貌節流:證交所/櫃買只能單日查詢,抓一年 = 每個來源約 240 次請求。
+    # 間隔太短有被官方端擋掉的風險 (且對公共服務不禮貌);1 秒是保守值。
+    # 這與鐵則 5 (shioaji snapshots 節流) 是同一個精神,只是對象換成官方網站。
+    CHIPS_REQUEST_INTERVAL = 1.0
+
+    def _chips_http_json(self, url, params, timeout=30):
+        """GET 官方 JSON 端點,回傳 dict。失敗拋例外,由呼叫端決定重試/略過。"""
+        full = f"{url}?{urllib.parse.urlencode(params)}"
+        req = urllib.request.Request(full, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode('utf-8'))
+
+    def _chips_http_taifex(self, start_d, end_d, timeout=60):
+        """POST 期交所三大法人 CSV (支援日期區間,一次可抓一整個月)。回傳 bytes。"""
+        body = urllib.parse.urlencode({
+            'down_type': '1', 'commodity_id': '',
+            'queryStartDate': start_d.strftime('%Y/%m/%d'),
+            'queryEndDate': end_d.strftime('%Y/%m/%d'),
+        }).encode('utf-8')
+        req = urllib.request.Request(self.CHIPS_TAIFEX_URL, data=body, headers={
+            'User-Agent': 'Mozilla/5.0', 'Content-Type': 'application/x-www-form-urlencoded'})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+
+    def _chips_missing_days(self, start_dt, end_dt):
+        """回傳區間內「還沒抓過」的日期清單 (跳過週末與本地已有的日期)。
+
+        這是使用者要求的「存起來、日後不用重複抓取」的核心:每次更新只抓
+        缺的那幾天。首次抓一年約 240 天,之後每天只補 1 天。
+        (國定假日無法先驗判斷,抓到空資料時視為該日無交易,一樣記為已處理。)
+        """
+        s_iso, e_iso = start_dt.strftime('%Y-%m-%d'), end_dt.strftime('%Y-%m-%d')
+        have = chips_store.stock_inst_available_dates(self.CHIPS_BASE_DIR, s_iso, e_iso)
+        out, cur = [], start_dt
+        while cur <= end_dt:
+            if cur.weekday() < 5 and cur.strftime('%Y-%m-%d') not in have:
+                out.append(cur)
+            cur += timedelta(days=1)
+        return out
+
+    def _chips_update_worker(self, start_dt, end_dt, set_status):
+        """背景執行緒:逐日抓證交所/櫃買,期交所按月批次抓,存檔後刷新畫面。
+
+        設計重點:
+        - 個別日期失敗不中斷整批 (官方偶發 5xx 很常見),最後統整報告失敗數。
+        - 每個來源、每一天都獨立 try/except,呼應鐵則 8「不可包成一個大 try
+          讓失敗無聲無息」。
+        - 全程檢查 _closing 與 _chips_cancel,使用者關視窗或按停止能立刻收手
+          (P-59:長時間背景工作要頻繁檢查,不可跑到底)。
+        """
+        try:
+            days = self._chips_missing_days(start_dt, end_dt)
+            total = len(days)
+            if total == 0:
+                self.safe_after(0, set_status, "本地已涵蓋此區間,無需下載。")
+                self.safe_after(0, self.log_message, "【籌碼】本地資料已涵蓋指定區間,未發出任何請求。")
+                return
+            self.safe_after(0, self.log_message,
+                            f"【籌碼】開始更新:{total} 個交易日待抓 "
+                            f"(每日 4 個端點,間隔 {self.CHIPS_REQUEST_INTERVAL} 秒,預估約 "
+                            f"{total * self.CHIPS_REQUEST_INTERVAL * 4 / 60:.0f} 分鐘)。")
+            ok_days = 0
+            fails = {'market': 0, 'stock': 0, 'margin': 0, 'tpex': 0}
+            for i, day in enumerate(days, 1):
+                if self._closing or self._chips_cancel:
+                    self.safe_after(0, self.log_message, f"【籌碼】已中止 (完成 {i - 1}/{total} 日)。")
+                    self.safe_after(0, set_status, f"已中止 ({i - 1}/{total})")
+                    return
+                iso = day.strftime('%Y-%m-%d')
+                ymd = day.strftime('%Y%m%d')
+                self.safe_after(0, set_status, f"下載中 {i}/{total}:{iso} ...")
+                got_any = False
+
+                # (1) 市場三大法人 (加權指數層級)
+                try:
+                    payload = self._chips_http_json(self.CHIPS_TWSE_MARKET_URL,
+                                                    {'dayDate': ymd, 'type': 'day', 'response': 'json'})
+                    df = chips_parser.parse_twse_market_inst(payload, date_iso=iso)
+                    if not df.empty:
+                        chips_store.upsert(chips_store.market_inst_path(self.CHIPS_BASE_DIR), df)
+                        got_any = True
+                except Exception:
+                    fails['market'] += 1
+                time.sleep(self.CHIPS_REQUEST_INTERVAL)
+
+                # (2) 融資融券 (市場層級)
+                try:
+                    payload = self._chips_http_json(self.CHIPS_TWSE_MARGIN_URL,
+                                                    {'date': ymd, 'selectType': 'MS', 'response': 'json'})
+                    df = chips_parser.parse_twse_margin(payload, date_iso=iso)
+                    if not df.empty:
+                        chips_store.upsert(chips_store.margin_path(self.CHIPS_BASE_DIR), df)
+                        got_any = True
+                except Exception:
+                    fails['margin'] += 1
+                time.sleep(self.CHIPS_REQUEST_INTERVAL)
+
+                # (3) 上市個股三大法人
+                stock_frames = []
+                try:
+                    payload = self._chips_http_json(self.CHIPS_TWSE_STOCK_URL,
+                                                    {'date': ymd, 'selectType': 'ALL', 'response': 'json'})
+                    df = chips_parser.parse_twse_stock_inst(payload, date_iso=iso)
+                    if not df.empty:
+                        stock_frames.append(df)
+                        got_any = True
+                except Exception:
+                    fails['stock'] += 1
+                time.sleep(self.CHIPS_REQUEST_INTERVAL)
+
+                # (4) 上櫃個股三大法人
+                try:
+                    payload = self._chips_http_json(self.CHIPS_TPEX_STOCK_URL,
+                                                    {'type': 'Daily', 'sect': 'EW',
+                                                     'date': day.strftime('%Y/%m/%d'),
+                                                     'id': '', 'response': 'json'})
+                    # 櫃買欄位分組沒有官方名稱,是靠恆等式反推的;改版時要看得見
+                    ok_layout, why = chips_parser.verify_tpex_layout(payload)
+                    if not ok_layout:
+                        self.safe_after(0, self.log_message,
+                                        f"【籌碼-警告】{iso} 櫃買欄位版面驗證失敗 ({why}),"
+                                        f"該日上櫃資料已略過,不寫入可能錯誤的籌碼。")
+                    else:
+                        df = chips_parser.parse_tpex_stock_inst(payload, date_iso=iso)
+                        if not df.empty:
+                            stock_frames.append(df)
+                            got_any = True
+                except Exception:
+                    fails['tpex'] += 1
+                time.sleep(self.CHIPS_REQUEST_INTERVAL)
+
+                if stock_frames:
+                    merged = pd.concat(stock_frames, ignore_index=True)
+                    chips_store.upsert(chips_store.stock_inst_path(self.CHIPS_BASE_DIR, iso), merged)
+                if got_any:
+                    ok_days += 1
+
+            # (5) 期貨三大法人:支援日期區間,按月批次抓 (240 次 → 約 12 次)
+            self.safe_after(0, set_status, "下載期貨籌碼 ...")
+            fut_fail = 0
+            for m_start, m_end in self._chips_month_chunks(start_dt, end_dt):
+                if self._closing or self._chips_cancel:
+                    break
+                try:
+                    raw = self._chips_http_taifex(m_start, m_end)
+                    df = chips_parser.parse_taifex_inst(raw)
+                    if not df.empty:
+                        for year, part in df.groupby(df['Date'].str[:4]):
+                            chips_store.upsert(
+                                chips_store.futures_inst_path(self.CHIPS_BASE_DIR, year), part)
+                except Exception:
+                    fut_fail += 1
+                time.sleep(self.CHIPS_REQUEST_INTERVAL)
+
+            msg = f"【籌碼】更新完成:{ok_days}/{total} 個交易日有資料"
+            bad = [f"{k}×{v}" for k, v in fails.items() if v] + ([f"期貨×{fut_fail}"] if fut_fail else [])
+            if bad:
+                msg += f";失敗 {', '.join(bad)} (可再按一次更新,已成功的不會重抓)"
+            self.safe_after(0, self.log_message, msg)
+            self.safe_after(0, set_status, f"完成:{ok_days}/{total} 日")
+            self.safe_after(0, self._chips_refresh_view)
+        except Exception as e:
+            self.safe_after(0, self.log_message, f"【籌碼】更新發生非預期錯誤:{type(e).__name__}: {e}")
+            self.safe_after(0, set_status, "更新失敗 (詳見系統日誌)")
+        finally:
+            self._chips_running = False
+            self.safe_after(0, self._chips_set_buttons_idle)
+
+    @staticmethod
+    def _chips_month_chunks(start_dt, end_dt):
+        """把區間切成「每月一段」,供期交所區間查詢使用。"""
+        out = []
+        cur = start_dt.replace(day=1)
+        while cur <= end_dt:
+            nxt = (cur.replace(day=28) + timedelta(days=4)).replace(day=1)
+            seg_s = max(cur, start_dt)
+            seg_e = min(nxt - timedelta(days=1), end_dt)
+            if seg_s <= seg_e:
+                out.append((seg_s, seg_e))
+            cur = nxt
+        return out
+
+    # ---------------- 籌碼分頁 UI ----------------
+    CHIPS_VIEWS = [('stock', '個股法人'), ('futures', '期貨法人'),
+                   ('market', '大盤法人'), ('margin', '融資融券')]
+
+    def _build_chips_panel(self, parent):
+        """建立籌碼分頁:工具列 (更新/檢視切換/查詢) + Treeview 表格。"""
+        self._chips_running = False
+        self._chips_cancel = False
+        self._chips_view = tk.StringVar(value='stock')
+
+        bar = tk.Frame(parent, bg="#1A2026")
+        bar.pack(side=tk.TOP, fill=tk.X, padx=4, pady=(2, 0))
+
+        self.btn_chips_update = tk.Button(
+            bar, text="⬇ 更新籌碼 (近一年)", bg="#00C853", fg="black", relief="flat",
+            font=('微軟正黑體', 9, 'bold'), padx=10, pady=2, command=self._chips_start_update)
+        self.btn_chips_update.pack(side=tk.LEFT)
+        self.btn_chips_stop = tk.Button(
+            bar, text="■ 停止", bg="#2A323D", fg="white", relief="flat",
+            font=('微軟正黑體', 9, 'bold'), padx=10, pady=2,
+            state=tk.DISABLED, command=self._chips_stop_update)
+        self.btn_chips_stop.pack(side=tk.LEFT, padx=(4, 10))
+
+        for key, label in self.CHIPS_VIEWS:
+            tk.Radiobutton(bar, text=label, variable=self._chips_view, value=key,
+                           bg="#1A2026", fg="#FFFFFF", selectcolor="#12161A",
+                           activebackground="#1A2026", activeforeground="#29B6F6",
+                           font=('微軟正黑體', 9), command=self._chips_refresh_view
+                           ).pack(side=tk.LEFT, padx=2)
+
+        tk.Label(bar, text="代號:", bg="#1A2026", fg="#8A99AD",
+                 font=('微軟正黑體', 9)).pack(side=tk.LEFT, padx=(10, 2))
+        self.entry_chips_code = tk.Entry(bar, bg="#2A323D", fg="white", width=10,
+                                         justify="center", insertbackground="white")
+        self.entry_chips_code.pack(side=tk.LEFT)
+        self.entry_chips_code.bind("<Return>", lambda e: self._chips_refresh_view())
+        tk.Button(bar, text="查詢", bg="#29B6F6", fg="black", relief="flat",
+                  font=('微軟正黑體', 9, 'bold'), padx=8,
+                  command=self._chips_refresh_view).pack(side=tk.LEFT, padx=4)
+
+        self.lbl_chips_status = tk.Label(bar, text="", bg="#1A2026", fg="#8A99AD",
+                                         font=('微軟正黑體', 9), anchor="w")
+        self.lbl_chips_status.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
+
+        table = tk.Frame(parent, bg="#1A2026")
+        table.pack(fill=tk.BOTH, expand=True, padx=4, pady=(2, 2))
+        self.tree_chips = ttk.Treeview(table, show="headings", height=5, style='Trades.Treeview')
+        self.tree_chips.tag_configure('visible_row', foreground='#FFFFFF', background='#12161A')
+        # 【鐵則 1】紅漲綠跌:買超紅、賣超綠 (籌碼的「買超」等同做多力道)
+        self.tree_chips.tag_configure('buy', foreground='#FF1744', background='#12161A')
+        self.tree_chips.tag_configure('sell', foreground='#00E676', background='#12161A')
+        sb = tk.Scrollbar(table, orient=tk.VERTICAL, command=self.tree_chips.yview)
+        self.tree_chips.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree_chips.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    def _chips_set_buttons_idle(self):
+        """下載結束 (完成/中止/失敗) 後恢復按鈕狀態。"""
+        try:
+            self.btn_chips_update.config(state=tk.NORMAL, text="⬇ 更新籌碼 (近一年)")
+            self.btn_chips_stop.config(state=tk.DISABLED)
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _chips_start_update(self):
+        """使用者按「更新籌碼」:抓近一年缺的日期。下載一律在背景執行緒。"""
+        if self._chips_running:
+            return
+        end_dt = datetime.now()
+        start_dt = end_dt - timedelta(days=365)
+        self._chips_running = True
+        self._chips_cancel = False
+        self.btn_chips_update.config(state=tk.DISABLED, text="更新中 ...")
+        self.btn_chips_stop.config(state=tk.NORMAL)
+
+        def set_status(msg):
+            try:
+                self.lbl_chips_status.config(text=msg)
+            except (tk.TclError, AttributeError):
+                pass
+        threading.Thread(target=self._chips_update_worker,
+                         args=(start_dt, end_dt, set_status), daemon=True).start()
+
+    def _chips_stop_update(self):
+        self._chips_cancel = True
+        self.lbl_chips_status.config(text="停止中 ...")
+
+    def _chips_refresh_view(self):
+        """依目前檢視模式從本地檔案載入並填表 (純讀檔,不觸發下載)。"""
+        view = self._chips_view.get()
+        end_iso = datetime.now().strftime('%Y-%m-%d')
+        start_iso = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+        try:
+            if view == 'stock':
+                cols, rows, note = self._chips_rows_stock(start_iso, end_iso)
+            elif view == 'futures':
+                cols, rows, note = self._chips_rows_futures(start_iso, end_iso)
+            elif view == 'market':
+                cols, rows, note = self._chips_rows_simple(
+                    chips_store.market_inst_path(self.CHIPS_BASE_DIR),
+                    ['Date', 'Foreign', 'Trust', 'Dealer', 'InstTotal'],
+                    ['日期', '外資', '投信', '自營商', '三大法人合計'], net_col='InstTotal')
+            else:
+                cols, rows, note = self._chips_rows_simple(
+                    chips_store.margin_path(self.CHIPS_BASE_DIR),
+                    ['Date', 'MarginBalance', 'MarginPrevBalance', 'ShortBalance',
+                     'ShortPrevBalance', 'MarginAmountBalance'],
+                    ['日期', '融資餘額(張)', '前日融資', '融券餘額(張)', '前日融券', '融資金額(仟元)'])
+        except Exception as e:
+            cols, rows, note = ['訊息'], [(f"讀取籌碼資料失敗:{type(e).__name__}: {e}",)], ''
+        self._chips_fill_tree(cols, rows)
+        try:
+            self.lbl_chips_status.config(text=note)
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _chips_fill_tree(self, headings, rows):
+        """【P-31】先備妥再刪再插:避免中途出錯留下永久空白清單。"""
+        prepared = []
+        for r in rows:
+            vals = tuple('' if v is None else str(v) for v in r)
+            tag = 'visible_row'
+            # 最後一欄若是可解析的淨額,依紅漲綠跌上色 (鐵則 1)
+            try:
+                n = int(str(r[-1]).replace(',', ''))
+                tag = 'buy' if n > 0 else ('sell' if n < 0 else 'visible_row')
+            except (ValueError, TypeError, IndexError):
+                pass
+            prepared.append((vals, tag))
+        try:
+            self.tree_chips['columns'] = tuple(headings)
+            for h in headings:
+                self.tree_chips.heading(h, text=h)
+                self.tree_chips.column(h, width=110, anchor="center")
+            for i in self.tree_chips.get_children():
+                self.tree_chips.delete(i)
+            for vals, tag in prepared:
+                self.tree_chips.insert("", "end", values=vals, tags=(tag,))
+        except (tk.TclError, AttributeError):
+            pass
+
+    @staticmethod
+    def _chips_fmt_int(v):
+        try:
+            return f"{int(v):,}"
+        except (ValueError, TypeError):
+            return str(v)
+
+    def _chips_rows_stock(self, start_iso, end_iso):
+        """個股法人:有填代號就看該股歷史,否則看最新一日的買超排行。"""
+        df = chips_store.load_stock_inst_range(self.CHIPS_BASE_DIR, start_iso, end_iso)
+        heads = ['日期', '代號', '名稱', '外資', '投信', '自營商', '三大法人合計']
+        if df is None or df.empty:
+            return heads, [], "本地尚無個股籌碼,請按「更新籌碼」下載。"
+        code = (self.entry_chips_code.get() or '').strip().upper()
+        if code:
+            sub = df[df['Code'].astype(str).str.upper() == code].sort_values('Date', ascending=False)
+            note = f"{code} 共 {len(sub)} 個交易日 (資料 {df['Date'].min()} ~ {df['Date'].max()})"
+            if sub.empty:
+                return heads, [], f"查無 {code} 的籌碼資料 (本地涵蓋 {df['Date'].min()} ~ {df['Date'].max()})"
+        else:
+            latest = df['Date'].max()
+            sub = df[df['Date'] == latest].sort_values('InstTotal', ascending=False).head(100)
+            note = f"最新 {latest} 三大法人買超前 100 名 (輸入代號可查個股歷史)"
+        rows = [(r['Date'], r['Code'], r['Name'], self._chips_fmt_int(r['Foreign']),
+                 self._chips_fmt_int(r['Trust']), self._chips_fmt_int(r['Dealer']),
+                 self._chips_fmt_int(r['InstTotal'])) for _, r in sub.iterrows()]
+        return heads, rows, note
+
+    def _chips_rows_futures(self, start_iso, end_iso):
+        """期貨法人:預設看臺股期貨,可用代號欄過濾商品名稱關鍵字。"""
+        df = chips_store.load_futures_inst_range(self.CHIPS_BASE_DIR, start_iso, end_iso)
+        heads = ['日期', '商品', '身份別', '未平倉淨額(口)', '未平倉淨額(千元)', '交易淨額(口)']
+        if df is None or df.empty:
+            return heads, [], "本地尚無期貨籌碼,請按「更新籌碼」下載。"
+        kw = (self.entry_chips_code.get() or '').strip()
+        sub = df[df['Product'].astype(str).str.contains(kw, na=False)] if kw else \
+            df[df['Product'].astype(str) == '臺股期貨']
+        if sub.empty:
+            return heads, [], f"查無商品含「{kw}」的期貨籌碼"
+        sub = sub.sort_values(['Date', 'Investor'], ascending=[False, True]).head(300)
+        note = (f"{'含「' + kw + '」' if kw else '臺股期貨'} 共 {len(sub)} 列"
+                f" (資料 {df['Date'].min()} ~ {df['Date'].max()};留空預設臺股期貨)")
+        rows = [(r['Date'], r['Product'], r['Investor'], self._chips_fmt_int(r['NetOI']),
+                 self._chips_fmt_int(r['NetOIAmount']), self._chips_fmt_int(r['NetTrade']))
+                for _, r in sub.iterrows()]
+        return heads, rows, note
+
+    def _chips_rows_simple(self, path, cols, heads, net_col=None):
+        """大盤法人 / 融資融券:單一 CSV,依日期新到舊列出。"""
+        df = chips_store.load(path)
+        if df is None or df.empty:
+            return heads, [], "本地尚無此類籌碼,請按「更新籌碼」下載。"
+        df = df.sort_values('Date', ascending=False).head(300)
+        rows = []
+        for _, r in df.iterrows():
+            vals = []
+            for c in cols:
+                v = r.get(c, '')
+                vals.append(v if c == 'Date' else self._chips_fmt_int(v))
+            rows.append(tuple(vals))
+        note = f"共 {len(df)} 個交易日 (最新 {df['Date'].max()})"
+        return heads, rows, note
 
     # 【ADR-028】期貨舊代號別名 (向下相容:MTX/FITX 是常見俗稱)
     FUT_ALIASES = {'MTX': 'MXF', 'FITX': 'TXF'}
@@ -10715,13 +11125,14 @@ class StockTradingAppPro(tk.Tk):
             self.safe_after(400, self._live_bar_painter)
 
     def set_bottom_tab(self, key):
-        """切換底部分頁:系統日誌/我的委託單/我的已成交/我的庫存。"""
+        """切換底部分頁:系統日誌/我的委託單/我的已成交/我的庫存/量化/籌碼。"""
         self.bottom_tab = key
-        for frame in (self.log_tab_frame, self.orders_tab_frame, self.fills_tab_frame, self.positions_tab_frame, self.quant_tab_frame):
+        for frame in (self.log_tab_frame, self.orders_tab_frame, self.fills_tab_frame,
+                      self.positions_tab_frame, self.quant_tab_frame, self.chips_tab_frame):
             frame.pack_forget()
         {"log": self.log_tab_frame, "orders": self.orders_tab_frame,
          "fills": self.fills_tab_frame, "positions": self.positions_tab_frame,
-         "quant": self.quant_tab_frame}[key].pack(fill=tk.BOTH, expand=True)
+         "quant": self.quant_tab_frame, "chips": self.chips_tab_frame}[key].pack(fill=tk.BOTH, expand=True)
         for k, btn in self.bottom_tab_buttons.items():
             if k == key: btn.config(bg="#29B6F6", fg="black")
             else: btn.config(bg="#2A323D", fg="white")
@@ -10732,6 +11143,10 @@ class StockTradingAppPro(tk.Tk):
         if key == "quant":
             self._qt_refresh_tree()
             self._qt_update_status_label()
+        # 【ADR-100】切到籌碼分頁時從本地檔案載入 (純讀檔,不觸發任何下載;
+        # 下載一律由使用者按「更新籌碼」明確發動,避免切分頁就打官方網站)
+        if key == "chips":
+            self._chips_refresh_view()
 
     # shioaji 委託回報的 action 是英文列舉字串,顯示與比對前先正規化成中文。
     _ACTION_DISPLAY_MAP = {'Buy': '買進', 'Sell': '賣出',

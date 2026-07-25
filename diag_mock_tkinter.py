@@ -163,6 +163,7 @@ class _Treeview(_MockWidget):
     def __init__(self, master=None, **kw):
         super().__init__(master, **kw)
         self._rows = {}      # iid -> values tuple
+        self._tags = {}      # iid -> tags tuple (ADR-100:上色邏輯要可驗證)
         self._order = []
         self._focus = None
         self._selection = ()  # 【ADR-057】忠實模擬 selection API
@@ -176,11 +177,16 @@ class _Treeview(_MockWidget):
         elif iid in self._rows:
             raise Exception(f"iid {iid} already exists")  # 忠實模擬真實 tkinter 重複 iid 會拋錯
         self._rows[iid] = tuple(values)
+        # 【ADR-100】保存 tags:舊版直接丟棄,導致所有「依 tag 上色」的邏輯
+        # (最典型的就是鐵則1 紅漲綠跌) 在診斷環境完全測不到——同 P-28 的教訓,
+        # 空殼 mock 會讓被測程式碼從沒真正被驗證。
+        self._tags[iid] = tuple(kw.get('tags') or ())
         self._order.append(iid)
         return iid
     def delete(self, *iids):
         for iid in iids:
             self._rows.pop(iid, None)
+            self._tags.pop(iid, None)
             if iid in self._order: self._order.remove(iid)
     def get_children(self, item=None): return list(self._order)
     def focus(self, item=None):
@@ -216,8 +222,11 @@ class _Treeview(_MockWidget):
                 raise Exception(f"item {iid} not found")
             if 'values' in kw:
                 self._rows[iid] = tuple(kw['values'])
+        if kw and 'tags' in kw and iid in self._rows:
+            self._tags[iid] = tuple(kw['tags'] or ())
         if option == "values": return self._rows.get(iid, ())
-        return {"values": self._rows.get(iid, ())}
+        if option == "tags": return self._tags.get(iid, ())
+        return {"values": self._rows.get(iid, ()), "tags": self._tags.get(iid, ())}
     def identify_row(self, y):
         # 診斷用:回傳目前 focus 的列 (真實環境是依 y 座標,mock 無座標概念)
         return self._focus or ""
