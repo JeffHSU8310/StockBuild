@@ -46,6 +46,8 @@ from core import telegram_notify
 from core import market_pattern
 from data import config_store
 from data import taifex_store
+# 【ADR-097 階段0】券商連線生命週期抽到 brokers/ 套件,詳見 DECISIONS_ADR097.md。
+from brokers.sinopac import SinopacBroker
 
 # 嘗試載入永豐金 API
 try:
@@ -216,7 +218,13 @@ class StockTradingAppPro(tk.Tk):
         self.last_fallback_snap_time = 0
         self.odd_no_stream_warned = False
         
-        if HAS_SJ: self.sj_api = sj.Shioaji(simulation=False) 
+        # 【ADR-097 階段0】self.brokers 是未來多券商註冊表 (key 為券商代號)。
+        # self.sj_api 目前仍指向跟 self.brokers['sinopac'].api 完全相同的
+        # shioaji 實例,現有上百處直接呼叫 self.sj_api.xxx 的地方不受影響。
+        self.brokers = {}
+        if HAS_SJ:
+            self.brokers['sinopac'] = SinopacBroker()
+            self.sj_api = self.brokers['sinopac'].api
         
         self.config_file = app_path("broker_config.json")
         self.wl_file = app_path("watchlists.json")
@@ -406,7 +414,7 @@ class StockTradingAppPro(tk.Tk):
             # 消滅,券商端 session 由伺服器逾時回收 (重登流程 ADR-026 也會
             # 先 logout 舊連線,不會被殭屍 session 卡住)。
             try:
-                t = threading.Thread(target=lambda: self.sj_api.logout(), daemon=True)
+                t = threading.Thread(target=lambda: self.brokers['sinopac'].logout(), daemon=True)
                 t.start()
                 t.join(timeout=3.0)
             except Exception:
@@ -1922,7 +1930,7 @@ class StockTradingAppPro(tk.Tk):
             except Exception:
                 pass
         try:
-            self.sj_api = sj.Shioaji(simulation=False)
+            self.sj_api = self.brokers['sinopac'].new_session()
             # 舊 contract 物件屬於舊連線,一併作廢,強制下次查詢走完整重新訂閱
             self.current_contract = None
             self._wl_contract_cache.clear()  # 【ADR-028】自選股合約快取也隨連線世代作廢
@@ -1934,7 +1942,7 @@ class StockTradingAppPro(tk.Tk):
 
         self.safe_after(0, self.log_message, "連線至券商伺服器並下載最新合約檔中...")
         try:
-            self.sj_api.login(api_key=api_key, secret_key=secret_key, contracts_timeout=10000)
+            self.brokers['sinopac'].login(api_key=api_key, secret_key=secret_key, contracts_timeout=10000)
         except Exception as e:
             self.safe_after(0, self.log_message, f"【API 登入失敗】: {e}")
             self.safe_after(0, self.log_message,
@@ -1943,7 +1951,7 @@ class StockTradingAppPro(tk.Tk):
                              " 1-2 分鐘再點一次「登入券商實盤 API」;(3) API Key/Secret 有誤。")
             return
         try:
-            self.sj_api.activate_ca(ca_path=ca_path, ca_passwd=ca_pw, person_id=pid)
+            self.brokers['sinopac'].activate_ca(ca_path=ca_path, ca_pw=ca_pw, pid=pid)
         except Exception as e:
             self.safe_after(0, self.log_message, f"【憑證啟用失敗】: {e}")
             self.safe_after(0, self.log_message, "【提示】請確認憑證路徑、憑證密碼與身分證字號;報價查詢可用,但實盤下單需要憑證通過。")
@@ -1953,10 +1961,9 @@ class StockTradingAppPro(tk.Tk):
             try:
                 # 【修正】只註冊 v1 typed callbacks。
                 # 舊版同時掛 v0 set_quote_callback 會造成零股/整股資料互相覆蓋污染。
-                self.sj_api.quote.set_on_tick_stk_v1_callback(self.on_tick_stk_v1)
-                self.sj_api.quote.set_on_bidask_stk_v1_callback(self.on_bidask_stk_v1)
-                self.sj_api.quote.set_on_tick_fop_v1_callback(self.on_tick_fop_v1)
-                self.sj_api.quote.set_on_bidask_fop_v1_callback(self.on_bidask_fop_v1)
+                self.brokers['sinopac'].set_quote_callbacks(
+                    self.on_tick_stk_v1, self.on_bidask_stk_v1,
+                    self.on_tick_fop_v1, self.on_bidask_fop_v1)
             except Exception as cb_e:
                 self.safe_after(0, self.log_message, f"五檔流初始化異常: {cb_e}")
 
@@ -1965,7 +1972,7 @@ class StockTradingAppPro(tk.Tk):
                 # 文件明確建議「委託狀態請使用主動回報，避免以 update_status() 輪詢」，
                 # 這裡註冊一次 push callback，「我的委託單」「我的已成交」兩個清單
                 # 完全靠這個 callback 更新，不做輪詢查詢。
-                self.sj_api.set_order_callback(self.on_order_deal_callback)
+                self.brokers['sinopac'].set_order_callback(self.on_order_deal_callback)
             except Exception as cb_e:
                 self.safe_after(0, self.log_message, f"委託回報callback初始化異常: {cb_e}")
 

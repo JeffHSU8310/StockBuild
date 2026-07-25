@@ -29,8 +29,19 @@
 │   └── 呼叫 ──►  data/  (設定 I/O,零 tkinter)                   │
 │                · config_store  券商設定 / 自選股 / 版面設定讀寫 │
 │                · 驗證方式:tests/test_core.py                    │
+│                                                                │
+│   ├── 呼叫 ──►  brokers/  (券商 adapter,零 tkinter,可依賴券商 SDK) │
+│                · base      BrokerClient 共用介面骨架 (ADR-097)  │
+│                · sinopac   永豐 shioaji adapter — 目前只涵蓋   │
+│                  連線生命週期 (login/logout/callback 註冊);    │
+│                  委託/報價/部位等呼叫仍在 stock_app_pro.py 直接 │
+│                  使用 self.sj_api (見 ADR-097 階段0 範圍聲明)   │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+> `brokers/` 跟 `core/`/`data/` 不同：它允許依賴各券商第三方 SDK (如
+> shioaji)，存在理由是「封裝券商 SDK 差異」而不是「離線可測的純邏輯」。
+> 未來群益/兆豐/凱基 adapter 會陸續加進這個套件 (見 DECISIONS_ADR097.md)。
 
 **鐵律**：`core/` 與 `data/` 必須維持零 tkinter、零 shioaji 依賴（鐵則 11 / ADR-009 /
 PITFALLS P-27）。它們存在的唯一理由就是「可離線單元測試」。
@@ -209,6 +220,9 @@ G:\StockBuild\
 │   └─ order_rules.py
 ├─ data/
 │   └─ config_store.py     設定 / 自選股 / 版面 I/O
+├─ brokers/                券商 adapter (零 tkinter,可依賴券商 SDK,ADR-097)
+│   ├─ base.py              BrokerClient 共用介面骨架
+│   └─ sinopac.py           永豐 shioaji adapter (目前只涵蓋連線生命週期)
 ├─ tests/
 │   └─ test_core.py        core/ + data/ 離線單元測試
 ├─ diag_mock_tkinter.py    假 tkinter/mplfinance 環境 (開發用)
