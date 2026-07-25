@@ -42,8 +42,10 @@ from core import taifex_daily
 from core import chukuangren_band
 from core import telegram_notify
 from core import market_pattern
+from core import chips_parser
 from data import config_store
 from data import taifex_store
+from data import chips_store
 
 
 class TestTickRules(unittest.TestCase):
@@ -3809,6 +3811,247 @@ class TestMarketPattern(unittest.TestCase):
             self.assertIn('label', entry)
             self.assertIn('category', entry)
             self.assertIn('desc', entry)
+
+
+class TestChipsParser(unittest.TestCase):
+    """【ADR-100】籌碼資料解析。樣本結構取自四個官方端點的實際回應。"""
+
+    def test_to_num_handles_official_placeholders(self):
+        # 官方「無資料」有多種寫法,全部要吃成 0 而不是拋例外
+        for raw, want in [('1,234', 1234), ('-1,234', -1234), ('--', 0), ('---', 0),
+                          ('', 0), (None, 0), ('0', 0), ('  5,000  ', 5000)]:
+            self.assertEqual(chips_parser.to_num(raw), want, f"to_num({raw!r})")
+
+    def test_roc_to_iso_covers_all_four_source_formats(self):
+        # 四個來源的日期寫法各不相同,同一支函式都要吃得下
+        self.assertEqual(chips_parser.roc_to_iso('20260724'), '2026-07-24')      # 證交所 date
+        self.assertEqual(chips_parser.roc_to_iso('115/07/24'), '2026-07-24')     # 櫃買 date
+        self.assertEqual(chips_parser.roc_to_iso('115年07月24日 三大法人'), '2026-07-24')
+        self.assertEqual(chips_parser.roc_to_iso('2026/07/23'), '2026-07-23')    # 期交所 CSV
+        self.assertIsNone(chips_parser.roc_to_iso(''))
+        self.assertIsNone(chips_parser.roc_to_iso('無效字串'))
+
+    def test_is_warrant_keeps_stocks_etfs_and_preferred_shares(self):
+        # 權證要濾掉 (佔 T86 九成筆數),但特別股/債券ETF 不可誤殺
+        for code in ('030001', '073456', '081234'):
+            self.assertTrue(chips_parser.is_warrant(code), code)
+        for code in ('2330', '0050', '00878', '006208', '2883B', '00945B', '00632R'):
+            self.assertFalse(chips_parser.is_warrant(code), code)
+
+    def test_parse_twse_market_inst_sums_three_investors(self):
+        payload = {'stat': 'OK', 'date': '20260724',
+                   'fields': ['單位名稱', '買進金額', '賣出金額', '買賣差額'],
+                   'data': [['自營商(自行買賣)', '10', '5', '5'],
+                            ['自營商(避險)', '20', '30', '-10'],
+                            ['投信', '100', '40', '60'],
+                            ['外資及陸資(不含外資自營商)', '900', '1,000', '-100'],
+                            ['外資自營商', '0', '0', '0'],
+                            ['合計', '1,030', '1,075', '-45']]}
+        df = chips_parser.parse_twse_market_inst(payload)
+        self.assertEqual(len(df), 1)
+        r = df.iloc[0]
+        self.assertEqual(r['Date'], '2026-07-24')
+        self.assertEqual(r['Foreign'], -100)   # 外資及陸資 + 外資自營商
+        self.assertEqual(r['Trust'], 60)
+        self.assertEqual(r['Dealer'], -5)      # 自行 + 避險
+        # 合計刻意用三者相加,不直接採官方「合計」列
+        self.assertEqual(r['InstTotal'], -45)
+
+    def test_parse_twse_market_inst_rejects_failed_payload(self):
+        self.assertTrue(chips_parser.parse_twse_market_inst({'stat': 'ERROR'}).empty)
+        self.assertTrue(chips_parser.parse_twse_market_inst(None).empty)
+
+    def _t86_payload(self):
+        row = ['2330', '台積電'] + ['0'] * 17
+        row[4], row[7], row[10], row[11], row[18] = '1,000', '200', '300', '400', '1,900'
+        warrant = ['030001', '某權證'] + ['9,999'] * 17
+        return {'stat': 'OK', 'date': '20260724',
+                'fields': ['f%d' % i for i in range(19)], 'data': [row, warrant]}
+
+    def test_parse_twse_stock_inst_merges_foreign_and_drops_warrants(self):
+        df = chips_parser.parse_twse_stock_inst(self._t86_payload())
+        self.assertEqual(len(df), 1, "權證應被濾掉")
+        r = df.iloc[0]
+        self.assertEqual(r['Code'], '2330')
+        self.assertEqual(r['Foreign'], 1200)   # 外陸資 1000 + 外資自營商 200
+        self.assertEqual(r['Trust'], 300)
+        self.assertEqual(r['Dealer'], 400)
+        self.assertEqual(r['InstTotal'], 1900)
+
+    def test_parse_twse_stock_inst_can_keep_warrants(self):
+        df = chips_parser.parse_twse_stock_inst(self._t86_payload(), drop_warrants=False)
+        self.assertEqual(len(df), 2)
+
+    def _tpex_payload(self):
+        # 7 組 × 3 欄 + 代號/名稱 + 合計,且滿足三條恆等式
+        def row(code, name, f_ex, f_dlr, trust, d_self, d_hedge):
+            f_tot, d_tot = f_ex + f_dlr, d_self + d_hedge
+            vals = [code, name]
+            for net in (f_ex, f_dlr, f_tot, trust, d_self, d_hedge, d_tot):
+                vals += ['0', '0', str(net)]      # 買進/賣出留 0,只驗買賣超
+            vals.append(str(f_tot + trust + d_tot))
+            return vals
+        return {'tables': [{'title': '三大法人買賣明細資訊', 'date': '115/07/24',
+                            'fields': ['代號', '名稱'] + ['x'] * 22,
+                            'data': [row('6488', '環球晶', 100, 5, 20, 3, 7),
+                                     row('030001', '某權證', 1, 1, 1, 1, 1)]}]}
+
+    def test_verify_tpex_layout_passes_on_consistent_data(self):
+        ok, msg = chips_parser.verify_tpex_layout(self._tpex_payload())
+        self.assertTrue(ok, msg)
+
+    def test_verify_tpex_layout_detects_column_reshuffle(self):
+        """櫃買改版換欄位順序時要能被抓到,不能無聲產出錯誤籌碼。"""
+        bad = self._tpex_payload()
+        bad['tables'][0]['data'][0][10] = '99999'    # 破壞「外資合計=外資+外資自營商」
+        ok, msg = chips_parser.verify_tpex_layout(bad)
+        self.assertFalse(ok)
+        self.assertIn('不符恆等式', msg)
+
+    def test_parse_tpex_stock_inst_uses_group_totals(self):
+        df = chips_parser.parse_tpex_stock_inst(self._tpex_payload())
+        self.assertEqual(len(df), 1, "權證應被濾掉")
+        r = df.iloc[0]
+        self.assertEqual(r['Date'], '2026-07-24')
+        self.assertEqual(r['Code'], '6488')
+        self.assertEqual(r['Foreign'], 105)    # 外資合計組
+        self.assertEqual(r['Trust'], 20)
+        self.assertEqual(r['Dealer'], 10)      # 自營商合計組
+        self.assertEqual(r['InstTotal'], 135)
+
+    def test_parse_twse_margin_reads_today_and_prev_balance(self):
+        payload = {'stat': 'OK', 'date': '20260724', 'tables': [{
+            'fields': ['項目', '買進', '賣出', '現金(券)償還', '前日餘額', '今日餘額'],
+            'data': [['融資(交易單位)', '1', '2', '3', '9,349,915', '9,354,810'],
+                     ['融券(交易單位)', '1', '2', '3', '208,646', '204,754'],
+                     ['融資金額(仟元)', '1', '2', '3', '582,626,349', '577,059,537']]}]}
+        r = chips_parser.parse_twse_margin(payload).iloc[0]
+        self.assertEqual(r['Date'], '2026-07-24')
+        self.assertEqual(r['MarginBalance'], 9354810)
+        self.assertEqual(r['MarginPrevBalance'], 9349915)
+        self.assertEqual(r['ShortBalance'], 204754)
+        self.assertEqual(r['MarginAmountBalance'], 577059537)
+
+    def _taifex_csv(self):
+        head = ('日期,商品名稱,身份別,多方交易口數,多方交易契約金額,空方交易口數,'
+                '空方交易契約金額,多空交易口數淨額,多空交易契約金額淨額,多方未平倉口數,'
+                '多方未平倉契約金額,空方未平倉口數,空方未平倉契約金額,'
+                '多空未平倉口數淨額,多空未平倉契約金額淨額')
+        return (head + '\n'
+                '2026/07/23,臺股期貨,自營商,1,2,3,4,-405,-3635089,5,6,7,8,739,6677060\n'
+                '2026/07/23,電子期貨,投信,1,2,3,4,10,20,5,6,7,8,-30,-40\n')
+
+    def test_parse_taifex_inst_reads_net_oi(self):
+        df = chips_parser.parse_taifex_inst(self._taifex_csv())
+        self.assertEqual(len(df), 2)
+        r = df.iloc[0]
+        self.assertEqual(r['Date'], '2026-07-23')
+        self.assertEqual(r['Product'], '臺股期貨')
+        self.assertEqual(r['Investor'], '自營商')
+        self.assertEqual(r['NetOI'], 739)          # 多空未平倉口數淨額
+        self.assertEqual(r['NetOIAmount'], 6677060)
+        self.assertEqual(r['NetTrade'], -405)      # 多空交易口數淨額
+
+    def test_parse_taifex_inst_filters_products(self):
+        df = chips_parser.parse_taifex_inst(self._taifex_csv(), products=('臺股期貨',))
+        self.assertEqual(len(df), 1)
+        self.assertEqual(df.iloc[0]['Product'], '臺股期貨')
+
+    def test_decode_taifex_handles_big5_and_utf8(self):
+        # 期交所實測是 cp950;另有來源可能給 UTF-8 BOM,兩者都要能解
+        self.assertIn('臺股期貨', chips_parser.decode_taifex('臺股期貨'.encode('cp950')))
+        self.assertIn('臺股期貨', chips_parser.decode_taifex('臺股期貨'.encode('utf-8-sig')))
+
+    def test_parse_taifex_inst_handles_empty_input(self):
+        self.assertTrue(chips_parser.parse_taifex_inst(b'').empty)
+
+
+class TestChipsStore(unittest.TestCase):
+    """【ADR-100】籌碼本地儲存:冪等 upsert 與「已抓過就不重抓」的日期查詢。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def _df(self, date, code='2330', total=100):
+        return pd.DataFrame([{'Date': date, 'Code': code, 'Name': 'X',
+                              'Foreign': 1, 'Trust': 2, 'Dealer': 3, 'InstTotal': total}])
+
+    def test_upsert_creates_then_appends_new_date(self):
+        p = chips_store.stock_inst_path(self.tmp, '2026-07-24')
+        chips_store.upsert(p, self._df('2026-07-24'))
+        chips_store.upsert(p, self._df('2026-07-23'))
+        self.assertEqual(len(chips_store.load(p)), 2)
+        self.assertEqual(chips_store.available_dates(p), {'2026-07-23', '2026-07-24'})
+
+    def test_upsert_same_date_overwrites_not_duplicates(self):
+        """重複匯入同一天不可產生重複列——否則「不重複抓取」的前提就破功。"""
+        p = chips_store.stock_inst_path(self.tmp, '2026-07-24')
+        chips_store.upsert(p, self._df('2026-07-24', total=100))
+        chips_store.upsert(p, self._df('2026-07-24', total=999))
+        df = chips_store.load(p)
+        self.assertEqual(len(df), 1)
+        self.assertEqual(int(df.iloc[0]['InstTotal']), 999, "同日期應被新資料覆蓋")
+
+    def test_upsert_empty_df_leaves_file_untouched(self):
+        p = chips_store.stock_inst_path(self.tmp, '2026-07-24')
+        chips_store.upsert(p, self._df('2026-07-24'))
+        chips_store.upsert(p, pd.DataFrame())
+        self.assertEqual(len(chips_store.load(p)), 1)
+
+    def test_code_leading_zeros_survive_roundtrip(self):
+        """0050 / 00632R 這類代號不可被 CSV 讀回時變成數字 50。
+
+        注意同一天的資料必須一次寫入:upsert 的語意是「同日期整批覆蓋」,
+        分兩次寫同一天會讓後者取代前者 (這是刻意的冪等行為,見
+        test_upsert_same_date_overwrites_not_duplicates)。
+        """
+        p = chips_store.stock_inst_path(self.tmp, '2026-07-24')
+        day = pd.concat([self._df('2026-07-24', code='0050'),
+                         self._df('2026-07-24', code='00632R'),
+                         self._df('2026-07-24', code='2330')], ignore_index=True)
+        chips_store.upsert(p, day)
+        codes = set(chips_store.load(p)['Code'].astype(str))
+        self.assertEqual(codes, {'0050', '00632R', '2330'})
+
+    def test_stock_inst_path_splits_by_year_month(self):
+        a = chips_store.stock_inst_path(self.tmp, '2026-07-24')
+        b = chips_store.stock_inst_path(self.tmp, '2026-08-01')
+        self.assertNotEqual(a, b)
+        self.assertTrue(a.endswith('stock_inst_2026-07.csv'))
+        self.assertTrue(b.endswith('stock_inst_2026-08.csv'))
+
+    def test_months_between_spans_year_boundary(self):
+        got = chips_store._months_between('2025-11-01', '2026-02-15')
+        self.assertEqual(got, ['2025-11', '2025-12', '2026-01', '2026-02'])
+
+    def test_available_dates_on_missing_file_is_empty(self):
+        p = chips_store.stock_inst_path(self.tmp, '2099-01-01')
+        self.assertEqual(chips_store.available_dates(p), set())
+
+    def test_load_stock_inst_range_merges_across_month_files(self):
+        chips_store.upsert(chips_store.stock_inst_path(self.tmp, '2026-06-30'),
+                           self._df('2026-06-30'))
+        chips_store.upsert(chips_store.stock_inst_path(self.tmp, '2026-07-01'),
+                           self._df('2026-07-01'))
+        df = chips_store.load_stock_inst_range(self.tmp, '2026-06-01', '2026-07-31')
+        self.assertEqual(len(df), 2)
+        # 區間外的資料不可被帶進來
+        narrow = chips_store.load_stock_inst_range(self.tmp, '2026-07-01', '2026-07-31')
+        self.assertEqual(len(narrow), 1)
+
+    def test_stock_inst_available_dates_scans_all_month_files(self):
+        for d in ('2026-06-30', '2026-07-01', '2026-07-02'):
+            chips_store.upsert(chips_store.stock_inst_path(self.tmp, d), self._df(d))
+        got = chips_store.stock_inst_available_dates(self.tmp, '2026-06-01', '2026-07-31')
+        self.assertEqual(got, {'2026-06-30', '2026-07-01', '2026-07-02'})
+
+    def test_futures_inst_range_merges_across_years(self):
+        for d in ('2025-12-31', '2026-01-02'):
+            df = pd.DataFrame([{'Date': d, 'Product': '臺股期貨', 'Investor': '外資及陸資',
+                                'NetOI': 1, 'NetOIAmount': 2, 'NetTrade': 3, 'NetTradeAmount': 4}])
+            chips_store.upsert(chips_store.futures_inst_path(self.tmp, d[:4]), df)
+        out = chips_store.load_futures_inst_range(self.tmp, '2025-01-01', '2026-12-31')
+        self.assertEqual(len(out), 2)
 
 
 if __name__ == "__main__":
