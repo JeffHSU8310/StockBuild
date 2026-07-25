@@ -19,6 +19,26 @@ from stock_app_pro import StockTradingAppPro
 app = StockTradingAppPro()
 app.flush_after = getattr(app, "flush_after")  # 來自 _Tk mock
 
+
+def place_and_settle(ctx, timeout=5.0):
+    """【ADR-099】送單 + 等背景執行緒完成 + 沖 after 佇列。
+
+    ADR-096 把 place_order() 改成背景執行緒 (避免同步網路呼叫卡死主執行緒),
+    因此 _confirm_and_place_order() 一回來時委託「還沒」寫進 my_orders——
+    真正的寫入發生在背景 thread 跑完、safe_after 把 _apply_order_result
+    排回主執行緒之後。診斷腳本必須等這兩步都完成才能斷言,否則測到的是
+    「還沒寫入」的中間狀態 (這正是本腳本三個下單案例一度失效的原因)。
+    """
+    import time as _t
+    before = len(app._after_queue)
+    app._confirm_and_place_order(ctx)
+    deadline = _t.time() + timeout
+    # 背景 thread 完成的判準:它一定會 safe_after 排入 _apply_order_result
+    while _t.time() < deadline and len(app._after_queue) <= before:
+        _t.sleep(0.01)
+    app.flush_after()
+
+
 results = []
 def run_case(name, fn):
     try:
@@ -99,7 +119,7 @@ def _order_appears_in_my_orders_and_tree():
         is_lot_restricted=False, use_daytrade=False,
         qty=1, qty_unit="張", price_disp="98.15", order_type_str="限價",
     )
-    app._confirm_and_place_order(ctx)
+    place_and_settle(ctx)
     assert len(app.my_orders) == 1, f"my_orders 應有1筆,實際 {len(app.my_orders)}"
     key = next(iter(app.my_orders))
     assert key.startswith("_pending_"), f"應該用 _pending_ 暫時key,實際 {key}"
@@ -126,7 +146,7 @@ def _order_seed_prints_explicit_success_log():
             is_lot_restricted=False, use_daytrade=False,
             qty=1, qty_unit="張", price_disp="98.15", order_type_str="限價",
         )
-        app._confirm_and_place_order(ctx)
+        place_and_settle(ctx)
     finally:
         app.log_message = _orig_log
     assert any("已加入清單" in m for m in app._log_capture), \
@@ -151,7 +171,7 @@ def _order_event_replaces_pending_without_dup_or_wipe():
             mode_labels={"IntradayOdd": "盤中零股"}, cond_labels={"Cash": "現股"},
             effective_cond="Cash", effective_tif="ROD", is_lot_restricted=True,
             use_daytrade=False, qty=10, qty_unit="股", price_disp="106.45", order_type_str="限價")
-        app._confirm_and_place_order(ctx); app.flush_after()
+        place_and_settle(ctx)
     def _msg(ts):
         return {'operation': {'op_type': 'New', 'op_code': '00', 'op_msg': ''},
             'order': {'id': 'c21b876d', 'action': 'Buy', 'price': 106.45, 'quantity': 10,
@@ -234,9 +254,21 @@ def _perf_cache_progressive_and_seq_guard():
         def __init__(s,code,symbol=None,name=""):
             s.code=code; s.symbol=symbol or code; s.name=name; s.day_trade='Yes'; s.reference=100.0
     class FQ:
-        def __init__(s): s.sub=0; s.unsub=0
-        def subscribe(s,c,**k): s.sub+=1
+        """【ADR-099】記錄每次訂閱是從哪條路徑來的。
+
+        自選股報價 worker (watchlist_quote_worker) 是獨立的背景 daemon
+        thread,會在測試執行期間自行訂閱期貨/指數 (ADR-042)。舊版斷言直接比
+        全域 sub 計數,會把這條無關路徑的訂閱算進來,誤判成「主圖換週期重訂閱」。
+        這裡改為可依來源過濾,讓斷言只針對主圖 (fetch_data_worker) 路徑。"""
+        def __init__(s): s.sub=0; s.unsub=0; s.subsrc=[]
+        def subscribe(s,c,**k):
+            s.sub+=1
+            import traceback as _tb
+            s.subsrc.append(''.join(_tb.format_stack()))
         def unsubscribe(s,c,**k): s.unsub+=1
+        def chart_subs(s):
+            """只數主圖路徑的訂閱 (排除自選股 worker)。"""
+            return sum(1 for t in s.subsrc if 'watchlist_quote_worker' not in t)
     class FS:
         def __init__(s): s.m={'0050':FC('0050')}
         def get(s,k): return s.m.get(k)
@@ -261,13 +293,21 @@ def _perf_cache_progressive_and_seq_guard():
     draws={'n':0}; orig=app.draw_chart
     app.draw_chart=lambda df:(draws.__setitem__('n',draws['n']+1), orig(df))[1]
     try:
-        # 首載 0050 日K → kbars 1 次;換 5分K → 快取秒開 0 次、不重訂閱
+        # 首載 0050 日K → 搶先出圖 1 段 + 分段補全 (ADR-046/047/048
+        # _download_kbars_chunked,chunk_days=90);換 5分K → 快取秒開、不重訂閱。
+        # 【ADR-099】本斷言原本寫死「首載只下載1次」,那是分段下載功能加入之前的
+        # 預期;分段補全是刻意的優化 (P-36:kbars 只回分K,長週期一次抓太多天會慢
+        # 到不行),所以這裡改驗「有下載且每段起點不重複」,而不是寫死次數。
         app._fetch_seq=1; app.fetch_data_worker('0050','日K',1); app.flush_after()
-        assert len(api.calls)==1, f"首載應下載1次,實際{len(api.calls)}"
-        subs=api.quote.sub
+        assert len(api.calls)>=1, f"首載應至少下載1次,實際{len(api.calls)}"
+        starts=[c[1] for c in api.calls]
+        assert len(starts)==len(set(starts)), f"分段下載不應重複抓同一起點: {starts}"
+        n_first=len(api.calls)
+        subs=api.quote.chart_subs()
         app._fetch_seq=2; app.fetch_data_worker('0050','5分K',2); app.flush_after()
-        assert len(api.calls)==1, "快取涵蓋時不應重新下載"
-        assert api.quote.sub==subs and api.quote.unsub==0, "同商品換週期不應重訂閱/退訂"
+        assert len(api.calls)==n_first, "快取涵蓋時不應重新下載"
+        assert api.quote.chart_subs()==subs and api.quote.unsub==0, \
+            f"同商品換週期不應重訂閱/退訂 (主圖訂閱 {subs}→{api.quote.chart_subs()}, 退訂 {api.quote.unsub})"
         # TXF 日K 首載 → 兩段式 (2次下載,2次出圖)
         k0=len(api.calls); d0=draws['n']
         app._fetch_seq=3; app.fetch_data_worker('TXF','日K',3); app.flush_after()
@@ -420,7 +460,7 @@ def _modify_entry_points_and_race_guard():
         mode_labels={"Common":"整股"}, cond_labels={"Cash":"現股"},
         effective_cond="Cash", effective_tif="ROD", is_lot_restricted=False,
         use_daytrade=False, qty=50, qty_unit="股", price_disp="102.0", order_type_str="限價")
-    app._confirm_and_place_order(ctx); app.flush_after()
+    place_and_settle(ctx)
     assert len(app.my_orders)==1, f"回報先到時不應重複,實際{len(app.my_orders)}筆"
     assert not any(str(k).startswith('_pending_') for k in app.my_orders), "不應建暫時項目"
 
@@ -804,8 +844,9 @@ def _round15_quant_trading():
     api=FApi(); app.sj_api=api; app.api_logged_in=True
     app.strategies=[]; app.strategy_runtimes={}; app._kbars_raw_cache.clear()
     s=_se.new_strategy()
+    # 【ADR-099】session_gate=False,理由同上 (診斷需與時鐘無關)。
     s.update({'name':'診斷金叉','symbol':'2330','market':'台股','timeframe':'1分K','qty':1,
-              'cooldown_sec':0,'enabled':True,'stop_loss_pct':2.0,
+              'cooldown_sec':0,'enabled':True,'stop_loss_pct':2.0,'session_gate':False,
               'entry':[{'type':'ma_cross_up','params':{'fast':3,'slow':10}}]})
     app.strategies.append(s); app.strategy_runtimes[s['id']]=_se.new_runtime()
     # 總開關關閉:完全不動作 (最重要的安全行為)
@@ -827,6 +868,7 @@ def _round15_quant_trading():
         s2=_se.new_strategy()
         s2.update({'name':'診斷實單','symbol':'TXF','market':'台期貨','timeframe':'1分K','qty':1,
                    'cooldown_sec':0,'mode':'實單','enabled':True,'stop_loss_pct':1.0,
+                   'session_gate':False,   # 【ADR-099】診斷需與時鐘無關,理由同上
                    'entry':[{'type':'ma_cross_up','params':{'fast':3,'slow':10}}]})
         app.strategies.append(s2); app.strategy_runtimes[s2['id']]=_se.new_runtime()
         app._quant_eval_pass(); app.flush_after()
@@ -1206,8 +1248,11 @@ def _round20_paper_livebar_speed():
     app.strategies=[]; app.strategy_runtimes={}
     app.paper_accts={'default':_pa.new_account(account_id='default')}
     s=_se.new_strategy()
+    # 【ADR-099】session_gate=False:診斷腳本必須能在任何時間跑,不受台股開盤
+    # 時段影響 (ADR-070 的時段閘門在非交易時間會直接跳過評估,導致這些案例
+    # 只有在盤中執行才會通過——等於平常完全失去保護作用)。
     s.update({'name':'診斷模擬','symbol':'2330','market':'台股','timeframe':'日K','qty':1,'mode':'模擬',
-              'enabled':True,'direction':'做多','cooldown_sec':0,
+              'enabled':True,'direction':'做多','cooldown_sec':0,'session_gate':False,
               'entry':[{'type':'ma_cross_up','params':{'fast':3,'slow':10}}],'stop_loss_pct':2.0})
     app.strategies.append(s); app.strategy_runtimes[s['id']]=_se.new_runtime()
     app._qt_running=True
@@ -1217,7 +1262,10 @@ def _round20_paper_livebar_speed():
     # 3. 邊界感知:runner自然輪詢同邊界不重複
     calls=[]
     orig=app._qt_fetch_closed_bars
-    app._qt_fetch_closed_bars=lambda st,c2,a2:(calls.append(1), orig(st,c2,a2))[1]
+    # 【ADR-099】用 *a/**k 轉發:程式後來新增了 tf/cache_sym/cache_market 關鍵字
+    # 參數 (ADR-074 看A做B),舊的三位置參數 lambda 會拋 TypeError 被外層 except
+    # 吞掉,導致 calls 永遠是空的、這個案例形同虛設。
+    app._qt_fetch_closed_bars=lambda *a, **k:(calls.append(1), orig(*a, **k))[1]
     try:
         app._qt_last_boundary={}
         app._quant_eval_pass(); app.flush_after()
