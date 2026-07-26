@@ -44,6 +44,7 @@ from core import telegram_notify
 from core import market_pattern
 from core import chips_parser
 from core import chips_features
+from core import volume_profile
 from data import config_store
 from data import taifex_store
 from data import chips_store
@@ -4274,6 +4275,151 @@ class TestChipConditions(unittest.TestCase):
     def test_new_strategy_defaults_to_no_lookahead(self):
         self.assertFalse(strategy_engine.new_strategy()['chips_allow_same_day'],
                          "預設必須是「不讀當日籌碼」")
+
+
+class TestVolumeProfile(unittest.TestCase):
+    """【ADR-102】量價關係推算支撐壓力。"""
+
+    def _df(self, rows, start='2026-01-01'):
+        return pd.DataFrame(rows, index=pd.date_range(start, periods=len(rows), freq='B'))
+
+    def _concentrated(self, n=150, hot=104.5, hot_vol=5_000_000, cold_vol=500_000):
+        """構造一段「104.5 附近成交量特別大」的資料,POC 應落在該處。"""
+        rng = np.random.RandomState(3)
+        rows = []
+        for i in range(n):
+            if i % 3 == 0:
+                base, vol = hot, hot_vol
+            else:
+                base, vol = 100 + rng.rand() * 10, cold_vol
+            rows.append({'Open': base, 'High': base + 0.6, 'Low': base - 0.6,
+                         'Close': base, 'Volume': vol})
+        return self._df(rows)
+
+    def test_poc_lands_on_high_volume_price(self):
+        r = volume_profile.find_levels(self._concentrated(), asset_type='stock',
+                                       raw_symbol='2330')
+        self.assertIsNotNone(r)
+        self.assertLess(abs(r['profile']['poc'] - 104.5), 1.5,
+                        f"POC 應落在成交密集區附近,實際 {r['profile']['poc']}")
+
+    def test_value_area_contains_poc_and_covers_target_pct(self):
+        prof = volume_profile.compute_profile(self._concentrated(), asset_type='stock',
+                                              raw_symbol='2330')
+        self.assertLessEqual(prof['val'], prof['poc'])
+        self.assertGreaterEqual(prof['vah'], prof['poc'])
+        # 價值區內的量應達到設定比例
+        lo, hi = prof['val'], prof['vah']
+        inside = sum(v for c, v in zip(prof['bin_centers'], prof['bin_volumes'])
+                     if lo <= c <= hi)
+        self.assertGreaterEqual(inside / prof['total_volume'], 0.65)
+
+    def test_volume_spread_across_bar_range_not_only_close(self):
+        """一根長紅棒的量要分攤到 High~Low 全程,不可全部記在收盤價那一箱。
+
+        全記在收盤價是常見的簡化實作,但會嚴重失真:成交是發生在整段路徑上的。
+        """
+        df = self._df([{'Open': 100, 'High': 110, 'Low': 100, 'Close': 110,
+                        'Volume': 1000}])
+        prof = volume_profile.compute_profile(df, asset_type='stock', raw_symbol='2330',
+                                              bins=10)
+        nonzero = [v for v in prof['bin_volumes'] if v > 0]
+        self.assertGreater(len(nonzero), 1, "量應分攤到多個價格箱")
+        self.assertAlmostEqual(sum(prof['bin_volumes']), 1000, places=4,
+                               msg="分攤後總量必須守恆")
+
+    def test_no_contradictory_hvn_and_lvn_on_same_level(self):
+        """同一條線不可同時標成「高量節點」與「低量真空帶」(實測踩過)。"""
+        r = volume_profile.find_levels(self._concentrated(), asset_type='stock',
+                                       raw_symbol='2330')
+        for lv in r['levels']:
+            self.assertNotIn(volume_profile.KIND_LVN, lv['kind_all'],
+                             "支撐壓力清單不該混入真空帶")
+        lvn_prices = {z['price'] for z in r['lvn_zones']}
+        level_prices = {lv['price'] for lv in r['levels']}
+        self.assertFalse(lvn_prices & level_prices, "真空帶不可與支撐壓力同價位")
+
+    def test_levels_have_no_duplicate_prices(self):
+        r = volume_profile.find_levels(self._concentrated(), asset_type='stock',
+                                       raw_symbol='2330')
+        prices = [lv['price'] for lv in r['levels']]
+        self.assertEqual(len(prices), len(set(prices)), "同一價位不可出現兩條線")
+
+    def test_role_split_by_current_price(self):
+        r = volume_profile.find_levels(self._concentrated(), asset_type='stock',
+                                       raw_symbol='2330')
+        cur, tick = r['current'], r['tick']
+        for lv in r['levels']:
+            if lv['role'] == volume_profile.ROLE_RESISTANCE:
+                self.assertGreater(lv['price'], cur)
+            elif lv['role'] == volume_profile.ROLE_SUPPORT:
+                self.assertLess(lv['price'], cur)
+            else:
+                self.assertLess(abs(lv['price'] - cur), tick)
+
+    def test_prices_aligned_to_tick_for_stock_and_future(self):
+        """【鐵則7】輸出點位必須是合法檔位,不可出現 605.3 這種非法價。"""
+        r = volume_profile.find_levels(self._concentrated(), asset_type='stock',
+                                       raw_symbol='2330')
+        for lv in r['levels']:
+            t = tick_rules.get_tick(lv['price'], 'stock', '2330')
+            aligned = round(lv['price'] / t) * t
+            self.assertAlmostEqual(aligned, lv['price'], places=6,
+                                   msg=f"{lv['price']} 未對齊 tick {t}")
+        rows = [{'Open': 20000 + i * 3, 'High': 20030 + i * 3, 'Low': 19970 + i * 3,
+                 'Close': 20000 + i * 3, 'Volume': 100000} for i in range(60)]
+        rf = volume_profile.find_levels(self._df(rows), asset_type='future',
+                                        raw_symbol='TXF')
+        self.assertEqual(rf['tick'], 1.0, "期貨 tick 應為 1 點")
+        for lv in rf['levels']:
+            self.assertEqual(lv['price'], round(lv['price']), "期貨點位應為整數")
+
+    def test_swing_points_require_volume_confirmation(self):
+        """沒有放量的轉折點不採計——這是「量價關係」而非純價格型態。"""
+        rows = []
+        for i in range(21):
+            price = 100 + (5 if i == 10 else 0)      # 第 10 根是價格高點
+            rows.append({'Open': price, 'High': price, 'Low': price - 1,
+                         'Close': price, 'Volume': 1000})
+        highs, _ = volume_profile.swing_points(self._df(rows), lookback=3, volume_mult=1.3)
+        self.assertEqual(highs, [], "沒有放量的高點不該被採計")
+        rows[10]['Volume'] = 10_000                   # 同一根給大量
+        highs2, _ = volume_profile.swing_points(self._df(rows), lookback=3, volume_mult=1.3)
+        self.assertIn(105.0, highs2, "放量的高點應被採計")
+
+    def test_handles_missing_volume_column(self):
+        """沒有 Volume 欄位時要退化成等權重而不是崩潰 (指數常見)。"""
+        rows = [{'Open': 100 + i, 'High': 101 + i, 'Low': 99 + i, 'Close': 100 + i}
+                for i in range(30)]
+        r = volume_profile.find_levels(self._df(rows), asset_type='index_tw',
+                                       raw_symbol='^TWII')
+        self.assertIsNotNone(r)
+        self.assertTrue(r['levels'])
+
+    def test_returns_none_on_unusable_data(self):
+        self.assertIsNone(volume_profile.compute_profile(None))
+        self.assertIsNone(volume_profile.compute_profile(pd.DataFrame()))
+        flat = self._df([{'Open': 5, 'High': 5, 'Low': 5, 'Close': 5, 'Volume': 10}] * 5)
+        self.assertIsNone(volume_profile.compute_profile(flat),
+                          "價格全平無法形成價格箱,應回 None 而不是除以零")
+
+    def test_zero_volume_returns_none(self):
+        rows = [{'Open': 100 + i, 'High': 101 + i, 'Low': 99 + i, 'Close': 100 + i,
+                 'Volume': 0} for i in range(20)]
+        self.assertIsNone(volume_profile.compute_profile(self._df(rows)))
+
+    def test_summarize_is_readable_and_safe(self):
+        r = volume_profile.find_levels(self._concentrated(), asset_type='stock',
+                                       raw_symbol='2330')
+        text = volume_profile.summarize(r)
+        self.assertIn('POC', text)
+        self.assertIn('現價', text)
+        self.assertIsInstance(volume_profile.summarize(None), str)
+
+    def test_max_levels_respected(self):
+        r = volume_profile.find_levels(self._concentrated(), asset_type='stock',
+                                       raw_symbol='2330', max_levels=3)
+        self.assertLessEqual(len(r['levels']), 3)
 
 
 if __name__ == "__main__":

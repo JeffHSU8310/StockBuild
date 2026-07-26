@@ -48,6 +48,8 @@ from core import market_pattern
 from core import chips_parser
 # 【ADR-101】籌碼併進策略 df (含未來函數防護)。
 from core import chips_features
+# 【ADR-102】量價關係推算支撐/壓力點位 (Volume Profile)。
+from core import volume_profile
 from data import config_store
 from data import taifex_store
 from data import chips_store
@@ -1269,6 +1271,24 @@ class StockTradingAppPro(tk.Tk):
             tk.Checkbutton(row_frame, text=name, variable=var, bg="#12161A", fg="white", selectcolor="#2A323D", command=self.trigger_redraw).pack(side=tk.LEFT, padx=(3,0))
             if name in ["MACD", "RSI", "KDJ", "DMI"]:
                 tk.Button(row_frame, text="⚙", bg="#2A323D", fg="white", relief="flat", padx=2, pady=0, command=cmd).pack(side=tk.LEFT)
+
+        # 【ADR-102】量價支撐壓力:勾選後在主圖畫出 POC/價值區/高量節點等水平線。
+        # 壓力紅、支撐綠 (鐵則1 的延伸),線的粗細與透明度對應強度。
+        self.sr_enabled_var = tk.BooleanVar(value=False)
+        self._sr_range_mode = self.SR_RANGE_VISIBLE
+        self._sr_fixed_bars = 120
+        self._sr_max_levels = 6
+        self._sr_last_result = None
+        tk.Checkbutton(row_frame, text="支撐壓力", variable=self.sr_enabled_var,
+                       bg="#12161A", fg="#FFCA28", selectcolor="#2A323D",
+                       command=self._sr_toggle).pack(side=tk.LEFT, padx=(10, 0))
+        self.cb_sr_range = ttk.Combobox(row_frame, values=list(self.SR_RANGE_MODES),
+                                        width=8, state="readonly",
+                                        style='BlackText.TCombobox')
+        self.cb_sr_range.set(self.SR_RANGE_VISIBLE)
+        self.cb_sr_range.pack(side=tk.LEFT, padx=(2, 0))
+        self.cb_sr_range.bind("<<ComboboxSelected>>",
+                              lambda e: self._sr_set_range_mode(self.cb_sr_range.get()))
 
         # 【使用者調整#1】圖表邊界前兩次都是 Claude 猜測數值，使用者要求改成
         # 可以自己調整、調好就鎖定保存。這顆按鈕開一個對話框，用滑桿即時
@@ -5186,6 +5206,9 @@ class StockTradingAppPro(tk.Tk):
             # K棒的「收盤價」(不是滑鼠像素位置),與垂直線構成十字準星。
             self.hline_main = axlist[0].axhline(y=0, color='white', linestyle='--', linewidth=0.8, alpha=0.6, visible=False, zorder=50, animated=True)
             self._live_bar_reset_artists()  # 【ADR-041】活K棒 artists 跟著新 axes 重建
+            # 【ADR-102】量價支撐壓力:在主圖畫水平線。放在這裡是因為 axlist 剛
+            # 建好、還沒交給 canvas,與其他 overlay (vlines/hline) 同一階段。
+            self._draw_sr_levels(axlist[0], raw_df)
 
             self.current_fig = fig
             self.current_canvas = FigureCanvasTkAgg(fig, master=self.chart_frame)
@@ -11133,6 +11156,99 @@ class StockTradingAppPro(tk.Tk):
             lb['l'] = min(lb['l'], price)
             lb['c'] = price
             lb['dirty'] = True
+
+    # ==================================================================
+    # 【ADR-102】量價支撐壓力 (Volume Profile)
+    #
+    # 計算在 core/volume_profile.py (純邏輯、可離線測試);這裡只負責
+    # 「決定用哪一段資料」與「畫到主圖上」。三種商品共用同一條路,
+    # 差別只在傳入的 asset_type/raw_symbol (價格箱寬度與 tick 對齊靠它們)。
+    # ==================================================================
+    SR_RANGE_VISIBLE = '可見範圍'
+    SR_RANGE_FIXED = '固定N根'
+    SR_RANGE_MODES = (SR_RANGE_VISIBLE, SR_RANGE_FIXED)
+
+    def _sr_source_df(self, raw_df):
+        """依目前模式決定要拿哪一段資料算支撐壓力。
+
+        可見範圍:使用者放大/平移到哪就算哪一段,最符合看盤習慣。
+        固定N根:不管畫面怎麼縮放都用最近 N 根,結果較穩定。
+        """
+        if raw_df is None or len(raw_df) == 0:
+            return None
+        mode = getattr(self, '_sr_range_mode', self.SR_RANGE_VISIBLE)
+        n = int(getattr(self, '_sr_fixed_bars', 120) or 120)
+        if mode == self.SR_RANGE_FIXED:
+            return raw_df.tail(max(20, n))
+        # 可見範圍:draw_chart 畫的是 self.plot_df (已依縮放裁切);取不到就退回全量
+        vis = getattr(self, 'plot_df', None)
+        if vis is not None and len(vis) >= 20:
+            return vis
+        return raw_df.tail(max(20, n))
+
+    def _draw_sr_levels(self, ax, raw_df):
+        """在主圖畫支撐壓力水平線。任何例外都不可影響 K 線圖本身。"""
+        self._sr_last_result = None
+        if not getattr(self, 'sr_enabled_var', None) or not self.sr_enabled_var.get():
+            return
+        try:
+            src = self._sr_source_df(raw_df)
+            if src is None or len(src) < 20:
+                return
+            result = volume_profile.find_levels(
+                src, asset_type=self.asset_type,
+                raw_symbol=str(self.current_symbol or '').upper(),
+                max_levels=int(getattr(self, '_sr_max_levels', 6) or 6))
+            if not result or not result['levels']:
+                return
+            self._sr_last_result = result
+            for lv in result['levels']:
+                # 【鐵則1】紅漲綠跌的延伸:壓力在上方用紅、支撐在下方用綠,
+                # 與台股慣例一致 (紅=多方要突破的價、綠=空方要跌破的價)。
+                if lv['role'] == volume_profile.ROLE_RESISTANCE:
+                    color = '#FF1744'
+                elif lv['role'] == volume_profile.ROLE_SUPPORT:
+                    color = '#00E676'
+                else:
+                    color = '#FFCA28'
+                # 強度決定粗細與透明度,一眼看得出哪幾條比較關鍵
+                lw = 0.7 + 1.3 * float(lv['strength'])
+                alpha = 0.35 + 0.45 * float(lv['strength'])
+                ax.axhline(y=lv['price'], color=color, linestyle='--',
+                           linewidth=lw, alpha=alpha, zorder=8)
+                ax.text(0.995, lv['price'], f" {lv['price_str']} ",
+                        transform=ax.get_yaxis_transform(), ha='right', va='center',
+                        color=color, fontsize=7, alpha=min(1.0, alpha + 0.25),
+                        bbox=dict(boxstyle='round,pad=0.15', fc='#12161A',
+                                  ec=color, lw=0.5, alpha=0.75), zorder=9)
+            for z in result.get('lvn_zones', []):
+                # 真空帶語意不同 (價格容易快速穿越,不是支撐壓力),用淡灰點線區隔
+                ax.axhline(y=z['price'], color='#8A99AD', linestyle=':',
+                           linewidth=0.6, alpha=0.30, zorder=7)
+        except Exception as e:
+            # 支撐壓力只是輔助資訊,絕不能因為它出錯就讓整張 K 線圖畫不出來
+            self.log_message(f"【支撐壓力】計算失敗 ({type(e).__name__}: {e}),本次略過繪製。")
+
+    def _sr_toggle(self):
+        """切換顯示/隱藏後重畫 (需要重畫才能加上或移除水平線)。"""
+        if self.current_df is not None:
+            self.draw_chart(self.current_df)
+        self._sr_log_summary()
+
+    def _sr_log_summary(self):
+        """把這次算出的點位摘要寫進系統日誌,方便拿數字去掛單或設停損。"""
+        r = getattr(self, '_sr_last_result', None)
+        if not r:
+            return
+        self.log_message(f"【支撐壓力】{volume_profile.summarize(r)}")
+        for lv in r['levels']:
+            self.log_message(f"　　{lv['role']} {lv['price_str']}"
+                             f" (強度 {lv['strength']:.2f}) {lv['label']}")
+
+    def _sr_set_range_mode(self, mode):
+        self._sr_range_mode = mode
+        if self.current_df is not None:
+            self.draw_chart(self.current_df)
 
     def _live_bar_reset_artists(self):
         """draw_chart 後重建活K棒 artists (舊 axes 已被銷毀)。在主執行緒呼叫。"""

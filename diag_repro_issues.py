@@ -1905,6 +1905,87 @@ def _chips_as_strategy_condition():
 
 run_case("ADR-101: 籌碼條件接策略/未來函數防護/分K擋下", _chips_as_strategy_condition)
 
+
+def _sr_levels_drawn_on_chart():
+    """【ADR-102】量價支撐壓力:開啟後主圖真的畫出水平線、顏色分壓力紅支撐綠、
+    兩種區間模式都可運作、計算失敗不可影響 K 線圖本身。
+
+    這裡用真的 matplotlib Axes (見 diag_mock_tkinter 的假 mplfinance),所以
+    ax.lines 是真實的 artist——不是空殼斷言 (P-28 教訓)。"""
+    import numpy as _np
+    import pandas as _pd
+    from core import volume_profile as _vp
+
+    rng = _np.random.RandomState(11)
+    rows = []
+    for i in range(220):
+        if i % 3 == 0:
+            base, vol = 104.5, 5_000_000      # 刻意製造成交密集區
+        else:
+            base, vol = 100 + rng.rand() * 10, 600_000
+        rows.append({'Open': base, 'High': base + 0.6, 'Low': base - 0.6,
+                     'Close': base, 'Volume': vol})
+    df = _pd.DataFrame(rows, index=_pd.date_range('2026-01-01', periods=220, freq='B'))
+
+    old_sym, old_at = app.current_symbol, app.asset_type
+    try:
+        app.current_symbol, app.asset_type = '2330', 'stock'
+
+        # 關閉時不應有任何支撐壓力線
+        app.sr_enabled_var.set(False)
+        app.draw_chart(df)
+        assert app._sr_last_result is None, "關閉時不該計算支撐壓力"
+
+        # 開啟後應畫出水平線
+        app.sr_enabled_var.set(True)
+        app.draw_chart(df)
+        r = app._sr_last_result
+        assert r and r['levels'], "開啟後應算出支撐壓力點位"
+        ax = app.axlist[0]
+        ys = {round(float(l.get_ydata()[0]), 4) for l in ax.lines
+              if len(set(l.get_ydata())) == 1}
+        for lv in r['levels']:
+            assert round(lv['price'], 4) in ys, f"點位 {lv['price']} 沒有被畫成水平線"
+
+        # 壓力紅、支撐綠 (鐵則1 的延伸)
+        colors = {}
+        for l in ax.lines:
+            yd = l.get_ydata()
+            if len(set(yd)) == 1:
+                colors.setdefault(round(float(yd[0]), 4), l.get_color())
+        for lv in r['levels']:
+            c = str(colors.get(round(lv['price'], 4), '')).upper()
+            if lv['role'] == _vp.ROLE_RESISTANCE:
+                assert c == '#FF1744', f"壓力 {lv['price']} 應為紅色,實際 {c}"
+            elif lv['role'] == _vp.ROLE_SUPPORT:
+                assert c == '#00E676', f"支撐 {lv['price']} 應為綠色,實際 {c}"
+
+        # POC 應落在刻意製造的密集區附近
+        assert abs(r['profile']['poc'] - 104.5) < 2.0, \
+            f"POC 應接近成交密集區 104.5,實際 {r['profile']['poc']}"
+
+        # 兩種區間模式都要能運作
+        app._sr_set_range_mode(app.SR_RANGE_FIXED)
+        assert app._sr_last_result and app._sr_last_result['levels'], "固定N根模式應可運作"
+        app._sr_set_range_mode(app.SR_RANGE_VISIBLE)
+        assert app._sr_last_result and app._sr_last_result['levels'], "可見範圍模式應可運作"
+
+        # 計算失敗時不可影響 K 線圖 (支撐壓力只是輔助資訊)
+        orig = _vp.find_levels
+        try:
+            stock_app_pro.volume_profile.find_levels = lambda *a, **k: (_ for _ in ()).throw(
+                RuntimeError('診斷用假錯誤'))
+            app.draw_chart(df)          # 不可拋例外
+            assert app.current_fig is not None, "支撐壓力出錯時 K 線圖仍應正常畫出"
+        finally:
+            stock_app_pro.volume_profile.find_levels = orig
+    finally:
+        app.sr_enabled_var.set(False)
+        app.current_symbol, app.asset_type = old_sym, old_at
+
+
+run_case("ADR-102: 量價支撐壓力畫線/壓力紅支撐綠/兩種區間/失敗不影響K線", _sr_levels_drawn_on_chart)
+
 print(f"{'案例':60s} 結果")
 print("-" * 76)
 for name, st, msg in results:
