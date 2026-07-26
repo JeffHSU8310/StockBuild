@@ -4560,6 +4560,42 @@ class TestFundamentalParser(unittest.TestCase):
         self.assertEqual(fundamental_parser.roc_date_to_iso('20260724'), '2026-07-24')
         self.assertIsNone(fundamental_parser.roc_date_to_iso(''))
 
+    def test_tpex_daily_history_uses_field_names_not_positions(self):
+        """【ADR-104】櫃買歷史行情有兩個陷阱,都必須靠「欄位名」而非位置解決:
+
+        1. 欄位名帶前後空白:'收盤 '、' 成交金額(元)'、'成交股數  '。
+        2. 欄位順序是「收盤、漲跌、開盤、最高、最低」——**收盤在開盤前面**,
+           與一般 OHLC 慣例相反。寫死索引會讓開高低收全部錯位,而且數字看起來
+           仍然「像價格」,不會報錯。
+        """
+        payload = {'date': '20260724', 'tables': [{
+            'fields': ['代號', '名稱', '收盤 ', '漲跌', '開盤 ', '最高 ', '最低',
+                       '成交股數  ', ' 成交金額(元)'],
+            'data': [['6488', '環球晶', '1030.00', '-5.00', '1020.00', '1035.00',
+                      '1010.00', '1,234,000', '999'],
+                     ['030001', '某權證', '1', '0', '1', '1', '1', '1', '1']]}]}
+        df = fundamental_parser.parse_tpex_daily_history(payload)
+        self.assertEqual(len(df), 1, "權證應被濾掉")
+        r = df.iloc[0]
+        self.assertEqual(r['Date'], '2026-07-24')
+        self.assertEqual(r['Code'], '6488')
+        # 關鍵:開/收不可互換 (欄位順序陷阱)
+        self.assertEqual(r['Open'], 1020.0)
+        self.assertEqual(r['Close'], 1030.0)
+        self.assertEqual(r['High'], 1035.0)
+        self.assertEqual(r['Low'], 1010.0)
+        self.assertEqual(r['Volume'], 1234000.0)
+        # OHLC 邏輯自洽 (錯位時這裡會失敗)
+        self.assertGreaterEqual(r['High'], max(r['Open'], r['Close']))
+        self.assertLessEqual(r['Low'], min(r['Open'], r['Close']))
+
+    def test_tpex_daily_history_handles_missing_fields(self):
+        self.assertTrue(fundamental_parser.parse_tpex_daily_history(None).empty)
+        self.assertTrue(fundamental_parser.parse_tpex_daily_history({}).empty)
+        bad = {'tables': [{'fields': ['代號', '名稱'], 'data': [['6488', 'X']]}]}
+        self.assertTrue(fundamental_parser.parse_tpex_daily_history(bad).empty,
+                        "缺必要欄位時應回空表而不是抓錯欄")
+
     def test_tpex_daily_all_parses_own_date_field(self):
         rows = [{'Date': '1150724', 'SecuritiesCompanyCode': '6488', 'CompanyName': '環球晶',
                  'Open': '1020', 'High': '1035', 'Low': '1010', 'Close': '1030',

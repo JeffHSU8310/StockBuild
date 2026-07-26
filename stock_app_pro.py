@@ -11278,6 +11278,9 @@ class StockTradingAppPro(tk.Tk):
     SC_TPEX_VAL_URL = 'https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis'
     SC_TPEX_REV_URL = 'https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O'
     SC_TPEX_QUOTE_URL = 'https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes'
+    # 【ADR-104】可回溯歷史的上櫃日行情 (吃 date 參數,實測可回溯數月)。
+    # 上面那支 openapi 只有當日,補不出上櫃的技術面歷史。
+    SC_TPEX_HIST_URL = 'https://www.tpex.org.tw/www/zh-tw/afterTrading/otc'
 
     # 【ADR-103 修正】財報依「產業別」分成六個端點,必須全部抓才完整。
     # 實測踩到的坑:只抓 _ci 會**漏掉全部金控股** (2881 富邦金、2882 國泰金、
@@ -11456,24 +11459,42 @@ class StockTradingAppPro(tk.Tk):
                 cur += timedelta(days=1)
             self.safe_after(0, self.log_message,
                             f"【選股】開始更新:{len(days)} 個交易日待抓 "
-                            f"(預估約 {len(days) * self.SC_REQUEST_INTERVAL / 60:.0f} 分鐘)。")
+                            f"(上市+上櫃各一次,預估約 "
+                            f"{len(days) * self.SC_REQUEST_INTERVAL * 2 / 60:.0f} 分鐘)。")
             ok_days = 0
             for i, day in enumerate(days, 1):
                 if self._closing or self._sc_cancel:
                     self.safe_after(0, self.log_message, f"【選股】已中止 (完成 {i - 1}/{len(days)})。")
                     break
                 self.safe_after(0, self._sc_set_status, f"下載日K {i}/{len(days)}:{day:%Y-%m-%d} ...")
+                iso = day.strftime('%Y-%m-%d')
+                got = []
+                # 上市 (MI_INDEX)
                 try:
                     payload = self._chips_http_json(
                         self.SC_TWSE_MI_URL,
                         {'date': day.strftime('%Y%m%d'), 'type': 'ALLBUT0999', 'response': 'json'})
-                    df = fundamental_parser.parse_twse_mi_index(
-                        payload, date_iso=day.strftime('%Y-%m-%d'))
+                    df = fundamental_parser.parse_twse_mi_index(payload, date_iso=iso)
                     if not df.empty:
-                        market_store.upsert_daily(self.SCREENER_BASE_DIR, df)
-                        ok_days += 1
+                        got.append(df)
                 except Exception:
                     pass          # 單日失敗不中斷整批 (假日/官方暫時性錯誤很常見)
+                time.sleep(self.SC_REQUEST_INTERVAL)
+                # 【ADR-104】上櫃 (可回溯的 afterTrading/otc):同一天一起補,
+                # 兩個市場的技術面歷史才會對齊,不會出現「上市有K棒、上櫃沒有」。
+                try:
+                    payload = self._chips_http_json(
+                        self.SC_TPEX_HIST_URL,
+                        {'date': day.strftime('%Y/%m/%d'), 'type': 'EW', 'response': 'json'})
+                    df_o = fundamental_parser.parse_tpex_daily_history(payload, date_iso=iso)
+                    if not df_o.empty:
+                        got.append(df_o)
+                except Exception:
+                    pass
+                if got:
+                    market_store.upsert_daily(self.SCREENER_BASE_DIR,
+                                              pd.concat(got, ignore_index=True))
+                    ok_days += 1
                 time.sleep(self.SC_REQUEST_INTERVAL)
 
             # 基本面快照 (每次更新都整批重抓:它是「現在的值」,不保留歷史)

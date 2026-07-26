@@ -227,6 +227,51 @@ def roc_date_to_iso(v):
     return None
 
 
+def parse_tpex_daily_history(payload, date_iso=None):
+    """TPEx `afterTrading/otc?date=YYYY/MM/DD&type=EW` → 全市場日 OHLCV。
+
+    【為什麼需要這一支】另一支 `tpex_mainboard_daily_close_quotes` 只有當日、
+    沒有日期參數,上櫃的技術面歷史因此補不起來 (ADR-103 原本列為最大落差)。
+    這支吃 date 參數,實測可回溯數月,逐日抓即可補齊上櫃歷史。
+
+    【兩個實測踩到的陷阱】
+    1. 欄位名帶前後空白:'收盤 '、' 成交金額(元)'、'成交股數  '。
+    2. 欄位順序是「收盤、漲跌、開盤、最高、最低」——**收盤在開盤前面**,
+       與一般 OHLC 慣例相反。
+    因此一律用「strip 後的欄位名」建索引,不寫死位置;官方調整欄位順序時
+    也不會無聲抓錯欄。
+    """
+    if not isinstance(payload, dict):
+        return pd.DataFrame(columns=DAILY_COLS)
+    tabs = payload.get('tables') or []
+    tb = tabs[0] if tabs and isinstance(tabs[0], dict) else None
+    if not tb:
+        return pd.DataFrame(columns=DAILY_COLS)
+    d = date_iso or roc_date_to_iso(payload.get('date') or tb.get('date'))
+    idx = {}
+    for i, name in enumerate(tb.get('fields') or []):
+        key = str(name).replace('<br>', '').strip()
+        idx.setdefault(key, i)
+    need = ('代號', '名稱', '開盤', '最高', '最低', '收盤', '成交股數')
+    if not all(k in idx for k in need):
+        return pd.DataFrame(columns=DAILY_COLS)
+    out = []
+    for r in tb.get('data') or []:
+        if len(r) <= max(idx[k] for k in need):
+            continue
+        code = _norm_code(r[idx['代號']])
+        if not is_listed_equity(code):
+            continue
+        close = to_float(r[idx['收盤']])
+        if close is None:
+            continue
+        out.append({'Date': d, COL_CODE: code, COL_NAME: str(r[idx['名稱']]).strip(),
+                    'Open': to_float(r[idx['開盤']]), 'High': to_float(r[idx['最高']]),
+                    'Low': to_float(r[idx['最低']]), 'Close': close,
+                    'Volume': to_float(r[idx['成交股數']]) or 0.0})
+    return pd.DataFrame(out, columns=DAILY_COLS)
+
+
 def parse_tpex_daily_all(rows, date_iso=None):
     """TPEx tpex_mainboard_daily_close_quotes (list of dict) → 全市場日 OHLCV。"""
     out = []
