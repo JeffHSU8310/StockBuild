@@ -44,9 +44,10 @@ COL_REV_MOM = 'RevenueMoMPct'  # 月營收月增率 %
 COL_REVENUE = 'MonthRevenue'
 COL_EQUITY = 'Equity'
 COL_ROE = 'ROEPct'
+COL_INDUSTRY = 'Industry'      # 產業別 (ADR-105;來源:月營收表的「產業別」欄)
 
-FUNDAMENTAL_COLS = [COL_CODE, COL_NAME, COL_CLOSE, COL_PE, COL_PB, COL_YIELD,
-                    COL_EPS, COL_GROSS_MARGIN, COL_REV_YOY, COL_REV_MOM,
+FUNDAMENTAL_COLS = [COL_CODE, COL_NAME, COL_INDUSTRY, COL_CLOSE, COL_PE, COL_PB,
+                    COL_YIELD, COL_EPS, COL_GROSS_MARGIN, COL_REV_YOY, COL_REV_MOM,
                     COL_REVENUE, COL_EQUITY, COL_ROE]
 
 
@@ -314,11 +315,15 @@ def parse_monthly_revenue(rows):
         out.append({
             COL_CODE: code,
             COL_NAME: str(d.get('公司名稱') or d.get('CompanyName') or '').strip(),
+            # 【ADR-105】產業別:上市與上櫃的月營收表都有這個欄位 (中文欄名),
+            # 是全市場唯一涵蓋率夠高的產業分類來源。
+            COL_INDUSTRY: str(d.get('產業別') or '').strip() or None,
             COL_REVENUE: to_float(d.get('營業收入-當月營收')),
             COL_REV_YOY: to_float(d.get('營業收入-去年同月增減(%)')),
             COL_REV_MOM: to_float(d.get('營業收入-上月比較增減(%)')),
         })
-    return pd.DataFrame(out, columns=[COL_CODE, COL_NAME, COL_REVENUE, COL_REV_YOY, COL_REV_MOM])
+    return pd.DataFrame(out, columns=[COL_CODE, COL_NAME, COL_INDUSTRY, COL_REVENUE,
+                                      COL_REV_YOY, COL_REV_MOM])
 
 
 # ---------------------------------------------------------------------------
@@ -455,11 +460,20 @@ def merge_fundamentals(valuation=None, revenue=None, income=None, balance=None,
         if c not in base.columns:
             base[c] = None
     # EPS 缺 → 用 收盤價/本益比 反推 (上櫃唯一取得 EPS 的途徑)
+    #
+    # 【pandas 型別坑】指派 list 給 float64 欄位時,list 裡的 None 在新版
+    # pandas 會直接拋 TypeError (Invalid value 'None' for dtype 'float64'),
+    # 而不是靜默轉成 NaN。一律先包成 pd.Series(dtype='float64') 再指派,
+    # None 會被正確轉成 NaN——這個崩潰只在「有一批股票缺 EPS」時才會出現,
+    # 很容易在小樣本測試中漏掉 (實測踩到)。
     need_eps = base[COL_EPS].isna()
     if need_eps.any():
-        base.loc[need_eps, COL_EPS] = [
-            derive_eps_from_pe(c, p) for c, p in
-            zip(base.loc[need_eps, COL_CLOSE], base.loc[need_eps, COL_PE])]
-    base[COL_ROE] = [derive_roe(e, pb, c) for e, pb, c in
-                     zip(base[COL_EPS], base[COL_PB], base[COL_CLOSE])]
+        filled = [derive_eps_from_pe(c, p) for c, p in
+                  zip(base.loc[need_eps, COL_CLOSE], base.loc[need_eps, COL_PE])]
+        base.loc[need_eps, COL_EPS] = pd.Series(filled, index=base.index[need_eps],
+                                                dtype='float64')
+    base[COL_ROE] = pd.Series(
+        [derive_roe(e, pb, c) for e, pb, c in
+         zip(base[COL_EPS], base[COL_PB], base[COL_CLOSE])],
+        index=base.index, dtype='float64')
     return base[FUNDAMENTAL_COLS].reset_index(drop=True)

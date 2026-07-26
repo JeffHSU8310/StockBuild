@@ -59,6 +59,34 @@ def fundamental_label(cond):
     return f"{label} {cond.get('op', OP_GTE)} {cond.get('value')} {unit}"
 
 
+def industries_of(fundamental_df):
+    """【ADR-105】列出資料裡實際出現的產業別 (排序後),供 UI 下拉使用。
+
+    不寫死清單:產業分類會隨官方調整增減 (實測上市 33 種、加上櫃共 36 種),
+    寫死會在官方新增分類時無聲漏掉那些股票。
+    """
+    if fundamental_df is None or len(fundamental_df) == 0:
+        return []
+    if fp.COL_INDUSTRY not in fundamental_df.columns:
+        return []
+    vals = fundamental_df[fp.COL_INDUSTRY].dropna().astype(str).str.strip()
+    return sorted({v for v in vals if v})
+
+
+def match_industry(row, industries):
+    """產業別是否符合。industries 為空/None 代表「不限產業」。
+
+    產業別為空的個股在「有指定產業」時視為不符合——理由同決策三:
+    「沒有資料」不可當成「符合」,否則指定產業時會混進分類不明的股票。
+    """
+    if not industries:
+        return True
+    val = row.get(fp.COL_INDUSTRY)
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return False
+    return str(val).strip() in set(industries)
+
+
 def eval_fundamental(row, conds):
     """對一列基本面資料評估所有基本面條件。回傳 (是否全部通過, 未通過原因)。
 
@@ -109,7 +137,7 @@ def _attach_chips_if_needed(ohlcv, code, chip_conds, stock_chips, margin_chips,
 def screen(fundamental_df, daily_df, conditions=None, fundamental_conds=None,
            logic='AND', stock_chips=None, margin_chips=None,
            allow_same_day_chips=False, min_bars=30, max_results=200,
-           to_ohlcv=None, progress_cb=None, should_stop=None):
+           to_ohlcv=None, progress_cb=None, should_stop=None, industries=None):
     """執行選股。回傳 dict:{'rows': [...], 'scanned': n, 'passed': m, 'errors': [...]}。
 
     參數:
@@ -136,6 +164,10 @@ def screen(fundamental_df, daily_df, conditions=None, fundamental_conds=None,
     # 第一階段:基本面 (向量化前先逐列判斷,量小且邏輯要與空值規則一致)
     stage1 = []
     for _, row in fundamental_df.iterrows():
+        # 【ADR-105】產業別先擋:它是最便宜的判斷 (單純字串比對),放在最前面
+        # 可以讓後面的數值比較與技術面掃描少跑很多檔。
+        if not match_industry(row, industries):
+            continue
         ok, _why = eval_fundamental(row, f_conds)
         if ok:
             stage1.append(row)
@@ -191,9 +223,13 @@ def _pack_row(row, details, f_conds, ohlcv=None):
     last_close = _g(fp.COL_CLOSE)
     if last_close is None and ohlcv is not None and len(ohlcv):
         last_close = float(ohlcv['Close'].iloc[-1])
+    industry = row.get(fp.COL_INDUSTRY)
+    if industry is None or (isinstance(industry, float) and pd.isna(industry)):
+        industry = ''
     return {
         'code': str(row.get(fp.COL_CODE)),
         'name': str(row.get(fp.COL_NAME) or ''),
+        'industry': str(industry),
         'close': last_close,
         'pe': _g(fp.COL_PE), 'pb': _g(fp.COL_PB), 'yield': _g(fp.COL_YIELD),
         'eps': _g(fp.COL_EPS), 'gross_margin': _g(fp.COL_GROSS_MARGIN),

@@ -4614,6 +4614,33 @@ class TestFundamentalParser(unittest.TestCase):
         self.assertAlmostEqual(float(r['EPS']), 10.0)
         self.assertAlmostEqual(float(r['ROEPct']), 20.0)
 
+    def test_merge_handles_mixed_missing_eps_without_dtype_error(self):
+        """【實測踩到】一批股票缺 EPS 時,新版 pandas 對 float64 欄位指派含
+        None 的 list 會直接拋 TypeError 而不是轉成 NaN。這個崩潰只在「部分
+        缺、部分有」的資料組合才會出現,小樣本很容易漏掉。"""
+        val = pd.DataFrame([
+            {'Code': '1101', 'Name': 'A', 'Close': 100.0, 'PE': None, 'PB': 1.0, 'YieldPct': 1.0},
+            {'Code': '2330', 'Name': 'B', 'Close': 200.0, 'PE': 10.0, 'PB': 2.0, 'YieldPct': 2.0},
+            {'Code': '6488', 'Name': 'C', 'Close': 50.0, 'PE': None, 'PB': 1.5, 'YieldPct': 3.0},
+        ])
+        inc = pd.DataFrame([{'Code': '2330', 'EPS': 22.08, 'GrossMarginPct': 60.0}])
+        m = fundamental_parser.merge_fundamentals(valuation=val, income=inc)
+        self.assertEqual(len(m), 3)
+        self.assertAlmostEqual(float(m[m.Code == '2330'].iloc[0]['EPS']), 22.08)
+        self.assertTrue(pd.isna(m[m.Code == '1101'].iloc[0]['EPS']),
+                        "本益比為空 (虧損) 時不可推出 EPS")
+
+    def test_monthly_revenue_carries_industry(self):
+        rows = [{'公司代號': '2330', '公司名稱': '台積電', '產業別': '半導體業',
+                 '營業收入-當月營收': '100', '營業收入-去年同月增減(%)': '67.87'},
+                {'SecuritiesCompanyCode': '1240', 'CompanyName': '茂生農經',
+                 '產業別': '農業科技', '營業收入-當月營收': '50',
+                 '營業收入-去年同月增減(%)': '24.2'}]
+        df = fundamental_parser.parse_monthly_revenue(rows)
+        self.assertEqual(len(df), 2, "上市中文欄名與上櫃英文欄名都要讀得到")
+        self.assertEqual(df[df.Code == '2330'].iloc[0]['Industry'], '半導體業')
+        self.assertEqual(df[df.Code == '1240'].iloc[0]['Industry'], '農業科技')
+
 
 class TestMarketScreener(unittest.TestCase):
     """【ADR-103】選股引擎。"""
@@ -4692,6 +4719,38 @@ class TestMarketScreener(unittest.TestCase):
             to_ohlcv=market_store.to_ohlcv_frame,
             should_stop=lambda: True)
         self.assertTrue(any('中止' in e[0] for e in r['errors']))
+
+    def test_industry_filter(self):
+        """【ADR-105】產業篩選。"""
+        f = self._fund()
+        f['Industry'] = ['半導體業', '水泥工業', None]
+        r = market_screener.screen(f, None, industries=['半導體業'])
+        self.assertEqual([x['code'] for x in r['rows']], ['2330'])
+        r2 = market_screener.screen(f, None, industries=['半導體業', '水泥工業'])
+        self.assertEqual(sorted(x['code'] for x in r2['rows']), ['1102', '2330'])
+        # 不指定 = 不限產業
+        r3 = market_screener.screen(f, None, industries=None)
+        self.assertEqual(len(r3['rows']), 3)
+
+    def test_industry_missing_excluded_when_specified(self):
+        """產業別為空的個股,在「有指定產業」時不可混進來 (同空值不通過原則)。"""
+        f = self._fund()
+        f['Industry'] = ['半導體業', '水泥工業', None]
+        r = market_screener.screen(f, None, industries=['半導體業', '水泥工業'])
+        self.assertNotIn('9999', [x['code'] for x in r['rows']])
+
+    def test_industries_of_reads_actual_values(self):
+        f = self._fund()
+        f['Industry'] = ['半導體業', '水泥工業', '半導體業']
+        self.assertEqual(market_screener.industries_of(f), ['半導體業', '水泥工業'])
+        self.assertEqual(market_screener.industries_of(None), [])
+        self.assertEqual(market_screener.industries_of(pd.DataFrame()), [])
+
+    def test_result_row_carries_industry(self):
+        f = self._fund()
+        f['Industry'] = ['半導體業', '水泥工業', None]
+        r = market_screener.screen(f, None, industries=['半導體業'])
+        self.assertEqual(r['rows'][0]['industry'], '半導體業')
 
     def test_presets_are_all_valid(self):
         for name, preset in market_screener.PRESETS.items():

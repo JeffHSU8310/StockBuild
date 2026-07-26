@@ -11297,6 +11297,7 @@ class StockTradingAppPro(tk.Tk):
     SC_TPEX_BAL_TPL = 'https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap07_O_{v}'
     SC_REQUEST_INTERVAL = 1.0      # 禮貌節流,同 ADR-100 的精神
     SC_HISTORY_DAYS = 180          # 技術面需要的歷史深度 (約 120 個交易日)
+    SC_INDUSTRY_ALL = '全部產業'     # 【ADR-105】產業下拉的「不限」選項
 
     def _sc_http_json_retry(self, url, params=None, tries=3, timeout=45):
         """帶重試的 JSON 下載。回傳 (資料, 錯誤訊息);成功時錯誤訊息為 ''。
@@ -11348,6 +11349,15 @@ class StockTradingAppPro(tk.Tk):
         self.cb_sc_preset.pack(side=tk.LEFT)
         # 【重用】把「某個已存策略的進場條件」直接拿來掃全市場:策略編輯器
         # 已經有完整的條件 UI,選股不必再做一套一模一樣的編輯器。
+        # 【ADR-105】產業別下拉:選項在載入基本面後才填 (不寫死清單,見
+        # market_screener.industries_of 的說明)。
+        tk.Label(bar, text="產業:", bg="#1A2026", fg="#8A99AD",
+                 font=('微軟正黑體', 9)).pack(side=tk.LEFT, padx=(10, 2))
+        self.cb_sc_industry = ttk.Combobox(bar, values=[self.SC_INDUSTRY_ALL], width=12,
+                                           state="readonly", style='BlackText.TCombobox')
+        self.cb_sc_industry.set(self.SC_INDUSTRY_ALL)
+        self.cb_sc_industry.pack(side=tk.LEFT)
+
         tk.Label(bar, text="或用策略條件:", bg="#1A2026", fg="#8A99AD",
                  font=('微軟正黑體', 9)).pack(side=tk.LEFT, padx=(10, 2))
         self.cb_sc_strategy = ttk.Combobox(bar, values=['(不使用)'], width=18,
@@ -11381,12 +11391,14 @@ class StockTradingAppPro(tk.Tk):
 
         table = tk.Frame(parent, bg="#1A2026")
         table.pack(fill=tk.BOTH, expand=True, padx=4, pady=(2, 2))
-        cols = ('code', 'name', 'close', 'pe', 'pb', 'yield', 'eps', 'gm', 'yoy', 'roe', 'why')
-        heads = {'code': '代號', 'name': '名稱', 'close': '收盤', 'pe': '本益比',
-                 'pb': '淨值比', 'yield': '殖利率%', 'eps': 'EPS', 'gm': '毛利%',
-                 'yoy': '營收年增%', 'roe': 'ROE%', 'why': '符合條件'}
-        widths = {'code': 60, 'name': 90, 'close': 70, 'pe': 60, 'pb': 60, 'yield': 65,
-                  'eps': 60, 'gm': 60, 'yoy': 80, 'roe': 60, 'why': 320}
+        cols = ('code', 'name', 'industry', 'close', 'pe', 'pb', 'yield', 'eps',
+                'gm', 'yoy', 'roe', 'why')
+        heads = {'code': '代號', 'name': '名稱', 'industry': '產業', 'close': '收盤',
+                 'pe': '本益比', 'pb': '淨值比', 'yield': '殖利率%', 'eps': 'EPS',
+                 'gm': '毛利%', 'yoy': '營收年增%', 'roe': 'ROE%', 'why': '符合條件'}
+        widths = {'code': 60, 'name': 90, 'industry': 90, 'close': 70, 'pe': 60,
+                  'pb': 60, 'yield': 65, 'eps': 60, 'gm': 60, 'yoy': 80,
+                  'roe': 60, 'why': 260}
         self.tree_sc = ttk.Treeview(table, columns=cols, show="headings", height=5,
                                     style='Trades.Treeview')
         for c in cols:
@@ -11398,6 +11410,17 @@ class StockTradingAppPro(tk.Tk):
         self.tree_sc.configure(yscrollcommand=sb.set)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree_sc.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    def _sc_refresh_industries(self):
+        """【ADR-105】從本地基本面讀出實際有的產業別填進下拉。"""
+        try:
+            fund = market_store.load_fundamental(self.SCREENER_BASE_DIR)
+            names = [self.SC_INDUSTRY_ALL] + market_screener.industries_of(fund)
+            self.cb_sc_industry['values'] = names
+            if self.cb_sc_industry.get() not in names:
+                self.cb_sc_industry.set(self.SC_INDUSTRY_ALL)
+        except (tk.TclError, AttributeError):
+            pass
 
     def _sc_refresh_strategy_list(self):
         """把目前已存的策略名稱填進下拉 (切到分頁時更新)。"""
@@ -11610,6 +11633,7 @@ class StockTradingAppPro(tk.Tk):
             self.safe_after(0, self.log_message,
                             f"【選股】基本面已更新:{len(merged)} 檔 "
                             f"(有EPS {int(merged['EPS'].notna().sum())} 檔)。")
+            self.safe_after(0, self._sc_refresh_industries)
 
     # ---------------- 選股 ----------------
     def _sc_collect_fundamental_conds(self):
@@ -11649,10 +11673,12 @@ class StockTradingAppPro(tk.Tk):
         self.btn_sc_update.config(state=tk.DISABLED)
         self.btn_sc_run.config(state=tk.DISABLED)
         self.btn_sc_stop.config(state=tk.NORMAL)
-        threading.Thread(target=self._sc_screen_worker, args=(fund, conds, f_conds),
-                         daemon=True).start()
+        ind = self.cb_sc_industry.get()
+        industries = None if (not ind or ind == self.SC_INDUSTRY_ALL) else [ind]
+        threading.Thread(target=self._sc_screen_worker,
+                         args=(fund, conds, f_conds, industries), daemon=True).start()
 
-    def _sc_screen_worker(self, fund, conds, f_conds):
+    def _sc_screen_worker(self, fund, conds, f_conds, industries=None):
         try:
             end_iso = datetime.now().strftime('%Y-%m-%d')
             start_iso = (datetime.now() - timedelta(days=self.SC_HISTORY_DAYS)).strftime('%Y-%m-%d')
@@ -11673,7 +11699,7 @@ class StockTradingAppPro(tk.Tk):
             res = market_screener.screen(
                 fund, daily, conditions=conds, fundamental_conds=f_conds,
                 stock_chips=stock_chips, margin_chips=margin_chips,
-                to_ohlcv=market_store.to_ohlcv_frame,
+                to_ohlcv=market_store.to_ohlcv_frame, industries=industries,
                 progress_cb=_progress, should_stop=lambda: self._sc_cancel or self._closing)
             self._sc_rows = res['rows']
             self.safe_after(0, self._sc_fill_tree, res)
@@ -11695,7 +11721,7 @@ class StockTradingAppPro(tk.Tk):
         prepared = []
         for r in res['rows']:
             why = ' / '.join((r.get('matched') or []) + (r.get('fundamental_matched') or []))
-            prepared.append((r['code'], r['name'], _f(r['close']), _f(r['pe']),
+            prepared.append((r['code'], r['name'], r.get('industry', ''), _f(r['close']), _f(r['pe']),
                              _f(r['pb']), _f(r['yield']), _f(r['eps']),
                              _f(r['gross_margin'], 1), _f(r['revenue_yoy'], 1),
                              _f(r['roe'], 1), why[:120]))
@@ -11811,6 +11837,7 @@ class StockTradingAppPro(tk.Tk):
         # 【ADR-103】切到選股分頁時刷新可用的策略清單 (同樣不觸發下載)
         if key == "screener":
             self._sc_refresh_strategy_list()
+            self._sc_refresh_industries()
 
     # shioaji 委託回報的 action 是英文列舉字串,顯示與比對前先正規化成中文。
     _ACTION_DISPLAY_MAP = {'Buy': '買進', 'Sell': '賣出',
