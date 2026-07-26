@@ -45,9 +45,12 @@ from core import market_pattern
 from core import chips_parser
 from core import chips_features
 from core import volume_profile
+from core import fundamental_parser
+from core import market_screener
 from data import config_store
 from data import taifex_store
 from data import chips_store
+from data import market_store
 
 
 class TestTickRules(unittest.TestCase):
@@ -4420,6 +4423,249 @@ class TestVolumeProfile(unittest.TestCase):
         r = volume_profile.find_levels(self._concentrated(), asset_type='stock',
                                        raw_symbol='2330', max_levels=3)
         self.assertLessEqual(len(r['levels']), 3)
+
+
+class TestFundamentalParser(unittest.TestCase):
+    """【ADR-103】基本面解析。"""
+
+    def test_to_float_distinguishes_missing_from_zero(self):
+        """**最關鍵的一條**:本益比「-」代表虧損(沒有本益比),不可當成 0。
+
+        若當成 0,使用者設「本益比 <= 15」會把虧損公司全選進來——嚴重選股錯誤。
+        """
+        self.assertIsNone(fundamental_parser.to_float('-'))
+        self.assertIsNone(fundamental_parser.to_float('--'))
+        self.assertIsNone(fundamental_parser.to_float(''))
+        self.assertIsNone(fundamental_parser.to_float(None))
+        self.assertIsNone(fundamental_parser.to_float('N/A'))
+        self.assertEqual(fundamental_parser.to_float('0'), 0.0)
+        self.assertEqual(fundamental_parser.to_float('1,234.5'), 1234.5)
+        self.assertEqual(fundamental_parser.to_float('12.5%'), 12.5)
+
+    def test_is_listed_equity_filters_warrants(self):
+        for c in ('2330', '0050', '00878', '006208'):
+            self.assertTrue(fundamental_parser.is_listed_equity(c), c)
+        for c in ('030001', '073456', '2330A'):
+            self.assertFalse(fundamental_parser.is_listed_equity(c), c)
+
+    def test_parse_twse_valuation(self):
+        payload = {'stat': 'OK',
+                   'fields': ['證券代號', '證券名稱', '收盤價', '殖利率(%)', '股利年度',
+                              '本益比', '股價淨值比', '財報年/季'],
+                   'data': [['2330', '台積電', '2350.00', '1.20', 114, '31.59', '10.34', '115/1'],
+                            ['1101', '台泥', '23.80', '3.36', 114, '-', '0.76', '115/1'],
+                            ['030001', '某權證', '1.0', '0', 114, '5', '1', '115/1']]}
+        df = fundamental_parser.parse_twse_valuation(payload)
+        self.assertEqual(len(df), 2, "權證應被濾掉")
+        tsmc = df[df['Code'] == '2330'].iloc[0]
+        self.assertEqual(tsmc['PE'], 31.59)
+        self.assertEqual(tsmc['Close'], 2350.0)
+        cement = df[df['Code'] == '1101'].iloc[0]
+        self.assertTrue(pd.isna(cement['PE']), "本益比「-」應為空值而不是 0")
+
+    def test_parse_mi_index_picks_largest_table(self):
+        """MI_INDEX 有多張表,要挑「筆數最大且含收盤價」的那張,不可寫死索引。"""
+        payload = {'stat': 'OK', 'date': '20260724', 'tables': [
+            {'fields': ['指數', '收盤指數'], 'data': [['發行量加權股價指數', '20000']]},
+            {'fields': ['證券代號', '證券名稱', '成交股數', '成交筆數', '成交金額',
+                        '開盤價', '最高價', '最低價', '收盤價'],
+             'data': [['2330', '台積電', '1,000', '5', '100', '2375', '2395', '2290', '2290'],
+                      ['030001', '權證', '1', '1', '1', '1', '1', '1', '1']]},
+        ]}
+        df = fundamental_parser.parse_twse_mi_index(payload)
+        self.assertEqual(len(df), 1, "權證應被濾掉")
+        r = df.iloc[0]
+        self.assertEqual(r['Date'], '2026-07-24')
+        self.assertEqual(r['Close'], 2290.0)
+        self.assertEqual(r['Open'], 2375.0)
+
+    def test_parse_monthly_revenue_uses_official_yoy(self):
+        rows = [{'公司代號': '2330', '公司名稱': '台積電',
+                 '營業收入-當月營收': '100000',
+                 '營業收入-去年同月增減(%)': '67.87',
+                 '營業收入-上月比較增減(%)': '5.2'}]
+        df = fundamental_parser.parse_monthly_revenue(rows)
+        self.assertEqual(df.iloc[0]['RevenueYoYPct'], 67.87)
+        self.assertEqual(df.iloc[0]['RevenueMoMPct'], 5.2)
+
+    def test_parse_income_statement_computes_gross_margin(self):
+        rows = [{'公司代號': '2330', '營業收入': '1000', '營業毛利（毛損）淨額': '662.5',
+                 '基本每股盈餘（元）': '22.08'},
+                {'公司代號': '9999', '營業收入': '0', '營業毛利（毛損）淨額': '10',
+                 '基本每股盈餘（元）': '1'}]
+        df = fundamental_parser.parse_income_statement(rows)
+        a = df[df['Code'] == '2330'].iloc[0]
+        self.assertEqual(a['EPS'], 22.08)
+        self.assertAlmostEqual(a['GrossMarginPct'], 66.25, places=2)
+        b = df[df['Code'] == '9999'].iloc[0]
+        # pandas 會把數值欄的 None 存成 NaN,兩者都代表「無資料」;
+        # 關鍵是**不可以是 0** (0 會讓「毛利率 >= 0」這種條件誤判成通過)。
+        self.assertTrue(pd.isna(b['GrossMarginPct']),
+                        f"營收為 0 時毛利率應為空,實際 {b['GrossMarginPct']!r}")
+
+    def test_derive_eps_from_pe_is_exact_definition(self):
+        """EPS = 收盤價 ÷ 本益比,這是本益比的定義,不是估計。"""
+        self.assertAlmostEqual(fundamental_parser.derive_eps_from_pe(100.0, 10.0), 10.0)
+        self.assertIsNone(fundamental_parser.derive_eps_from_pe(100.0, 0),
+                          "本益比 0/負 (虧損) 不可推出 EPS")
+        self.assertIsNone(fundamental_parser.derive_eps_from_pe(None, 10.0))
+
+    def test_derive_roe(self):
+        # 每股淨值 = 100/2 = 50;ROE = 5/50 = 10%
+        self.assertAlmostEqual(fundamental_parser.derive_roe(5.0, 2.0, 100.0), 10.0)
+        self.assertIsNone(fundamental_parser.derive_roe(5.0, 0, 100.0))
+        self.assertIsNone(fundamental_parser.derive_roe(None, 2.0, 100.0))
+
+    def test_merge_fills_eps_from_pe_when_income_missing(self):
+        """上櫃沒有損益表端點,EPS 要能從 收盤價/本益比 補上。"""
+        val = pd.DataFrame([{'Code': '6488', 'Name': 'A', 'Close': 100.0,
+                             'PE': 10.0, 'PB': 2.0, 'YieldPct': 3.0}])
+        m = fundamental_parser.merge_fundamentals(valuation=val)
+        r = m.iloc[0]
+        self.assertAlmostEqual(float(r['EPS']), 10.0)
+        self.assertAlmostEqual(float(r['ROEPct']), 20.0)
+
+
+class TestMarketScreener(unittest.TestCase):
+    """【ADR-103】選股引擎。"""
+
+    def _fund(self):
+        return pd.DataFrame([
+            {'Code': '2330', 'Name': '台積電', 'Close': 2350.0, 'PE': 31.59, 'PB': 10.34,
+             'YieldPct': 1.2, 'EPS': 22.08, 'GrossMarginPct': 66.25,
+             'RevenueYoYPct': 67.9, 'RevenueMoMPct': 5.0, 'MonthRevenue': 1e6,
+             'Equity': 1e9, 'ROEPct': 9.72},
+            {'Code': '1102', 'Name': '亞泥', 'Close': 32.75, 'PE': 10.99, 'PB': 0.66,
+             'YieldPct': 7.02, 'EPS': 2.98, 'GrossMarginPct': 18.0,
+             'RevenueYoYPct': 3.0, 'RevenueMoMPct': 1.0, 'MonthRevenue': 1e5,
+             'Equity': 1e8, 'ROEPct': 6.0},
+            {'Code': '9999', 'Name': '虧損股', 'Close': 10.0, 'PE': None, 'PB': 0.5,
+             'YieldPct': 0.0, 'EPS': None, 'GrossMarginPct': None,
+             'RevenueYoYPct': -50.0, 'RevenueMoMPct': -10.0, 'MonthRevenue': 1e3,
+             'Equity': 1e6, 'ROEPct': None},
+        ])
+
+    def test_value_screen_picks_low_pe_high_yield(self):
+        r = market_screener.screen(
+            self._fund(), None,
+            fundamental_conds=[{'field': 'pe', 'op': market_screener.OP_LTE, 'value': 15},
+                               {'field': 'yield', 'op': market_screener.OP_GTE, 'value': 5}])
+        codes = [x['code'] for x in r['rows']]
+        self.assertEqual(codes, ['1102'])
+
+    def test_missing_value_never_passes(self):
+        """**最重要**:本益比為空(虧損)絕不可通過「本益比<=15」。
+
+        若把空值當成跳過,虧損股會被選進價值股清單——這是選股工具最嚴重的
+        錯誤類型,因為使用者會照著它下單。
+        """
+        r = market_screener.screen(
+            self._fund(), None,
+            fundamental_conds=[{'field': 'pe', 'op': market_screener.OP_LTE, 'value': 999}])
+        codes = [x['code'] for x in r['rows']]
+        self.assertNotIn('9999', codes, "本益比無資料的虧損股不可通過本益比條件")
+        self.assertIn('2330', codes)
+
+    def test_eval_fundamental_reports_reason(self):
+        row = self._fund().iloc[0]
+        ok, why = market_screener.eval_fundamental(
+            row, [{'field': 'pe', 'op': market_screener.OP_LTE, 'value': 10}])
+        self.assertFalse(ok)
+        self.assertIn('本益比', why)
+        ok2, _ = market_screener.eval_fundamental(
+            row, [{'field': 'pe', 'op': market_screener.OP_LTE, 'value': 40}])
+        self.assertTrue(ok2)
+
+    def test_technical_conditions_reuse_strategy_engine(self):
+        """技術面直接重用 strategy_engine.CONDITIONS,語意與策略完全一致。"""
+        idx = pd.date_range('2026-01-01', periods=60, freq='B')
+        rising = pd.DataFrame({'Open': 1.0, 'High': 1.0, 'Low': 1.0,
+                               'Close': np.arange(60, dtype=float) + 100,
+                               'Volume': 1000.0}, index=idx)
+        daily = pd.DataFrame([{'Date': d.strftime('%Y-%m-%d'), 'Code': '2330',
+                               'Name': 'A', 'Open': c, 'High': c, 'Low': c,
+                               'Close': c, 'Volume': 1000.0}
+                              for d, c in zip(idx, rising['Close'])])
+        r = market_screener.screen(
+            self._fund(), daily,
+            conditions=[{'type': 'price_above_ma', 'params': {'n': 20, 'kind': 'SMA'}}],
+            fundamental_conds=[],
+            to_ohlcv=market_store.to_ohlcv_frame)
+        self.assertIn('2330', [x['code'] for x in r['rows']],
+                      "持續上漲的股票應通過「站上20MA」")
+
+    def test_should_stop_aborts_scan(self):
+        r = market_screener.screen(
+            self._fund(), pd.DataFrame([{'Date': '2026-01-01', 'Code': '2330', 'Name': 'A',
+                                         'Open': 1, 'High': 1, 'Low': 1, 'Close': 1,
+                                         'Volume': 1}]),
+            conditions=[{'type': 'ma_cross_up', 'params': {}}],
+            to_ohlcv=market_store.to_ohlcv_frame,
+            should_stop=lambda: True)
+        self.assertTrue(any('中止' in e[0] for e in r['errors']))
+
+    def test_presets_are_all_valid(self):
+        for name, preset in market_screener.PRESETS.items():
+            for c in preset.get('conditions', []):
+                self.assertIn(c['type'], strategy_engine.CONDITIONS,
+                              f"範本「{name}」用了不存在的條件 {c['type']}")
+            for f in preset.get('fundamental', []):
+                self.assertIn(f['field'], market_screener.FUNDAMENTAL_FIELDS,
+                              f"範本「{name}」用了不存在的基本面欄位 {f['field']}")
+                self.assertIn(f['op'], market_screener.OPS)
+
+
+class TestMarketStore(unittest.TestCase):
+    """【ADR-103】全市場資料儲存。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def _daily(self, date, code='2330', close=100.0):
+        return pd.DataFrame([{'Date': date, 'Code': code, 'Name': 'A', 'Open': close,
+                              'High': close, 'Low': close, 'Close': close, 'Volume': 1000.0}])
+
+    def test_upsert_daily_is_idempotent_per_date_code(self):
+        market_store.upsert_daily(self.tmp, self._daily('2026-07-24', close=100))
+        market_store.upsert_daily(self.tmp, self._daily('2026-07-24', close=999))
+        df = market_store.load(market_store.daily_path(self.tmp, '2026-07-24'))
+        self.assertEqual(len(df), 1)
+        self.assertEqual(float(df.iloc[0]['Close']), 999.0, "同日同股應被覆蓋")
+
+    def test_upsert_daily_splits_by_month(self):
+        market_store.upsert_daily(self.tmp, self._daily('2026-06-30'))
+        market_store.upsert_daily(self.tmp, self._daily('2026-07-01'))
+        self.assertIsNotNone(market_store.load(market_store.daily_path(self.tmp, '2026-06-01')))
+        self.assertIsNotNone(market_store.load(market_store.daily_path(self.tmp, '2026-07-01')))
+
+    def test_available_daily_dates_supports_incremental(self):
+        for d in ('2026-07-23', '2026-07-24'):
+            market_store.upsert_daily(self.tmp, self._daily(d))
+        got = market_store.available_daily_dates(self.tmp, '2026-07-01', '2026-07-31')
+        self.assertEqual(got, {'2026-07-23', '2026-07-24'})
+
+    def test_to_ohlcv_frame_builds_indexed_series(self):
+        rows = pd.concat([self._daily(f'2026-07-{d:02d}', close=100 + d) for d in (20, 21, 22)],
+                         ignore_index=True)
+        market_store.upsert_daily(self.tmp, rows)
+        daily = market_store.load_daily_range(self.tmp, '2026-07-01', '2026-07-31')
+        ohlcv = market_store.to_ohlcv_frame(daily, '2330')
+        self.assertEqual(len(ohlcv), 3)
+        self.assertIsInstance(ohlcv.index, pd.DatetimeIndex)
+        self.assertEqual(float(ohlcv['Close'].iloc[-1]), 122.0)
+        self.assertIsNone(market_store.to_ohlcv_frame(daily, '9999'))
+
+    def test_code_leading_zeros_preserved(self):
+        market_store.upsert_daily(self.tmp, self._daily('2026-07-24', code='0050'))
+        df = market_store.load(market_store.daily_path(self.tmp, '2026-07-24'))
+        self.assertIn('0050', set(df['Code'].astype(str)))
+
+    def test_fundamental_snapshot_roundtrip(self):
+        f = pd.DataFrame([{'Code': '2330', 'Name': '台積電', 'PE': 31.59}])
+        market_store.save_fundamental(self.tmp, f)
+        got = market_store.load_fundamental(self.tmp)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got.iloc[0]['Code'], '2330')
 
 
 if __name__ == "__main__":

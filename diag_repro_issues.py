@@ -1986,6 +1986,89 @@ def _sr_levels_drawn_on_chart():
 
 run_case("ADR-102: 量價支撐壓力畫線/壓力紅支撐綠/兩種區間/失敗不影響K線", _sr_levels_drawn_on_chart)
 
+
+def _screener_end_to_end():
+    """【ADR-103】選股:切分頁不下載、基本面門檻生效、虧損股不可通過本益比條件、
+    技術面重用策略條件、結果可填表。"""
+    import tempfile as _tf
+    import pandas as _pd
+    import numpy as _np
+    from data import market_store as _mkt
+
+    net = []
+    orig_json = app._chips_http_json
+    old_base = app.SCREENER_BASE_DIR
+    tmp = _tf.mkdtemp()
+    try:
+        app._chips_http_json = lambda *a, **k: net.append('json')
+        app.SCREENER_BASE_DIR = tmp
+
+        app.set_bottom_tab("screener")
+        assert not net, f"切到選股分頁不應發出網路請求,實際 {net}"
+
+        # 準備基本面:一檔好股、一檔虧損股(本益比無資料)
+        fund = _pd.DataFrame([
+            {'Code': '2330', 'Name': '台積電', 'Close': 100.0, 'PE': 12.0, 'PB': 1.2,
+             'YieldPct': 6.0, 'EPS': 8.0, 'GrossMarginPct': 50.0, 'RevenueYoYPct': 30.0,
+             'RevenueMoMPct': 1.0, 'MonthRevenue': 1.0, 'Equity': 1.0, 'ROEPct': 12.0},
+            {'Code': '9999', 'Name': '虧損股', 'Close': 10.0, 'PE': None, 'PB': 0.5,
+             'YieldPct': 0.0, 'EPS': None, 'GrossMarginPct': None, 'RevenueYoYPct': -10.0,
+             'RevenueMoMPct': 0.0, 'MonthRevenue': 1.0, 'Equity': 1.0, 'ROEPct': None},
+        ])
+        _mkt.save_fundamental(tmp, fund)
+
+        # 全市場日K:2330 持續上漲
+        idx = _pd.date_range('2026-01-01', periods=60, freq='B')
+        rows = []
+        for i, d in enumerate(idx):
+            c = 100.0 + i
+            rows.append({'Date': d.strftime('%Y-%m-%d'), 'Code': '2330', 'Name': '台積電',
+                         'Open': c, 'High': c, 'Low': c, 'Close': c, 'Volume': 1000.0})
+        _mkt.upsert_daily(tmp, _pd.DataFrame(rows))
+
+        # 只用基本面:本益比<=15 → 虧損股(無本益比)絕不可入選
+        app._sc_entries['pe'][0].delete(0, 'end'); app._sc_entries['pe'][0].insert(0, '15')
+        conds = app._sc_collect_fundamental_conds()
+        assert conds and conds[0]['field'] == 'pe', f"應收集到本益比條件,實際 {conds}"
+        from core import market_screener as _ms
+        res = _ms.screen(fund, None, fundamental_conds=conds)
+        codes = [r['code'] for r in res['rows']]
+        assert '2330' in codes, "符合條件的股票應入選"
+        assert '9999' not in codes, "本益比無資料的虧損股絕不可通過本益比條件"
+
+        # 技術面:重用策略引擎條件
+        daily = _mkt.load_daily_range(tmp, '2026-01-01', '2026-12-31')
+        assert daily is not None and len(daily) == 60, "日K應可讀回"
+        res2 = _ms.screen(fund, daily,
+                          conditions=[{'type': 'price_above_ma',
+                                       'params': {'n': 20, 'kind': 'SMA'}}],
+                          fundamental_conds=[],
+                          to_ohlcv=_mkt.to_ohlcv_frame)
+        assert '2330' in [r['code'] for r in res2['rows']], "持續上漲應通過站上20MA"
+
+        # 填表
+        app._sc_fill_tree(res2)
+        assert len(app.tree_sc.get_children()) == len(res2['rows']), "結果應填入表格"
+
+        # 範本都要是有效條件
+        for name, p in _ms.PRESETS.items():
+            for c in p.get('conditions', []):
+                assert c['type'] in stock_app_pro.strategy_engine.CONDITIONS, \
+                    f"範本 {name} 用了不存在的條件"
+
+        assert not net, "整個選股流程都不該發出網路請求 (資料來自本地)"
+    finally:
+        app._chips_http_json = orig_json
+        app.SCREENER_BASE_DIR = old_base
+        try:
+            app._sc_entries['pe'][0].delete(0, 'end')
+        except Exception:
+            pass
+        app.set_bottom_tab("log")
+
+
+run_case("ADR-103: 選股/基本面門檻/虧損股不誤選/技術面重用/切頁不下載", _screener_end_to_end)
+
 print(f"{'案例':60s} 結果")
 print("-" * 76)
 for name, st, msg in results:

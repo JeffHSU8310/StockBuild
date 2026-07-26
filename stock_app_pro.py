@@ -50,6 +50,10 @@ from core import chips_parser
 from core import chips_features
 # 【ADR-102】量價關係推算支撐/壓力點位 (Volume Profile)。
 from core import volume_profile
+# 【ADR-103】全方位選股:基本面解析 + 全市場篩選引擎 + 全市場資料儲存。
+from core import fundamental_parser
+from core import market_screener
+from data import market_store
 from data import config_store
 from data import taifex_store
 from data import chips_store
@@ -1320,7 +1324,7 @@ class StockTradingAppPro(tk.Tk):
         bottom_tab_bar = tk.Frame(log_outer, bg="#1A2026")
         bottom_tab_bar.pack(fill=tk.X, side=tk.TOP)
         self.bottom_tab_buttons = {}
-        for key, label in [("log", "系統日誌與回報"), ("orders", "我的委託單"), ("fills", "我的已成交"), ("positions", "我的庫存"), ("quant", "量化交易"), ("chips", "籌碼")]:
+        for key, label in [("log", "系統日誌與回報"), ("orders", "我的委託單"), ("fills", "我的已成交"), ("positions", "我的庫存"), ("quant", "量化交易"), ("chips", "籌碼"), ("screener", "選股")]:
             btn = tk.Button(bottom_tab_bar, text=label, font=('微軟正黑體', 9, 'bold'), relief="flat",
                              command=lambda k=key: self.set_bottom_tab(k))
             btn.pack(side=tk.LEFT, padx=(2, 0), pady=1)
@@ -1426,6 +1430,10 @@ class StockTradingAppPro(tk.Tk):
         # --- 分頁6:籌碼 (ADR-100) ---
         self.chips_tab_frame = tk.Frame(self.bottom_content_frame, bg="#1A2026")
         self._build_chips_panel(self.chips_tab_frame)
+
+        # --- 分頁7:選股 (ADR-103) ---
+        self.screener_tab_frame = tk.Frame(self.bottom_content_frame, bg="#1A2026")
+        self._build_screener_panel(self.screener_tab_frame)
 
         self.bottom_tab = "log"
         self.set_bottom_tab("log")
@@ -11250,6 +11258,368 @@ class StockTradingAppPro(tk.Tk):
         if self.current_df is not None:
             self.draw_chart(self.current_df)
 
+    # ======================================================================
+    # 【ADR-103】全方位選股
+    #
+    # 資料全部來自官方免費 API,**完全不動用 shioaji**:全市場 1900+ 檔若
+    # 逐檔打 kbars 會直接撞上鐵則 5 的 API 配額上限。改用「一次拿全市場」
+    # 的端點,每天只要 4~5 次請求。
+    #
+    # 技術面/籌碼面條件直接重用 strategy_engine.CONDITIONS——使用者在策略裡
+    # 熟悉的條件,選股時是完全相同的語意 (見 core/market_screener 說明)。
+    # ======================================================================
+    SCREENER_BASE_DIR = APP_DIR
+    SC_TWSE_MI_URL = 'https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX'
+    SC_TWSE_VAL_URL = 'https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU_d'
+    SC_TWSE_REV_URL = 'https://openapi.twse.com.tw/v1/opendata/t187ap05_L'
+    SC_TWSE_INC_URL = 'https://openapi.twse.com.tw/v1/opendata/t187ap06_L_ci'
+    SC_TWSE_BAL_URL = 'https://openapi.twse.com.tw/v1/opendata/t187ap07_L_ci'
+    SC_TPEX_VAL_URL = 'https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis'
+    SC_TPEX_REV_URL = 'https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O'
+    SC_TPEX_QUOTE_URL = 'https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes'
+    SC_REQUEST_INTERVAL = 1.0      # 禮貌節流,同 ADR-100 的精神
+    SC_HISTORY_DAYS = 180          # 技術面需要的歷史深度 (約 120 個交易日)
+
+    def _build_screener_panel(self, parent):
+        self._sc_running = False
+        self._sc_cancel = False
+        self._sc_rows = []
+
+        bar = tk.Frame(parent, bg="#1A2026")
+        bar.pack(side=tk.TOP, fill=tk.X, padx=4, pady=(2, 0))
+        self.btn_sc_update = tk.Button(
+            bar, text="⬇ 更新全市場資料", bg="#00C853", fg="black", relief="flat",
+            font=('微軟正黑體', 9, 'bold'), padx=8, pady=2, command=self._sc_start_update)
+        self.btn_sc_update.pack(side=tk.LEFT)
+        self.btn_sc_run = tk.Button(
+            bar, text="🔍 開始選股", bg="#29B6F6", fg="black", relief="flat",
+            font=('微軟正黑體', 9, 'bold'), padx=8, pady=2, command=self._sc_start_screen)
+        self.btn_sc_run.pack(side=tk.LEFT, padx=4)
+        self.btn_sc_stop = tk.Button(
+            bar, text="■ 停止", bg="#2A323D", fg="white", relief="flat",
+            font=('微軟正黑體', 9, 'bold'), padx=8, pady=2,
+            state=tk.DISABLED, command=self._sc_stop)
+        self.btn_sc_stop.pack(side=tk.LEFT)
+
+        tk.Label(bar, text="範本:", bg="#1A2026", fg="#8A99AD",
+                 font=('微軟正黑體', 9)).pack(side=tk.LEFT, padx=(10, 2))
+        self.cb_sc_preset = ttk.Combobox(bar, values=list(market_screener.PRESETS.keys()),
+                                         width=24, state="readonly", style='BlackText.TCombobox')
+        self.cb_sc_preset.set(list(market_screener.PRESETS.keys())[0])
+        self.cb_sc_preset.pack(side=tk.LEFT)
+        # 【重用】把「某個已存策略的進場條件」直接拿來掃全市場:策略編輯器
+        # 已經有完整的條件 UI,選股不必再做一套一模一樣的編輯器。
+        tk.Label(bar, text="或用策略條件:", bg="#1A2026", fg="#8A99AD",
+                 font=('微軟正黑體', 9)).pack(side=tk.LEFT, padx=(10, 2))
+        self.cb_sc_strategy = ttk.Combobox(bar, values=['(不使用)'], width=18,
+                                           state="readonly", style='BlackText.TCombobox')
+        self.cb_sc_strategy.set('(不使用)')
+        self.cb_sc_strategy.pack(side=tk.LEFT)
+
+        self.lbl_sc_status = tk.Label(bar, text="", bg="#1A2026", fg="#8A99AD",
+                                      font=('微軟正黑體', 9), anchor="w")
+        self.lbl_sc_status.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
+
+        # 基本面門檻:留空代表「不設這個條件」
+        fbar = tk.Frame(parent, bg="#1A2026")
+        fbar.pack(side=tk.TOP, fill=tk.X, padx=4, pady=(2, 0))
+        tk.Label(fbar, text="基本面門檻 (留空=不限):", bg="#1A2026", fg="#FFCA28",
+                 font=('微軟正黑體', 9, 'bold')).pack(side=tk.LEFT)
+        self._sc_entries = {}
+        for key, op, label in (('pe', market_screener.OP_LTE, '本益比≤'),
+                               ('pb', market_screener.OP_LTE, '淨值比≤'),
+                               ('yield', market_screener.OP_GTE, '殖利率≥'),
+                               ('eps', market_screener.OP_GTE, 'EPS≥'),
+                               ('gross_margin', market_screener.OP_GTE, '毛利率≥'),
+                               ('revenue_yoy', market_screener.OP_GTE, '營收年增≥'),
+                               ('roe', market_screener.OP_GTE, 'ROE≥')):
+            tk.Label(fbar, text=label, bg="#1A2026", fg="#8A99AD",
+                     font=('微軟正黑體', 9)).pack(side=tk.LEFT, padx=(8, 1))
+            e = tk.Entry(fbar, bg="#2A323D", fg="white", width=5, justify="center",
+                         insertbackground="white")
+            e.pack(side=tk.LEFT)
+            self._sc_entries[key] = (e, op)
+
+        table = tk.Frame(parent, bg="#1A2026")
+        table.pack(fill=tk.BOTH, expand=True, padx=4, pady=(2, 2))
+        cols = ('code', 'name', 'close', 'pe', 'pb', 'yield', 'eps', 'gm', 'yoy', 'roe', 'why')
+        heads = {'code': '代號', 'name': '名稱', 'close': '收盤', 'pe': '本益比',
+                 'pb': '淨值比', 'yield': '殖利率%', 'eps': 'EPS', 'gm': '毛利%',
+                 'yoy': '營收年增%', 'roe': 'ROE%', 'why': '符合條件'}
+        widths = {'code': 60, 'name': 90, 'close': 70, 'pe': 60, 'pb': 60, 'yield': 65,
+                  'eps': 60, 'gm': 60, 'yoy': 80, 'roe': 60, 'why': 320}
+        self.tree_sc = ttk.Treeview(table, columns=cols, show="headings", height=5,
+                                    style='Trades.Treeview')
+        for c in cols:
+            self.tree_sc.heading(c, text=heads[c])
+            self.tree_sc.column(c, width=widths[c], anchor="center")
+        self.tree_sc.tag_configure('visible_row', foreground='#FFFFFF', background='#12161A')
+        self.tree_sc.bind("<Double-1>", self._sc_on_row_double_click)
+        sb = tk.Scrollbar(table, orient=tk.VERTICAL, command=self.tree_sc.yview)
+        self.tree_sc.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree_sc.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    def _sc_refresh_strategy_list(self):
+        """把目前已存的策略名稱填進下拉 (切到分頁時更新)。"""
+        try:
+            names = ['(不使用)'] + [str(s.get('name')) for s in (self.strategies or [])
+                                    if s.get('entry')]
+            self.cb_sc_strategy['values'] = names
+            if self.cb_sc_strategy.get() not in names:
+                self.cb_sc_strategy.set('(不使用)')
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _sc_set_status(self, msg):
+        try:
+            self.lbl_sc_status.config(text=msg)
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _sc_set_idle(self):
+        try:
+            self.btn_sc_update.config(state=tk.NORMAL)
+            self.btn_sc_run.config(state=tk.NORMAL)
+            self.btn_sc_stop.config(state=tk.DISABLED)
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _sc_stop(self):
+        self._sc_cancel = True
+        self._sc_set_status("停止中 ...")
+
+    # ---------------- 下載 ----------------
+    def _sc_start_update(self):
+        if self._sc_running:
+            return
+        self._sc_running = True
+        self._sc_cancel = False
+        self.btn_sc_update.config(state=tk.DISABLED)
+        self.btn_sc_run.config(state=tk.DISABLED)
+        self.btn_sc_stop.config(state=tk.NORMAL)
+        threading.Thread(target=self._sc_update_worker, daemon=True).start()
+
+    def _sc_update_worker(self):
+        """背景執行緒:補齊全市場日K歷史 + 更新基本面快照。
+
+        日K 用 MI_INDEX 逐日抓 (它吃 date 參數,可回補歷史;STOCK_DAY_ALL
+        只有當日,建不出技術面需要的歷史)。已抓過的日期會跳過 (同 ADR-100
+        的不重抓機制)。
+        """
+        try:
+            end_dt = datetime.now()
+            start_dt = end_dt - timedelta(days=self.SC_HISTORY_DAYS)
+            have = market_store.available_daily_dates(
+                self.SCREENER_BASE_DIR, start_dt.strftime('%Y-%m-%d'),
+                end_dt.strftime('%Y-%m-%d'))
+            days, cur = [], start_dt
+            while cur <= end_dt:
+                if cur.weekday() < 5 and cur.strftime('%Y-%m-%d') not in have:
+                    days.append(cur)
+                cur += timedelta(days=1)
+            self.safe_after(0, self.log_message,
+                            f"【選股】開始更新:{len(days)} 個交易日待抓 "
+                            f"(預估約 {len(days) * self.SC_REQUEST_INTERVAL / 60:.0f} 分鐘)。")
+            ok_days = 0
+            for i, day in enumerate(days, 1):
+                if self._closing or self._sc_cancel:
+                    self.safe_after(0, self.log_message, f"【選股】已中止 (完成 {i - 1}/{len(days)})。")
+                    break
+                self.safe_after(0, self._sc_set_status, f"下載日K {i}/{len(days)}:{day:%Y-%m-%d} ...")
+                try:
+                    payload = self._chips_http_json(
+                        self.SC_TWSE_MI_URL,
+                        {'date': day.strftime('%Y%m%d'), 'type': 'ALLBUT0999', 'response': 'json'})
+                    df = fundamental_parser.parse_twse_mi_index(
+                        payload, date_iso=day.strftime('%Y-%m-%d'))
+                    if not df.empty:
+                        market_store.upsert_daily(self.SCREENER_BASE_DIR, df)
+                        ok_days += 1
+                except Exception:
+                    pass          # 單日失敗不中斷整批 (假日/官方暫時性錯誤很常見)
+                time.sleep(self.SC_REQUEST_INTERVAL)
+
+            # 基本面快照 (每次更新都整批重抓:它是「現在的值」,不保留歷史)
+            if not (self._closing or self._sc_cancel):
+                self.safe_after(0, self._sc_set_status, "下載基本面 ...")
+                self._sc_update_fundamental()
+            self.safe_after(0, self.log_message, f"【選股】更新完成:{ok_days} 個交易日日K已入庫。")
+            self.safe_after(0, self._sc_set_status, f"完成 ({ok_days} 日)")
+        except Exception as e:
+            self.safe_after(0, self.log_message, f"【選股】更新失敗:{type(e).__name__}: {e}")
+        finally:
+            self._sc_running = False
+            self.safe_after(0, self._sc_set_idle)
+
+    def _sc_update_fundamental(self):
+        """抓五個基本面來源並合併存檔。每個來源獨立 try (鐵則8)。"""
+        def _get(url, params=None):
+            return self._chips_http_json(url, params or {})
+        val = rev = inc = bal = None
+        daily = market_store.load_daily_range(
+            self.SCREENER_BASE_DIR,
+            (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d'),
+            datetime.now().strftime('%Y-%m-%d'))
+        if daily is not None and not daily.empty:
+            latest = daily['Date'].astype(str).max()
+            daily = daily[daily['Date'].astype(str) == latest]
+        parts_v, parts_r, parts_b = [], [], []
+        for name, fn in (
+            ('上市估值', lambda: fundamental_parser.parse_twse_valuation(
+                _get(self.SC_TWSE_VAL_URL, {'date': datetime.now().strftime('%Y%m%d'),
+                                            'selectType': 'ALL', 'response': 'json'}))),
+            ('上櫃估值', lambda: fundamental_parser.parse_tpex_valuation(_get(self.SC_TPEX_VAL_URL))),
+        ):
+            try:
+                d = fn()
+                if d is not None and not d.empty:
+                    parts_v.append(d)
+            except Exception as e:
+                self.safe_after(0, self.log_message, f"【選股】{name}下載失敗:{e}")
+            time.sleep(self.SC_REQUEST_INTERVAL)
+        for name, url in (('上市月營收', self.SC_TWSE_REV_URL), ('上櫃月營收', self.SC_TPEX_REV_URL)):
+            try:
+                d = fundamental_parser.parse_monthly_revenue(_get(url))
+                if d is not None and not d.empty:
+                    parts_r.append(d)
+            except Exception as e:
+                self.safe_after(0, self.log_message, f"【選股】{name}下載失敗:{e}")
+            time.sleep(self.SC_REQUEST_INTERVAL)
+        try:
+            inc = fundamental_parser.parse_income_statement(_get(self.SC_TWSE_INC_URL))
+        except Exception as e:
+            self.safe_after(0, self.log_message, f"【選股】損益表下載失敗:{e}")
+        time.sleep(self.SC_REQUEST_INTERVAL)
+        try:
+            bal = fundamental_parser.parse_balance_sheet(_get(self.SC_TWSE_BAL_URL))
+        except Exception as e:
+            self.safe_after(0, self.log_message, f"【選股】資產負債表下載失敗:{e}")
+
+        val = pd.concat(parts_v, ignore_index=True) if parts_v else None
+        rev = pd.concat(parts_r, ignore_index=True) if parts_r else None
+        merged = fundamental_parser.merge_fundamentals(
+            valuation=val, revenue=rev, income=inc, balance=bal, daily=daily)
+        if merged is not None and not merged.empty:
+            market_store.save_fundamental(self.SCREENER_BASE_DIR, merged)
+            self.safe_after(0, self.log_message,
+                            f"【選股】基本面已更新:{len(merged)} 檔 "
+                            f"(有EPS {int(merged['EPS'].notna().sum())} 檔)。")
+
+    # ---------------- 選股 ----------------
+    def _sc_collect_fundamental_conds(self):
+        """讀取基本面輸入框;留空=不設該條件。"""
+        out = []
+        for key, (entry, op) in self._sc_entries.items():
+            txt = (entry.get() or '').strip()
+            if not txt:
+                continue
+            try:
+                out.append({'field': key, 'op': op, 'value': float(txt)})
+            except ValueError:
+                self.log_message(f"【選股】{key} 門檻「{txt}」不是有效數字,已略過此條件。")
+        return out
+
+    def _sc_start_screen(self):
+        if self._sc_running:
+            return
+        fund = market_store.load_fundamental(self.SCREENER_BASE_DIR)
+        if fund is None or fund.empty:
+            messagebox.showwarning("選股", "本地尚無基本面資料。\n請先按「⬇ 更新全市場資料」下載。")
+            return
+        preset = market_screener.PRESETS.get(self.cb_sc_preset.get(), {})
+        conds = list(preset.get('conditions') or [])
+        f_conds = self._sc_collect_fundamental_conds()
+        if not f_conds:
+            f_conds = list(preset.get('fundamental') or [])
+        # 若選了策略,改用該策略的進場條件 (取代範本的技術條件)
+        sname = self.cb_sc_strategy.get()
+        if sname and sname != '(不使用)':
+            st = next((s for s in (self.strategies or []) if str(s.get('name')) == sname), None)
+            if st and st.get('entry'):
+                conds = list(st['entry'])
+                self.log_message(f"【選股】使用策略「{sname}」的 {len(conds)} 個進場條件掃描全市場。")
+        self._sc_running = True
+        self._sc_cancel = False
+        self.btn_sc_update.config(state=tk.DISABLED)
+        self.btn_sc_run.config(state=tk.DISABLED)
+        self.btn_sc_stop.config(state=tk.NORMAL)
+        threading.Thread(target=self._sc_screen_worker, args=(fund, conds, f_conds),
+                         daemon=True).start()
+
+    def _sc_screen_worker(self, fund, conds, f_conds):
+        try:
+            end_iso = datetime.now().strftime('%Y-%m-%d')
+            start_iso = (datetime.now() - timedelta(days=self.SC_HISTORY_DAYS)).strftime('%Y-%m-%d')
+            daily = None
+            if conds:
+                self.safe_after(0, self._sc_set_status, "載入全市場日K ...")
+                daily = market_store.load_daily_range(self.SCREENER_BASE_DIR, start_iso, end_iso)
+                if daily is None:
+                    self.safe_after(0, self.log_message,
+                                    "【選股】本地沒有全市場日K,技術面條件無法評估;"
+                                    "請先按「更新全市場資料」。")
+            stock_chips = chips_store.load_stock_inst_range(self.CHIPS_BASE_DIR, start_iso, end_iso)
+            margin_chips = chips_store.load(chips_store.margin_path(self.CHIPS_BASE_DIR))
+
+            def _progress(i, total):
+                self.safe_after(0, self._sc_set_status, f"篩選中 {i}/{total} ...")
+
+            res = market_screener.screen(
+                fund, daily, conditions=conds, fundamental_conds=f_conds,
+                stock_chips=stock_chips, margin_chips=margin_chips,
+                to_ohlcv=market_store.to_ohlcv_frame,
+                progress_cb=_progress, should_stop=lambda: self._sc_cancel or self._closing)
+            self._sc_rows = res['rows']
+            self.safe_after(0, self._sc_fill_tree, res)
+        except Exception as e:
+            self.safe_after(0, self.log_message, f"【選股】執行失敗:{type(e).__name__}: {e}")
+        finally:
+            self._sc_running = False
+            self.safe_after(0, self._sc_set_idle)
+
+    def _sc_fill_tree(self, res):
+        """【P-31】先備妥再刪再插。"""
+        def _f(v, nd=2):
+            if v is None:
+                return '--'
+            try:
+                return f"{float(v):.{nd}f}"
+            except (TypeError, ValueError):
+                return str(v)
+        prepared = []
+        for r in res['rows']:
+            why = ' / '.join((r.get('matched') or []) + (r.get('fundamental_matched') or []))
+            prepared.append((r['code'], r['name'], _f(r['close']), _f(r['pe']),
+                             _f(r['pb']), _f(r['yield']), _f(r['eps']),
+                             _f(r['gross_margin'], 1), _f(r['revenue_yoy'], 1),
+                             _f(r['roe'], 1), why[:120]))
+        try:
+            for i in self.tree_sc.get_children():
+                self.tree_sc.delete(i)
+            for vals in prepared:
+                self.tree_sc.insert("", "end", values=vals, tags=('visible_row',))
+        except (tk.TclError, AttributeError):
+            pass
+        msg = f"掃描 {res['scanned']} 檔 → 符合 {res['passed']} 檔"
+        self._sc_set_status(msg)
+        self.log_message(f"【選股】{msg}")
+        for label, why in (res.get('errors') or [])[:3]:
+            self.log_message(f"【選股-提醒】{label}: {why}")
+
+    def _sc_on_row_double_click(self, event=None):
+        """雙擊結果列 → 直接把該股帶到主圖查詢 (選完股馬上看線圖)。"""
+        try:
+            sel = self.tree_sc.focus() or (self.tree_sc.selection() or [None])[0]
+            if not sel:
+                return
+            code = str(self.tree_sc.item(sel, 'values')[0])
+            self.entry_symbol.delete(0, tk.END)
+            self.entry_symbol.insert(0, code)
+            self.start_fetch_thread()
+        except (tk.TclError, AttributeError, IndexError):
+            pass
+
     def _live_bar_reset_artists(self):
         """draw_chart 後重建活K棒 artists (舊 axes 已被銷毀)。在主執行緒呼叫。"""
         self._live_bar_artists = None
@@ -11312,11 +11682,13 @@ class StockTradingAppPro(tk.Tk):
         """切換底部分頁:系統日誌/我的委託單/我的已成交/我的庫存/量化/籌碼。"""
         self.bottom_tab = key
         for frame in (self.log_tab_frame, self.orders_tab_frame, self.fills_tab_frame,
-                      self.positions_tab_frame, self.quant_tab_frame, self.chips_tab_frame):
+                      self.positions_tab_frame, self.quant_tab_frame, self.chips_tab_frame,
+                      self.screener_tab_frame):
             frame.pack_forget()
         {"log": self.log_tab_frame, "orders": self.orders_tab_frame,
          "fills": self.fills_tab_frame, "positions": self.positions_tab_frame,
-         "quant": self.quant_tab_frame, "chips": self.chips_tab_frame}[key].pack(fill=tk.BOTH, expand=True)
+         "quant": self.quant_tab_frame, "chips": self.chips_tab_frame,
+         "screener": self.screener_tab_frame}[key].pack(fill=tk.BOTH, expand=True)
         for k, btn in self.bottom_tab_buttons.items():
             if k == key: btn.config(bg="#29B6F6", fg="black")
             else: btn.config(bg="#2A323D", fg="white")
@@ -11331,6 +11703,9 @@ class StockTradingAppPro(tk.Tk):
         # 下載一律由使用者按「更新籌碼」明確發動,避免切分頁就打官方網站)
         if key == "chips":
             self._chips_refresh_view()
+        # 【ADR-103】切到選股分頁時刷新可用的策略清單 (同樣不觸發下載)
+        if key == "screener":
+            self._sc_refresh_strategy_list()
 
     # shioaji 委託回報的 action 是英文列舉字串,顯示與比對前先正規化成中文。
     _ACTION_DISPLAY_MAP = {'Buy': '買進', 'Sell': '賣出',
