@@ -46,6 +46,8 @@ from core import telegram_notify
 from core import market_pattern
 # 【ADR-100】籌碼資料:解析純邏輯在 core/,本地 CSV 存取在 data/。
 from core import chips_parser
+# 【ADR-101】籌碼併進策略 df (含未來函數防護)。
+from core import chips_features
 from data import config_store
 from data import taifex_store
 from data import chips_store
@@ -6994,7 +6996,55 @@ class StockTradingAppPro(tk.Tk):
         if df is None or len(df) < 2:
             return pd.DataFrame()
         # 最後一根視為未完成 (盤中一定是,收盤後犧牲一根換取絕不用未完成K棒的保證)
-        return df.iloc[:-1]
+        df = df.iloc[:-1]
+        # 【ADR-101】策略若用到籌碼條件,在這裡把籌碼併成 Chip* 欄位。
+        # 放在資料準備階段的好處:條件函式簽名不變,實盤與回測共用同一條路。
+        if strategy_engine.strategy_uses_chips(strategy):
+            df = self._qt_attach_chips(df, strategy, cache_sym=_sym, cache_market=_mkt)
+        return df
+
+    def _qt_attach_chips(self, df, strategy, cache_sym=None, cache_market=None):
+        """【ADR-101】把本地籌碼併進策略用的 df。純讀本地檔,不觸發下載。
+
+        籌碼要先由使用者在「籌碼」分頁按更新下載;這裡刻意不自動下載——
+        自動交易的評估迴圈每 2 秒跑一次,在裡面發網路請求會拖垮迴圈,
+        也違反「下載由使用者明確發動」的設計 (見 ADR-100)。
+        缺資料時條件會拋 ChipDataMissing,由 eval_conditions 收進 errors,
+        GUI 提示使用者去更新籌碼,不會靜默當成條件成立。
+        """
+        try:
+            sym = str(cache_sym or strategy.get('symbol') or '').upper()
+            start_iso = (df.index.min()).strftime('%Y-%m-%d')
+            end_iso = (df.index.max()).strftime('%Y-%m-%d')
+            trade_type = strategy_engine.trade_type_of(strategy)
+
+            stock_chips = None
+            if trade_type != '期貨':
+                allsym = chips_store.load_stock_inst_range(self.CHIPS_BASE_DIR, start_iso, end_iso)
+                if allsym is not None and not allsym.empty:
+                    stock_chips = allsym[allsym['Code'].astype(str).str.upper() == sym]
+            margin_chips = chips_store.load(chips_store.margin_path(self.CHIPS_BASE_DIR))
+            futures_chips = None
+            fut_product = None
+            if trade_type == '期貨':
+                futures_chips = chips_store.load_futures_inst_range(
+                    self.CHIPS_BASE_DIR, start_iso, end_iso)
+                fut_product = self.CHIPS_FUT_PRODUCT_MAP.get(sym[:3], '臺股期貨')
+            return chips_features.attach_chips(
+                df, stock_chips=stock_chips, margin_chips=margin_chips,
+                futures_chips=futures_chips, futures_product=fut_product,
+                allow_same_day=bool(strategy.get('chips_allow_same_day')))
+        except Exception as e:
+            self.safe_after(0, self.log_message,
+                            f"【籌碼】併入策略資料時發生問題 ({type(e).__name__}: {e});"
+                            "該策略的籌碼條件本次將視為不成立。")
+            return df
+
+    # shioaji 期貨代號前綴 → 期交所商品名稱 (籌碼表的 Product 欄用中文)
+    CHIPS_FUT_PRODUCT_MAP = {
+        'TXF': '臺股期貨', 'MXF': '小型臺指期貨', 'TMF': '微型臺指期貨',
+        'EXF': '電子期貨', 'FXF': '金融期貨',
+    }
 
     def _resolve_strategy_symbol_name(self, trade_type, symbol):
         """【ADR-043 第2項】依交易種類解析商品中文名稱,確認代碼有效。
@@ -8713,6 +8763,16 @@ class StockTradingAppPro(tk.Tk):
         tk.Checkbutton(top, text="非交易時間自動待命 (建議)", variable=var_sess_gate,
                        bg="#1A2026", fg="#8A99AD", selectcolor="#2A323D", activebackground="#1A2026",
                        font=('微軟正黑體', 8)).grid(row=4, column=2, columnspan=4, sticky='w', padx=(10, 0), pady=(6, 0))
+        # 【ADR-101】籌碼未來函數開關 (進階,預設關閉)。
+        # 籌碼是當日盤後才公布的:讓 T 日讀到 T 日籌碼 = 實盤不可能取得的資訊,
+        # 回測績效會虛高。預設 T 日只讀得到 T-1 日(含)以前的籌碼;勾選這格
+        # 僅供研究理論上限,回測報告會標示「含未來函數」。
+        var_chip_sameday = tk.BooleanVar(value=bool(s.get('chips_allow_same_day', False)))
+        tk.Checkbutton(top, text="⚠ 籌碼允許讀當日 (含未來函數,僅供研究)",
+                       variable=var_chip_sameday,
+                       bg="#1A2026", fg="#FF8A65", selectcolor="#2A323D", activebackground="#1A2026",
+                       font=('微軟正黑體', 8)).grid(row=5, column=2, columnspan=4, sticky='w',
+                                                    padx=(10, 0), pady=(2, 0))
         # 【ADR-043 第6項】絕對停損/停利 (股票=元,期貨=點;0=停用,與% 任一先到就出場)
         _lbl(top, "停損(元/點)").grid(row=6, column=0, sticky='w', pady=(6, 0))
         e_sl_abs = _ent(top, s.get('stop_loss_abs', 0.0), 6); e_sl_abs.grid(row=6, column=1, padx=4, pady=(6, 0))
@@ -9084,6 +9144,8 @@ class StockTradingAppPro(tk.Tk):
             # 【ADR-070】交易時段閘門設定
             s['futures_session'] = 'day' if cb_fut_sess.get() == '只做日盤' else 'day_night'
             s['session_gate'] = bool(var_sess_gate.get())
+            # 【ADR-101】籌碼未來函數開關 (進階;預設 False = 只讀前一日籌碼)
+            s['chips_allow_same_day'] = bool(var_chip_sameday.get())
             # 【ADR-074】看A做B 設定
             s.update(watch_ui['get']())
             try: s['cooldown_sec'] = float(e_cool.get().strip())
@@ -9946,6 +10008,12 @@ class StockTradingAppPro(tk.Tk):
             df = df[(df.index >= pd.Timestamp(start_dt)) & (df.index <= pd.Timestamp(end_dt) + pd.Timedelta(days=1))]
         except Exception:
             pass
+        # 【ADR-101】回測路徑也要併籌碼,且走與實盤完全相同的
+        # _qt_attach_chips → chips_features.attach_chips,包含同一套未來函數
+        # 防護。兩邊共用一條路,才不會出現「回測對、實盤錯」的雙軌問題。
+        if df is not None and not df.empty and strategy_engine.strategy_uses_chips(st):
+            df = self._qt_attach_chips(df, st, cache_sym=str(st.get('symbol')).upper(),
+                                       cache_market=st.get('market'))
         return df
 
     def _qt_offer_abort_backtest(self, what="回測"):

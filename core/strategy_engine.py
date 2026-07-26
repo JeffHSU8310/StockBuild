@@ -20,6 +20,10 @@ import re
 import uuid
 import pandas as pd
 
+# 【ADR-101】籌碼條件:籌碼在資料準備階段被併成 df 的 Chip* 欄位,
+# 條件函式簽名維持 func(df, params) 不變,實盤與回測因此自動共用同一條路。
+from core import chips_features as _cf
+
 # ============================================================
 # 指標計算 (自帶,與圖表設定脫鉤)
 # ============================================================
@@ -336,6 +340,144 @@ def _c_gap_down(df, p):
     return float(df['Open'].iloc[-1]) < float(df['Low'].iloc[-2]) * (1.0 - thr)
 
 
+# ============================================================
+# 【ADR-101】籌碼條件
+#
+# 資料來源:core/chips_features.attach_chips() 在資料準備階段把籌碼併成
+# df 的 Chip* 欄位。**T 日預設只讀得到 T-1 日(含)以前的籌碼** (籌碼盤後
+# 才公布,詳見 chips_features 模組 docstring 的未來函數說明)。
+#
+# 沒有籌碼資料時,series_of() 會拋 ChipDataMissing;eval_conditions 的
+# try/except 會把訊息收進 errors,GUI 就能提示「請先更新籌碼」,而不是讓
+# 使用者對著永遠不成立的條件猜原因。這是刻意的:「沒資料」與「條件沒到」
+# 對使用者的意義完全不同,不可混為一談。
+#
+# 個股籌碼原始單位是股,使用者參數用「張」,比較時乘 SHARES_PER_LOT。
+# ============================================================
+def _c_chip_foreign_buy_streak(df, p):
+    return _cf.consecutive_net(_cf.series_of(df, _cf.COL_FOREIGN),
+                               int(p.get('n', 3)), positive=True)
+
+
+def _c_chip_foreign_sell_streak(df, p):
+    return _cf.consecutive_net(_cf.series_of(df, _cf.COL_FOREIGN),
+                               int(p.get('n', 3)), positive=False)
+
+
+def _c_chip_trust_buy_streak(df, p):
+    return _cf.consecutive_net(_cf.series_of(df, _cf.COL_TRUST),
+                               int(p.get('n', 3)), positive=True)
+
+
+def _c_chip_trust_sell_streak(df, p):
+    return _cf.consecutive_net(_cf.series_of(df, _cf.COL_TRUST),
+                               int(p.get('n', 3)), positive=False)
+
+
+def _c_chip_inst_buy_over(df, p):
+    """三大法人合計買超 ≥ X 張。"""
+    s = _cf.series_of(df, _cf.COL_INST_TOTAL)
+    v = s.iloc[-1]
+    if pd.isna(v):
+        return False
+    return float(v) >= float(p.get('value', 500)) * _cf.SHARES_PER_LOT
+
+
+def _c_chip_inst_sell_over(df, p):
+    """三大法人合計賣超 ≤ X 張 (參數填負數,例如 -500)。"""
+    s = _cf.series_of(df, _cf.COL_INST_TOTAL)
+    v = s.iloc[-1]
+    if pd.isna(v):
+        return False
+    return float(v) <= float(p.get('value', -500)) * _cf.SHARES_PER_LOT
+
+
+def _c_chip_foreign_turn_buy(df, p):
+    return _cf.turned_positive(_cf.series_of(df, _cf.COL_FOREIGN))
+
+
+def _c_chip_foreign_turn_sell(df, p):
+    return _cf.turned_negative(_cf.series_of(df, _cf.COL_FOREIGN))
+
+
+def _c_chip_foreign_vol_ratio(df, p):
+    """外資買超佔當根成交量 ≥ X%。
+
+    用相對比例而非絕對張數,避免大型股與中小型股用同一個門檻失真
+    (外資買 500 張對台積電是雜訊,對小型股可能是關鍵買盤)。
+    """
+    s = _cf.series_of(df, _cf.COL_FOREIGN)
+    if 'Volume' not in df.columns or len(df) == 0:
+        return False
+    fv, vol = s.iloc[-1], pd.to_numeric(df['Volume'], errors='coerce').iloc[-1]
+    if pd.isna(fv) or pd.isna(vol) or float(vol) <= 0:
+        return False
+    return (float(fv) / float(vol)) * 100.0 >= float(p.get('value', 10.0))
+
+
+def _c_chip_margin_decrease_streak(df, p):
+    """融資餘額連續 N 日減少 (散戶退場,籌碼趨於安定)。"""
+    return _cf.consecutive_decreasing(_cf.series_of(df, _cf.COL_MARGIN), int(p.get('n', 3)))
+
+
+def _c_chip_margin_increase_streak(df, p):
+    """融資餘額連續 N 日增加 (散戶進場,籌碼較亂)。"""
+    return _cf.consecutive_increasing(_cf.series_of(df, _cf.COL_MARGIN), int(p.get('n', 3)))
+
+
+def _c_chip_fut_foreign_oi_above(df, p):
+    """期貨外資未平倉淨額 ≥ X 口 (正=淨多)。"""
+    s = _cf.series_of(df, _cf.COL_FUT_FOREIGN_OI)
+    v = s.iloc[-1]
+    if pd.isna(v):
+        return False
+    return float(v) >= float(p.get('value', 0))
+
+
+def _c_chip_fut_foreign_oi_below(df, p):
+    """期貨外資未平倉淨額 ≤ X 口 (負=淨空)。"""
+    s = _cf.series_of(df, _cf.COL_FUT_FOREIGN_OI)
+    v = s.iloc[-1]
+    if pd.isna(v):
+        return False
+    return float(v) <= float(p.get('value', 0))
+
+
+def _c_chip_fut_foreign_turn_long(df, p):
+    """期貨外資未平倉由淨空翻淨多 (大盤轉折訊號)。"""
+    return _cf.turned_positive(_cf.series_of(df, _cf.COL_FUT_FOREIGN_OI))
+
+
+def _c_chip_fut_foreign_turn_short(df, p):
+    """期貨外資未平倉由淨多翻淨空。"""
+    return _cf.turned_negative(_cf.series_of(df, _cf.COL_FUT_FOREIGN_OI))
+
+
+# 籌碼條件的 id 集合:GUI 用它判斷「這個策略有沒有用到籌碼」,
+# 進而決定要不要載入籌碼資料、要不要擋下分K週期。
+CHIP_CONDITION_IDS = {
+    'chip_foreign_buy_streak', 'chip_foreign_sell_streak',
+    'chip_trust_buy_streak', 'chip_trust_sell_streak',
+    'chip_inst_buy_over', 'chip_inst_sell_over',
+    'chip_foreign_turn_buy', 'chip_foreign_turn_sell',
+    'chip_foreign_vol_ratio',
+    'chip_margin_decrease_streak', 'chip_margin_increase_streak',
+    'chip_fut_foreign_oi_above', 'chip_fut_foreign_oi_below',
+    'chip_fut_foreign_turn_long', 'chip_fut_foreign_turn_short',
+}
+
+
+def strategy_uses_chips(strategy):
+    """這個策略的進出場條件裡有沒有用到籌碼條件。"""
+    if not isinstance(strategy, dict):
+        return False
+    for key in ('entry', 'exit_signals'):
+        for c in (strategy.get(key) or []):
+            if isinstance(c, dict) and c.get('type') in CHIP_CONDITION_IDS:
+                return True
+    return False
+
+
 CONDITIONS = {
     'ma_cross_up':     ("均線黃金交叉 (快線上穿慢線)", [('fast', '快線期間', 5), ('slow', '慢線期間', 20)], _c_ma_cross_up),
     'ma_cross_down':   ("均線死亡交叉 (快線下穿慢線)", [('fast', '快線期間', 5), ('slow', '慢線期間', 20)], _c_ma_cross_down),
@@ -383,6 +525,23 @@ CONDITIONS = {
     'inside_bar':          ("內包K棒 (高低被前根包住)", [], _c_inside_bar),
     'gap_up':              ("跳空上漲 (開盤>前根最高)", [('value', '額外門檻%', 0.0)], _c_gap_up),
     'gap_down':            ("跳空下跌 (開盤<前根最低)", [('value', '額外門檻%', 0.0)], _c_gap_down),
+
+    # ---- 【ADR-101】籌碼條件 (僅日K以上;T日預設只讀得到T-1日以前的籌碼) ----
+    'chip_foreign_buy_streak':  ("[籌碼] 外資連續買超N日", [('n', '連續日數', 3)], _c_chip_foreign_buy_streak),
+    'chip_foreign_sell_streak': ("[籌碼] 外資連續賣超N日", [('n', '連續日數', 3)], _c_chip_foreign_sell_streak),
+    'chip_trust_buy_streak':    ("[籌碼] 投信連續買超N日", [('n', '連續日數', 3)], _c_chip_trust_buy_streak),
+    'chip_trust_sell_streak':   ("[籌碼] 投信連續賣超N日", [('n', '連續日數', 3)], _c_chip_trust_sell_streak),
+    'chip_inst_buy_over':       ("[籌碼] 三大法人買超≥X張", [('value', '張數門檻', 500)], _c_chip_inst_buy_over),
+    'chip_inst_sell_over':      ("[籌碼] 三大法人賣超≤X張 (填負數)", [('value', '張數門檻', -500)], _c_chip_inst_sell_over),
+    'chip_foreign_turn_buy':    ("[籌碼] 外資由賣轉買 (翻多那日)", [], _c_chip_foreign_turn_buy),
+    'chip_foreign_turn_sell':   ("[籌碼] 外資由買轉賣 (翻空那日)", [], _c_chip_foreign_turn_sell),
+    'chip_foreign_vol_ratio':   ("[籌碼] 外資買超佔成交量≥X%", [('value', '佔比%', 10.0)], _c_chip_foreign_vol_ratio),
+    'chip_margin_decrease_streak': ("[籌碼] 融資餘額連續N日減少 (散戶退場)", [('n', '連續日數', 3)], _c_chip_margin_decrease_streak),
+    'chip_margin_increase_streak': ("[籌碼] 融資餘額連續N日增加 (散戶進場)", [('n', '連續日數', 3)], _c_chip_margin_increase_streak),
+    'chip_fut_foreign_oi_above':   ("[籌碼] 期貨外資未平倉≥X口 (淨多)", [('value', '口數門檻', 0)], _c_chip_fut_foreign_oi_above),
+    'chip_fut_foreign_oi_below':   ("[籌碼] 期貨外資未平倉≤X口 (淨空)", [('value', '口數門檻', 0)], _c_chip_fut_foreign_oi_below),
+    'chip_fut_foreign_turn_long':  ("[籌碼] 期貨外資未平倉由空翻多", [], _c_chip_fut_foreign_turn_long),
+    'chip_fut_foreign_turn_short': ("[籌碼] 期貨外資未平倉由多翻空", [], _c_chip_fut_foreign_turn_short),
 }
 
 def spec_parts(item):
@@ -444,6 +603,9 @@ def new_strategy():
         # 【ADR-070】交易時段閘門:session_gate=True 時,非交易時間自動待命,
         # 進入盤中才評估下單 (無需人工開啟);futures_session 決定期貨要不要含夜盤。
         'session_gate': True,         # True=非交易時間不動作 (建議);False=只看K棒邊界不看時段
+        # 【ADR-101】籌碼未來函數開關。False (預設) = T 日只讀得到 T-1 日(含)
+        # 以前的籌碼,與實盤可取得的資訊一致;True 僅供研究,回測會虛高。
+        'chips_allow_same_day': False,
         'futures_session': 'day_night',  # 'day'=只做日盤 08:45-13:45;'day_night'=含夜盤 15:00-次日05:00
         # 【ADR-074 看A做B】訊號來源 (A) 與執行商品 (B) 分離。watch_enabled=False 時
         # A=B (看自己做自己,一般模式)。A 可為指數 (加權/櫃買/台指期等,各項商品皆可);
@@ -680,6 +842,13 @@ def validate_strategy(s):
     for c in list(s.get('entry', [])) + list(s.get('exit_signals', [])):
         if c.get('type') not in CONDITIONS:
             return False, f"未知的條件類型: {c.get('type')}"
+    # 【ADR-101】籌碼是日頻資料 (盤後公布),分K 策略用它意義不大:當日所有
+    # 分K 只會讀到同一筆前一交易日的值。與其讓使用者以為「分K 也有籌碼訊號」,
+    # 不如在存檔時就擋下並說明原因。
+    if strategy_uses_chips(s) and not _cf.timeframe_supports_chips(s.get('timeframe')):
+        return False, (f"籌碼條件只能用於 {'/'.join(_cf.CHIP_ALLOWED_TIMEFRAMES)} "
+                       f"(目前週期:{s.get('timeframe')})。籌碼是每日盤後公布的日頻資料,"
+                       "分K 策略的當日每一根都只會讀到同一筆前一交易日的值,沒有意義。")
     sl = float(s.get('stop_loss_pct', 0) or 0)
     tp = float(s.get('take_profit_pct', 0) or 0)
     sl_abs = float(s.get('stop_loss_abs', 0) or 0)

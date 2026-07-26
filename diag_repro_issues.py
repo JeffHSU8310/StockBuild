@@ -1850,6 +1850,61 @@ def _chips_tab_and_views():
 
 run_case("ADR-100: 籌碼分頁四檢視/紅漲綠跌/切頁不下載/不重複抓取", _chips_tab_and_views)
 
+
+def _chips_as_strategy_condition():
+    """【ADR-101】籌碼條件接進策略:GUI 端要能從本地讀籌碼併進 df,
+    且未來函數防護 (T日只讀T-1日) 在 GUI 這條路上同樣生效。"""
+    import tempfile as _tf
+    import pandas as _pd
+    from data import chips_store as _chipstore
+    from core import chips_features as _cf
+    from core import strategy_engine as _se
+
+    old_base = app.CHIPS_BASE_DIR
+    tmp = _tf.mkdtemp()
+    try:
+        app.CHIPS_BASE_DIR = tmp
+        idx = _pd.date_range('2026-07-01', periods=6, freq='D')
+        # 每天外資買超遞增,方便驗證「讀到的是前一日」
+        rows = [{'Date': d.strftime('%Y-%m-%d'), 'Code': '2330', 'Name': '台積電',
+                 'Foreign': 1000 * (i + 1), 'Trust': 0, 'Dealer': 0,
+                 'InstTotal': 1000 * (i + 1)} for i, d in enumerate(idx)]
+        for r in rows:
+            _chipstore.upsert(_chipstore.stock_inst_path(tmp, r['Date']), _pd.DataFrame([r]))
+
+        df = _pd.DataFrame({'Open': 100.0, 'High': 101.0, 'Low': 99.0,
+                            'Close': 100.0, 'Volume': 1_000_000.0}, index=idx)
+        s = _se.new_strategy()
+        s.update({'name': '籌碼診斷', 'symbol': '2330', 'market': '台股',
+                  'timeframe': '日K', 'qty': 1, 'direction': '做多',
+                  'stop_loss_pct': 2.0,
+                  'entry': [{'type': 'chip_foreign_buy_streak', 'params': {'n': 3}}]})
+        assert _se.strategy_uses_chips(s), "應偵測到策略用了籌碼條件"
+
+        out = app._qt_attach_chips(df, s, cache_sym='2330', cache_market='台股')
+        col = out[_cf.COL_FOREIGN]
+        assert _pd.isna(col.iloc[0]), "第一根沒有前一日籌碼,應為 NaN"
+        assert col.iloc[1] == 1000, f"第二根應讀到第一天的 1000,實際 {col.iloc[1]}"
+        assert col.iloc[3] == 3000, f"第四根應讀到第三天的 3000 (不可是當日 4000),實際 {col.iloc[3]}"
+
+        # 進階選項開啟才讀當日
+        s2 = dict(s); s2['chips_allow_same_day'] = True
+        out2 = app._qt_attach_chips(df, s2, cache_sym='2330', cache_market='台股')
+        assert out2[_cf.COL_FOREIGN].iloc[0] == 1000, "允許當日時第一根應讀到當日籌碼"
+
+        # 條件在 GUI 併好的 df 上能正確評估
+        assert _se.CONDITIONS['chip_foreign_buy_streak'][2](out, {'n': 3}) is True
+
+        # 分K 策略用籌碼條件應被擋下
+        s3 = dict(s); s3['timeframe'] = '5分K'
+        ok3, why3 = _se.validate_strategy(s3)
+        assert not ok3 and '籌碼條件只能用於' in why3, f"分K應被擋下,實際: {ok3} {why3}"
+    finally:
+        app.CHIPS_BASE_DIR = old_base
+
+
+run_case("ADR-101: 籌碼條件接策略/未來函數防護/分K擋下", _chips_as_strategy_condition)
+
 print(f"{'案例':60s} 結果")
 print("-" * 76)
 for name, st, msg in results:

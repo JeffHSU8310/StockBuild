@@ -43,6 +43,7 @@ from core import chukuangren_band
 from core import telegram_notify
 from core import market_pattern
 from core import chips_parser
+from core import chips_features
 from data import config_store
 from data import taifex_store
 from data import chips_store
@@ -2124,15 +2125,38 @@ class TestNewConditionsADR057(unittest.TestCase):
 
     def test_every_condition_is_callable_and_safe_on_short_df(self):
         """所有條件遇到「資料太短」都必須回傳 False 而不是拋例外 —— 回測初期
-        K棒不足時會大量走到這條路徑,任何一個拋例外都會讓整個回測中斷。"""
+        K棒不足時會大量走到這條路徑,任何一個拋例外都會讓整個回測中斷。
+
+        【ADR-101】籌碼條件要餵「有 Chip 欄位但只有兩根」的 df:欄位不存在
+        代表的是「根本沒載入籌碼」(使用者還沒下載),那是另一種狀況,刻意設計成
+        拋 ChipDataMissing 讓 GUI 能提示;這裡要測的是本來的意圖——**資料太短**。
+        實際的籌碼欄位一定由 attach_chips 建立,所以「有欄位、前幾根是 NaN」
+        才是回測初期真正會遇到的情形。
+        """
         tiny = self._df_from_closes([10, 11])
+        tiny_with_chips = tiny.copy()
+        for col in chips_features.ALL_CHIP_COLS:
+            tiny_with_chips[col] = [1000.0, 2000.0]
         for key, (name, spec, fn) in strategy_engine.CONDITIONS.items():
             params = {k: dv for k, _lab, dv, _ch in (strategy_engine.spec_parts(x) for x in spec)}
+            df_in = tiny_with_chips if key in strategy_engine.CHIP_CONDITION_IDS else tiny
             try:
-                r = fn(tiny, params)
+                r = fn(df_in, params)
             except Exception as e:
                 self.fail(f"條件 {key} 在短資料上拋例外: {type(e).__name__}: {e}")
             self.assertIn(r, (True, False), f"條件 {key} 回傳非布林值: {r!r}")
+
+    def test_chip_conditions_never_break_backtest_via_eval_conditions(self):
+        """【ADR-101】即使完全沒有籌碼欄位,走 eval_conditions 也只會讓那一條
+        變 False 並記錄原因,不會中斷回測 (回測是透過 evaluate_strategy →
+        eval_conditions,例外一定被接住)。這是上面那條安全網的真正保證。"""
+        tiny = self._df_from_closes([10, 11])
+        for key in strategy_engine.CHIP_CONDITION_IDS:
+            errors = []
+            ok, _ = strategy_engine.eval_conditions(
+                tiny, [{'type': key, 'params': {}}], errors=errors)
+            self.assertFalse(ok, f"{key} 沒有籌碼時不該成立")
+            self.assertEqual(len(errors), 1, f"{key} 應留下可讀的錯誤原因")
 
     def test_spec_parts_backward_compatible(self):
         self.assertEqual(strategy_engine.spec_parts(('n', '期間', 20)), ('n', '期間', 20, None))
@@ -4052,6 +4076,204 @@ class TestChipsStore(unittest.TestCase):
             chips_store.upsert(chips_store.futures_inst_path(self.tmp, d[:4]), df)
         out = chips_store.load_futures_inst_range(self.tmp, '2025-01-01', '2026-12-31')
         self.assertEqual(len(out), 2)
+
+
+class TestChipsFeatures(unittest.TestCase):
+    """【ADR-101】籌碼併入 df 與未來函數防護——本專案最需要被守住的正確性。"""
+
+    def _bars(self, n=10, start='2026-07-13', volume=1_000_000.0):
+        idx = pd.date_range(start, periods=n, freq='D')
+        return pd.DataFrame({'Open': 100.0, 'High': 101.0, 'Low': 99.0,
+                             'Close': 100.0, 'Volume': volume}, index=idx)
+
+    def _chips(self, n=10, start='2026-07-13', step=1000):
+        idx = pd.date_range(start, periods=n, freq='D')
+        vals = [step * (i + 1) for i in range(n)]
+        return pd.DataFrame({'Date': [d.strftime('%Y-%m-%d') for d in idx],
+                             'Foreign': vals, 'Trust': [0] * n, 'Dealer': [0] * n,
+                             'InstTotal': vals})
+
+    def test_default_never_reads_same_day_chips(self):
+        """**最重要的一條**:T 日只能讀到 T-1 日(含)以前的籌碼。
+
+        籌碼是當日盤後才公布的。若 T 日 K 棒讀得到 T 日籌碼,回測績效會虛高
+        到實盤無法複製 (look-ahead bias)。
+        """
+        out = chips_features.attach_chips(self._bars(), stock_chips=self._chips())
+        col = out[chips_features.COL_FOREIGN]
+        self.assertTrue(pd.isna(col.iloc[0]), "第一根沒有前一日籌碼,應為 NaN")
+        self.assertEqual(col.iloc[1], 1000, "第二根應讀到第一天的籌碼")
+        self.assertEqual(col.iloc[2], 2000, "第三根應讀到第二天的籌碼")
+        # 逐根確認:讀到的值一律是「前一根日期」的籌碼,不是自己當日
+        for i in range(1, 10):
+            self.assertEqual(col.iloc[i], 1000 * i,
+                             f"第{i}根不可讀到當日籌碼 {1000 * (i + 1)}")
+
+    def test_allow_same_day_is_opt_in_only(self):
+        """進階選項開啟後才讀當日 (僅供研究,呼叫端須標示含未來函數)。"""
+        out = chips_features.attach_chips(self._bars(), stock_chips=self._chips(),
+                                          allow_same_day=True)
+        col = out[chips_features.COL_FOREIGN]
+        self.assertEqual(col.iloc[0], 1000, "允許當日時第一根就該讀到當日籌碼")
+        self.assertEqual(col.iloc[5], 6000)
+
+    def test_gap_in_chips_carries_last_known_value(self):
+        """籌碼中間缺日 (假日/停牌) 時沿用最後一筆已知值,不可跳成 NaN。"""
+        chips = self._chips(n=3)                      # 只有 7/13~7/15
+        out = chips_features.attach_chips(self._bars(n=8), stock_chips=chips)
+        col = out[chips_features.COL_FOREIGN]
+        self.assertEqual(col.iloc[3], 3000, "7/16 應沿用 7/15 的籌碼")
+        self.assertEqual(col.iloc[7], 3000, "之後仍沿用最後一筆已知值")
+
+    def test_no_chips_gives_nan_columns_not_crash(self):
+        out = chips_features.attach_chips(self._bars(), stock_chips=None)
+        self.assertIn(chips_features.COL_FOREIGN, out.columns)
+        self.assertFalse(chips_features.has_chip_data(out, [chips_features.COL_FOREIGN]))
+
+    def test_attach_does_not_mutate_input(self):
+        df = self._bars()
+        chips_features.attach_chips(df, stock_chips=self._chips())
+        self.assertNotIn(chips_features.COL_FOREIGN, df.columns, "不可就地修改傳入的 df")
+
+    def test_futures_chips_split_by_investor(self):
+        idx = pd.date_range('2026-07-13', periods=5, freq='D')
+        rows = []
+        for i, d in enumerate(idx):
+            for inv, oi in (('外資及陸資', -1000 * (i + 1)), ('投信', 500), ('自營商', 20)):
+                rows.append({'Date': d.strftime('%Y-%m-%d'), 'Product': '臺股期貨',
+                             'Investor': inv, 'NetOI': oi})
+        out = chips_features.attach_chips(self._bars(n=5), futures_chips=pd.DataFrame(rows),
+                                          futures_product='臺股期貨')
+        self.assertEqual(out[chips_features.COL_FUT_FOREIGN_OI].iloc[1], -1000)
+        self.assertEqual(out[chips_features.COL_FUT_TRUST_OI].iloc[1], 500)
+        self.assertEqual(out[chips_features.COL_FUT_DEALER_OI].iloc[1], 20)
+
+    def test_series_of_raises_when_missing(self):
+        """缺資料要拋 ChipDataMissing,不可靜默回 False——「沒資料」與
+        「條件沒到」對使用者的意義完全不同 (ADR-065 的教訓)。"""
+        with self.assertRaises(chips_features.ChipDataMissing):
+            chips_features.series_of(self._bars(), chips_features.COL_FOREIGN)
+        empty = chips_features.attach_chips(self._bars(), stock_chips=None)
+        with self.assertRaises(chips_features.ChipDataMissing):
+            chips_features.series_of(empty, chips_features.COL_FOREIGN)
+
+    def test_consecutive_helpers(self):
+        s = pd.Series([1, 2, 3, 4.0])
+        self.assertTrue(chips_features.consecutive_net(s, 3, positive=True))
+        self.assertFalse(chips_features.consecutive_net(s, 3, positive=False))
+        self.assertFalse(chips_features.consecutive_net(pd.Series([1, -1, 2.0]), 3, positive=True))
+        # NaN 一律視為不成立 (沒資料 ≠ 條件達成)
+        self.assertFalse(chips_features.consecutive_net(pd.Series([1, float('nan'), 3.0]), 3))
+        self.assertTrue(chips_features.consecutive_decreasing(pd.Series([5, 4, 3, 2.0]), 3))
+        self.assertFalse(chips_features.consecutive_decreasing(pd.Series([5, 4, 5, 2.0]), 3))
+        self.assertTrue(chips_features.turned_positive(pd.Series([-1, 5.0])))
+        self.assertFalse(chips_features.turned_positive(pd.Series([1, 5.0])))
+        self.assertTrue(chips_features.turned_negative(pd.Series([1, -5.0])))
+
+    def test_timeframe_gate(self):
+        self.assertTrue(chips_features.timeframe_supports_chips('日K'))
+        self.assertTrue(chips_features.timeframe_supports_chips('週K'))
+        self.assertFalse(chips_features.timeframe_supports_chips('5分K'))
+        self.assertFalse(chips_features.timeframe_supports_chips('60分K'))
+
+
+class TestChipConditions(unittest.TestCase):
+    """【ADR-101】籌碼條件在策略引擎中的行為。"""
+
+    def _df_with_chips(self, foreign, trust=None, inst=None, margin=None,
+                       fut_oi=None, volume=1_000_000.0):
+        n = len(foreign)
+        idx = pd.date_range('2026-07-01', periods=n, freq='D')
+        df = pd.DataFrame({'Open': 100.0, 'High': 101.0, 'Low': 99.0,
+                           'Close': 100.0, 'Volume': volume}, index=idx)
+        df[chips_features.COL_FOREIGN] = foreign
+        df[chips_features.COL_TRUST] = trust if trust is not None else [0] * n
+        df[chips_features.COL_DEALER] = [0] * n
+        df[chips_features.COL_INST_TOTAL] = inst if inst is not None else foreign
+        df[chips_features.COL_MARGIN] = margin if margin is not None else [0] * n
+        df[chips_features.COL_FUT_FOREIGN_OI] = fut_oi if fut_oi is not None else [0] * n
+        return df
+
+    def _run(self, cid, df, params=None):
+        return strategy_engine.CONDITIONS[cid][2](df, params or {})
+
+    def test_foreign_buy_and_sell_streak(self):
+        up = self._df_with_chips([100, 200, 300, 400])
+        self.assertTrue(self._run('chip_foreign_buy_streak', up, {'n': 3}))
+        self.assertFalse(self._run('chip_foreign_sell_streak', up, {'n': 3}))
+        mixed = self._df_with_chips([100, -200, 300, 400])
+        self.assertFalse(self._run('chip_foreign_buy_streak', mixed, {'n': 3}))
+        down = self._df_with_chips([-1, -2, -3, -4])
+        self.assertTrue(self._run('chip_foreign_sell_streak', down, {'n': 3}))
+
+    def test_inst_threshold_uses_lots_not_shares(self):
+        """參數是「張」,資料是「股」,比較時要換算 (500 張 = 500,000 股)。"""
+        df = self._df_with_chips([0, 0, 600_000])
+        self.assertTrue(self._run('chip_inst_buy_over', df, {'value': 500}))
+        self.assertFalse(self._run('chip_inst_buy_over', df, {'value': 700}))
+        df2 = self._df_with_chips([0, 0, -600_000])
+        self.assertTrue(self._run('chip_inst_sell_over', df2, {'value': -500}))
+
+    def test_foreign_turn_buy_only_on_flip_bar(self):
+        flip = self._df_with_chips([-100, -50, 200])
+        self.assertTrue(self._run('chip_foreign_turn_buy', flip))
+        cont = self._df_with_chips([-100, 50, 200])
+        self.assertFalse(self._run('chip_foreign_turn_buy', cont), "已翻多的隔天不該再成立")
+
+    def test_foreign_volume_ratio(self):
+        df = self._df_with_chips([0, 0, 150_000], volume=1_000_000.0)
+        self.assertTrue(self._run('chip_foreign_vol_ratio', df, {'value': 10}))
+        self.assertFalse(self._run('chip_foreign_vol_ratio', df, {'value': 20}))
+
+    def test_margin_decrease_streak(self):
+        df = self._df_with_chips([0] * 5, margin=[100, 90, 80, 70, 60])
+        self.assertTrue(self._run('chip_margin_decrease_streak', df, {'n': 3}))
+        self.assertFalse(self._run('chip_margin_increase_streak', df, {'n': 3}))
+
+    def test_futures_foreign_oi_conditions(self):
+        df = self._df_with_chips([0] * 3, fut_oi=[-500, -200, 800])
+        self.assertTrue(self._run('chip_fut_foreign_oi_above', df, {'value': 0}))
+        self.assertFalse(self._run('chip_fut_foreign_oi_below', df, {'value': 0}))
+        self.assertTrue(self._run('chip_fut_foreign_turn_long', df))
+        self.assertFalse(self._run('chip_fut_foreign_turn_short', df))
+
+    def test_missing_chips_reported_via_errors_not_silent(self):
+        """沒有籌碼欄位時,eval_conditions 要把原因收進 errors 讓 GUI 能提示。"""
+        plain = pd.DataFrame({'Open': 1.0, 'High': 1.0, 'Low': 1.0, 'Close': 1.0,
+                              'Volume': 1.0}, index=pd.date_range('2026-07-01', periods=5))
+        errors = []
+        ok, _ = strategy_engine.eval_conditions(
+            plain, [{'type': 'chip_foreign_buy_streak', 'params': {'n': 3}}], errors=errors)
+        self.assertFalse(ok)
+        self.assertEqual(len(errors), 1)
+        self.assertIn('ChipDataMissing', errors[0][1])
+
+    def test_strategy_uses_chips_detection(self):
+        s = strategy_engine.new_strategy()
+        s['entry'] = [{'type': 'ma_cross_up', 'params': {}}]
+        self.assertFalse(strategy_engine.strategy_uses_chips(s))
+        s['entry'].append({'type': 'chip_foreign_buy_streak', 'params': {'n': 3}})
+        self.assertTrue(strategy_engine.strategy_uses_chips(s))
+        s2 = strategy_engine.new_strategy()
+        s2['exit_signals'] = [{'type': 'chip_foreign_turn_sell', 'params': {}}]
+        self.assertTrue(strategy_engine.strategy_uses_chips(s2), "出場條件也要算")
+
+    def test_validate_blocks_chip_conditions_on_intraday(self):
+        """分K 策略用籌碼條件應在存檔時被擋下並說明原因。"""
+        s = strategy_engine.new_strategy()
+        s.update({'name': 'X', 'symbol': '2330', 'timeframe': '5分K', 'qty': 1,
+                  'direction': '做多', 'stop_loss_pct': 2.0,
+                  'entry': [{'type': 'chip_foreign_buy_streak', 'params': {'n': 3}}]})
+        ok, why = strategy_engine.validate_strategy(s)
+        self.assertFalse(ok)
+        self.assertIn('籌碼條件只能用於', why)
+        s['timeframe'] = '日K'
+        ok2, why2 = strategy_engine.validate_strategy(s)
+        self.assertTrue(ok2, why2)
+
+    def test_new_strategy_defaults_to_no_lookahead(self):
+        self.assertFalse(strategy_engine.new_strategy()['chips_allow_same_day'],
+                         "預設必須是「不讀當日籌碼」")
 
 
 if __name__ == "__main__":
