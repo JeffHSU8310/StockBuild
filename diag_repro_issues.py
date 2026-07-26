@@ -2069,6 +2069,89 @@ def _screener_end_to_end():
 
 run_case("ADR-103: 選股/基本面門檻/虧損股不誤選/技術面重用/切頁不下載", _screener_end_to_end)
 
+
+def _screener_industry_and_backtest():
+    """【ADR-105/106】產業篩選 + 選股回測:GUI 端能跑完整流程,
+    且回測的未來函數防護在 GUI 這條路同樣生效。"""
+    import tempfile as _tf
+    import pandas as _pd
+    import numpy as _np
+    from data import market_store as _mkt
+    from core import market_screener as _ms
+
+    old_base = app.SCREENER_BASE_DIR
+    tmp = _tf.mkdtemp()
+    net = []
+    orig_json = app._chips_http_json
+    try:
+        app._chips_http_json = lambda *a, **k: net.append('x')
+        app.SCREENER_BASE_DIR = tmp
+
+        # 12 檔 × 80 天:前 4 檔上漲
+        rng = _np.random.RandomState(5)
+        idx = _pd.date_range('2026-01-01', periods=80, freq='B')
+        rows = []
+        for k in range(12):
+            px, trend = 100.0, (1.0 if k < 4 else -0.8)
+            for d in idx:
+                px = max(5.0, px + trend + rng.randn() * 0.15)
+                rows.append({'Date': d.strftime('%Y-%m-%d'), 'Code': f'{1000+k}',
+                             'Name': f'股{k}', 'Open': px, 'High': px*1.01,
+                             'Low': px*0.99, 'Close': px, 'Volume': 1e6})
+        _mkt.upsert_daily(tmp, _pd.DataFrame(rows))
+        fund = _pd.DataFrame([{
+            'Code': f'{1000+k}', 'Name': f'股{k}',
+            'Industry': ('半導體業' if k < 4 else '水泥工業'),
+            'Close': 100.0, 'PE': 10.0, 'PB': 1.0, 'YieldPct': 5.0, 'EPS': 2.0,
+            'GrossMarginPct': 30.0, 'RevenueYoYPct': 20.0, 'RevenueMoMPct': 1.0,
+            'MonthRevenue': 1.0, 'Equity': 1.0, 'ROEPct': 10.0} for k in range(12)])
+        _mkt.save_fundamental(tmp, fund)
+
+        # --- 產業篩選 (ADR-105) ---
+        app.set_bottom_tab("screener")
+        app._sc_refresh_industries()
+        vals = list(app.cb_sc_industry['values'])
+        assert '半導體業' in vals and '水泥工業' in vals, f"產業下拉未填入,實際 {vals}"
+        assert vals[0] == app.SC_INDUSTRY_ALL, "第一項應是「全部產業」"
+        r = _ms.screen(fund, None, industries=['半導體業'])
+        assert {x['code'] for x in r['rows']} == {'1000','1001','1002','1003'}, \
+            "產業篩選結果不正確"
+        assert r['rows'][0]['industry'] == '半導體業', "結果應帶產業別"
+
+        # --- 選股回測 (ADR-106) ---
+        daily = _mkt.load_daily_range(tmp, '2026-01-01', '2026-12-31')
+        from core import screener_backtest as _sb
+        res = _sb.run_screener_backtest(
+            daily, conditions=[{'type': 'price_above_ma', 'params': {'n': 20}}],
+            fundamental_df=fund,
+            fundamental_conds=[{'field': 'pe', 'op': '<=', 'value': 15}],
+            rebalance_days=10, top_n=5, min_bars=25,
+            to_ohlcv=_mkt.to_ohlcv_frame)
+        assert res['fundamental_skipped'] is True, \
+            "基本面只有當前快照,回測預設必須略過 (否則是未來函數)"
+        assert res['has_lookahead'] is False
+        assert res['periods'], "應該要有調倉期"
+        for p in res['periods']:
+            assert p['entry_date'] > p['signal_date'], "進場日必須晚於訊號日"
+        picked = {h['code'] for h in res['holdings']}
+        assert picked == {'1000','1001','1002','1003'}, f"應選中上漲股,實際 {sorted(picked)}"
+
+        # GUI 顯示不可拋例外,且要能標示紅綠
+        app._sc_show_backtest(res, 10, 25)
+        assert len(app.tree_sc.get_children()) == len(res['periods']), "每期都要顯示一列"
+        tags = [app.tree_sc.item(i, 'tags') for i in app.tree_sc.get_children()]
+        assert any('buy' in tuple(t) or 'sell' in tuple(t) for t in tags), \
+            "本期損益應依紅漲綠跌上色"
+
+        assert not net, "整個流程都不該發出網路請求 (資料全在本地)"
+    finally:
+        app._chips_http_json = orig_json
+        app.SCREENER_BASE_DIR = old_base
+        app.set_bottom_tab("log")
+
+
+run_case("ADR-105/106: 產業篩選 + 選股回測/未來函數防護/紅綠上色", _screener_industry_and_backtest)
+
 print(f"{'案例':60s} 結果")
 print("-" * 76)
 for name, st, msg in results:

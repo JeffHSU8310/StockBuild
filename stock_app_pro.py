@@ -53,6 +53,7 @@ from core import volume_profile
 # 【ADR-103】全方位選股:基本面解析 + 全市場篩選引擎 + 全市場資料儲存。
 from core import fundamental_parser
 from core import market_screener
+from core import screener_backtest
 from data import market_store
 from data import config_store
 from data import taifex_store
@@ -11335,6 +11336,10 @@ class StockTradingAppPro(tk.Tk):
             bar, text="🔍 開始選股", bg="#29B6F6", fg="black", relief="flat",
             font=('微軟正黑體', 9, 'bold'), padx=8, pady=2, command=self._sc_start_screen)
         self.btn_sc_run.pack(side=tk.LEFT, padx=4)
+        self.btn_sc_bt = tk.Button(
+            bar, text="📊 回測條件", bg="#FB8C00", fg="black", relief="flat",
+            font=('微軟正黑體', 9, 'bold'), padx=8, pady=2, command=self._sc_start_backtest)
+        self.btn_sc_bt.pack(side=tk.LEFT, padx=(0, 4))
         self.btn_sc_stop = tk.Button(
             bar, text="■ 停止", bg="#2A323D", fg="white", relief="flat",
             font=('微軟正黑體', 9, 'bold'), padx=8, pady=2,
@@ -11405,6 +11410,9 @@ class StockTradingAppPro(tk.Tk):
             self.tree_sc.heading(c, text=heads[c])
             self.tree_sc.column(c, width=widths[c], anchor="center")
         self.tree_sc.tag_configure('visible_row', foreground='#FFFFFF', background='#12161A')
+        # 【鐵則1】回測結果的本期損益:賺紅、賠綠
+        self.tree_sc.tag_configure('buy', foreground='#FF1744', background='#12161A')
+        self.tree_sc.tag_configure('sell', foreground='#00E676', background='#12161A')
         self.tree_sc.bind("<Double-1>", self._sc_on_row_double_click)
         sb = tk.Scrollbar(table, orient=tk.VERTICAL, command=self.tree_sc.yview)
         self.tree_sc.configure(yscrollcommand=sb.set)
@@ -11443,6 +11451,7 @@ class StockTradingAppPro(tk.Tk):
         try:
             self.btn_sc_update.config(state=tk.NORMAL)
             self.btn_sc_run.config(state=tk.NORMAL)
+            self.btn_sc_bt.config(state=tk.NORMAL)
             self.btn_sc_stop.config(state=tk.DISABLED)
         except (tk.TclError, AttributeError):
             pass
@@ -11737,6 +11746,118 @@ class StockTradingAppPro(tk.Tk):
         self.log_message(f"【選股】{msg}")
         for label, why in (res.get('errors') or [])[:3]:
             self.log_message(f"【選股-提醒】{label}: {why}")
+
+    # ---------------- 選股回測 (ADR-106) ----------------
+    def _sc_start_backtest(self):
+        """回測目前這組選股條件在歷史上的表現。"""
+        if self._sc_running:
+            return
+        daily = market_store.load_daily_range(
+            self.SCREENER_BASE_DIR,
+            (datetime.now() - timedelta(days=self.SC_HISTORY_DAYS)).strftime('%Y-%m-%d'),
+            datetime.now().strftime('%Y-%m-%d'))
+        if daily is None or daily.empty:
+            messagebox.showwarning("選股回測", "本地沒有全市場日K。\n請先按「⬇ 更新全市場資料」。")
+            return
+        n_days = daily['Date'].nunique()
+        if n_days < 32:
+            messagebox.showwarning(
+                "選股回測",
+                f"本地只有 {n_days} 個交易日的資料,不足以回測。\n"
+                "請先讓「更新全市場資料」跑完 (預設抓 180 天)。")
+            return
+
+        preset = market_screener.PRESETS.get(self.cb_sc_preset.get(), {})
+        conds = list(preset.get('conditions') or [])
+        sname = self.cb_sc_strategy.get()
+        if sname and sname != '(不使用)':
+            st = next((x for x in (self.strategies or []) if str(x.get('name')) == sname), None)
+            if st and st.get('entry'):
+                conds = list(st['entry'])
+        f_conds = self._sc_collect_fundamental_conds() or list(preset.get('fundamental') or [])
+        if not conds:
+            messagebox.showwarning(
+                "選股回測",
+                "這組條件沒有技術面/籌碼面條件,無法回測。\n\n"
+                "基本面資料只有「當前快照」沒有歷史,套用到過去的日期會變成\n"
+                "偷看尚未公布的財報 (未來函數),因此不能只靠基本面回測。\n\n"
+                "請選一個含技術面條件的範本,或指定某個策略的進場條件。")
+            return
+        ind = self.cb_sc_industry.get()
+        industries = None if (not ind or ind == self.SC_INDUSTRY_ALL) else [ind]
+        fund = market_store.load_fundamental(self.SCREENER_BASE_DIR)
+
+        self._sc_running = True
+        self._sc_cancel = False
+        self.btn_sc_update.config(state=tk.DISABLED)
+        self.btn_sc_run.config(state=tk.DISABLED)
+        self.btn_sc_bt.config(state=tk.DISABLED)
+        self.btn_sc_stop.config(state=tk.NORMAL)
+        threading.Thread(target=self._sc_backtest_worker,
+                         args=(daily, fund, conds, f_conds, industries), daemon=True).start()
+
+    def _sc_backtest_worker(self, daily, fund, conds, f_conds, industries):
+        try:
+            n_days = daily['Date'].nunique()
+            # 資料只有 N 天時,暖身根數與調倉頻率要跟著縮,否則一期都跑不出來
+            min_bars = max(20, min(60, n_days // 3))
+            reb = max(5, min(20, n_days // 6))
+            start_iso = (datetime.now() - timedelta(days=self.SC_HISTORY_DAYS)).strftime('%Y-%m-%d')
+            end_iso = datetime.now().strftime('%Y-%m-%d')
+            stock_chips = chips_store.load_stock_inst_range(self.CHIPS_BASE_DIR, start_iso, end_iso)
+            margin_chips = chips_store.load(chips_store.margin_path(self.CHIPS_BASE_DIR))
+
+            def _prog(i, total):
+                self.safe_after(0, self._sc_set_status, f"回測中 第 {i}/{total} 期 ...")
+
+            res = screener_backtest.run_screener_backtest(
+                daily, conditions=conds, fundamental_df=fund,
+                fundamental_conds=f_conds, industries=industries,
+                rebalance_days=reb, top_n=10, min_bars=min_bars,
+                stock_chips=stock_chips, margin_chips=margin_chips,
+                to_ohlcv=market_store.to_ohlcv_frame,
+                progress_cb=_prog, should_stop=lambda: self._sc_cancel or self._closing)
+            self.safe_after(0, self._sc_show_backtest, res, reb, min_bars)
+        except Exception as e:
+            self.safe_after(0, self.log_message, f"【選股回測】失敗:{type(e).__name__}: {e}")
+        finally:
+            self._sc_running = False
+            self.safe_after(0, self._sc_set_idle)
+
+    def _sc_show_backtest(self, res, reb, min_bars):
+        """把回測結果填進結果表,並把警告寫進系統日誌。"""
+        for w in (res.get('warnings') or []):
+            self.log_message(f"【選股回測】{w}")
+        m = res.get('metrics') or {}
+        if not m or not m.get('periods'):
+            self._sc_set_status("回測無結果 (詳見系統日誌)")
+            return
+        for line in screener_backtest.summarize(res).split('\n'):
+            self.log_message(f"【選股回測】{line}")
+        self.log_message(f"【選股回測】設定:每 {reb} 個交易日調倉一次、"
+                         f"前 {min_bars} 天暖身、每期最多 10 檔等權、含手續費與交易稅。")
+        # 用結果表顯示每一期
+        heads = ('期別', '訊號日', '買進日', '賣出日', '選中檔數', '本期損益', '本期報酬%')
+        rows = [(str(i), p['signal_date'], p['entry_date'], p['exit_date'],
+                 str(p['picks']), f"{p['pnl']:,.0f}", f"{p['return_pct']:+.2f}")
+                for i, p in enumerate(res['periods'], 1)]
+        try:
+            self.tree_sc['columns'] = heads
+            for h in heads:
+                self.tree_sc.heading(h, text=h)
+                self.tree_sc.column(h, width=110, anchor="center")
+            for i in self.tree_sc.get_children():
+                self.tree_sc.delete(i)
+            for vals in rows:
+                # 【鐵則1】本期賺紅、賠綠
+                tag = 'buy' if float(vals[6]) > 0 else ('sell' if float(vals[6]) < 0 else 'visible_row')
+                self.tree_sc.insert("", "end", values=vals, tags=(tag,))
+        except (tk.TclError, AttributeError, ValueError):
+            pass
+        warn = " ⚠含未來函數" if res.get('has_lookahead') else ""
+        self._sc_set_status(
+            f"回測 {m['periods']} 期:總報酬 {m['total_return_pct']:+.2f}%、"
+            f"超額 {m['excess_pct']:+.2f}%、最大回撤 {m['max_drawdown_pct']:.2f}%{warn}")
 
     def _sc_on_row_double_click(self, event=None):
         """雙擊結果列 → 直接把該股帶到主圖查詢 (選完股馬上看線圖)。"""

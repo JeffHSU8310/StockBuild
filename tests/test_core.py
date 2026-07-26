@@ -47,6 +47,7 @@ from core import chips_features
 from core import volume_profile
 from core import fundamental_parser
 from core import market_screener
+from core import screener_backtest
 from data import config_store
 from data import taifex_store
 from data import chips_store
@@ -4814,6 +4815,144 @@ class TestMarketStore(unittest.TestCase):
         got = market_store.load_fundamental(self.tmp)
         self.assertEqual(len(got), 1)
         self.assertEqual(got.iloc[0]['Code'], '2330')
+
+
+class TestScreenerBacktest(unittest.TestCase):
+    """【ADR-106】選股回測。"""
+
+    def _market(self, n_days=80, n_stocks=12, n_winners=4):
+        """前 n_winners 檔持續上漲,其餘持續下跌。
+
+        趨勢差距刻意拉大且雜訊調小:若下跌股的隨機波動足以讓它短期站上 20MA,
+        它被選中其實是條件的正常行為 (不是 bug),但那樣就測不出「條件有沒有
+        選對趨勢」。這裡讓兩組明顯分離,測試才有鑑別力。
+        """
+        rng = np.random.RandomState(5)
+        idx = pd.date_range('2026-01-01', periods=n_days, freq='B')
+        rows = []
+        for k in range(n_stocks):
+            code = f'{1000 + k}'
+            trend = 1.0 if k < n_winners else -0.8
+            px = 100.0
+            for d in idx:
+                px = max(5.0, px + trend + rng.randn() * 0.15)
+                rows.append({'Date': d.strftime('%Y-%m-%d'), 'Code': code,
+                             'Name': f'股{k}', 'Open': px, 'High': px * 1.01,
+                             'Low': px * 0.99, 'Close': px, 'Volume': 1e6})
+        return pd.DataFrame(rows)
+
+    def _fund(self, n_stocks=12):
+        return pd.DataFrame([{
+            'Code': f'{1000 + k}', 'Name': f'股{k}', 'Industry': '測試業',
+            'Close': 100.0, 'PE': 10.0, 'PB': 1.0, 'YieldPct': 5.0, 'EPS': 2.0,
+            'GrossMarginPct': 30.0, 'RevenueYoYPct': 20.0, 'RevenueMoMPct': 1.0,
+            'MonthRevenue': 1.0, 'Equity': 1.0, 'ROEPct': 10.0} for k in range(n_stocks)])
+
+    def _run(self, **kw):
+        base = dict(conditions=[{'type': 'price_above_ma',
+                                 'params': {'n': 20, 'kind': 'SMA'}}],
+                    rebalance_days=10, top_n=5, min_bars=25,
+                    to_ohlcv=market_store.to_ohlcv_frame)
+        base.update(kw)
+        return screener_backtest.run_screener_backtest(self._market(), **base)
+
+    def test_picks_the_trending_stocks(self):
+        r = self._run()
+        picked = {h['code'] for h in r['holdings']}
+        winners = {'1000', '1001', '1002', '1003'}
+        self.assertTrue(picked, "應該有選到股票")
+        self.assertEqual(picked, winners,
+                         f"「站上20MA」應選中持續上漲的4檔,實際 {sorted(picked)}")
+        self.assertGreater(r['metrics']['total_return_pct'], 0)
+        self.assertGreater(r['metrics']['excess_pct'], 0,
+                           "選中上漲股應該勝過全市場買進持有")
+
+    def test_fundamental_conditions_skipped_by_default(self):
+        """**最重要**:基本面只有當前快照,預設不可套用到過去的日期。
+
+        套用等於在當時就知道尚未公布的財報,會讓回測績效嚴重虛高——而且
+        數字看起來完全合理,是最難察覺的錯誤。
+        """
+        r = self._run(fundamental_df=self._fund(),
+                      fundamental_conds=[{'field': 'pe', 'op': '<=', 'value': 15}])
+        self.assertTrue(r['fundamental_skipped'])
+        self.assertFalse(r['has_lookahead'])
+        self.assertTrue(any('已略過' in w for w in r['warnings']))
+
+    def test_fundamental_forced_marks_lookahead(self):
+        r = self._run(fundamental_df=self._fund(),
+                      fundamental_conds=[{'field': 'pe', 'op': '<=', 'value': 15}],
+                      allow_lookahead_fundamental=True)
+        self.assertFalse(r['fundamental_skipped'])
+        self.assertTrue(r['has_lookahead'], "強制套用時必須標記未來函數")
+        self.assertIn('未來函數', screener_backtest.summarize(r))
+
+    def test_entry_is_next_trading_day_after_signal(self):
+        """訊號用收盤價算出來,不可能用同一根的收盤價成交——進場必須是隔一日。"""
+        r = self._run()
+        for p in r['periods']:
+            self.assertGreater(p['entry_date'], p['signal_date'],
+                               "進場日必須晚於訊號日")
+            self.assertGreater(p['exit_date'], p['entry_date'])
+
+    def test_no_future_data_leaks_into_screening(self):
+        """篩選當下只能看到 <= 訊號日的 K 棒。"""
+        daily = self._market()
+        seen = {}
+
+        def spy_to_ohlcv(df, code):
+            seen['max_date'] = max(seen.get('max_date', ''), str(df['Date'].max()))
+            return market_store.to_ohlcv_frame(df, code)
+
+        r = screener_backtest.run_screener_backtest(
+            daily, conditions=[{'type': 'price_above_ma', 'params': {'n': 20}}],
+            rebalance_days=10, top_n=3, min_bars=25, to_ohlcv=spy_to_ohlcv)
+        last_signal = max(p['signal_date'] for p in r['periods'])
+        self.assertLessEqual(seen['max_date'], last_signal,
+                             "篩選時看到了訊號日之後的資料 (未來函數)")
+
+    def test_rebalance_dates_skip_warmup(self):
+        days = [f'2026-01-{d:02d}' for d in range(1, 29)]
+        reb = screener_backtest.rebalance_dates(days, rebalance_days=5, min_bars=10)
+        self.assertEqual(reb[0], days[10], "前 min_bars 天要留給指標暖身")
+        self.assertEqual(reb[1], days[15])
+
+    def test_insufficient_data_warns_instead_of_crashing(self):
+        tiny = self._market(n_days=10)
+        r = screener_backtest.run_screener_backtest(
+            tiny, conditions=[{'type': 'price_above_ma', 'params': {'n': 20}}],
+            min_bars=60, to_ohlcv=market_store.to_ohlcv_frame)
+        self.assertEqual(r['periods'], [])
+        self.assertTrue(any('交易日不足' in w for w in r['warnings']))
+
+    def test_no_conditions_warns(self):
+        r = screener_backtest.run_screener_backtest(
+            self._market(), conditions=[], min_bars=25,
+            to_ohlcv=market_store.to_ohlcv_frame)
+        self.assertTrue(any('沒有可回測的條件' in w for w in r['warnings']))
+
+    def test_empty_market_returns_warning(self):
+        r = screener_backtest.run_screener_backtest(None)
+        self.assertTrue(r['warnings'])
+        self.assertEqual(r['periods'], [])
+
+    def test_metrics_include_buy_hold_comparison(self):
+        """要能回答「這組條件有沒有贏過隨便買」。"""
+        m = self._run()['metrics']
+        for k in ('total_return_pct', 'buy_hold_pct', 'excess_pct',
+                  'max_drawdown_pct', 'win_rate', 'period_win_rate'):
+            self.assertIn(k, m)
+        self.assertAlmostEqual(m['excess_pct'],
+                               m['total_return_pct'] - m['buy_hold_pct'], places=1)
+
+    def test_costs_reduce_return(self):
+        with_cost = self._run(apply_cost=True)['metrics']['total_pnl']
+        no_cost = self._run(apply_cost=False)['metrics']['total_pnl']
+        self.assertLess(with_cost, no_cost, "含手續費與交易稅的損益必須較低")
+
+    def test_should_stop_aborts(self):
+        r = self._run(should_stop=lambda: True)
+        self.assertTrue(any('中止' in w for w in r['warnings']))
 
 
 if __name__ == "__main__":
