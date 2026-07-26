@@ -4516,6 +4516,59 @@ class TestFundamentalParser(unittest.TestCase):
         self.assertIsNone(fundamental_parser.derive_roe(5.0, 0, 100.0))
         self.assertIsNone(fundamental_parser.derive_roe(None, 2.0, 100.0))
 
+    def test_income_statement_reads_both_chinese_and_english_code_field(self):
+        """上市用中文欄名「公司代號」、上櫃用英文「SecuritiesCompanyCode」。
+
+        只讀其中一種會**整批漏掉另一個市場**且不報錯 (筆數少了但看不出來)
+        ——這是實測抓到的真實 bug:上櫃 884 筆損益表原本全被濾掉,只剩 7 筆。
+        """
+        twse = [{'公司代號': '2330', '營業收入': '1000',
+                 '營業毛利（毛損）淨額': '660', '基本每股盈餘（元）': '22.08'}]
+        tpex = [{'SecuritiesCompanyCode': '1240', 'CompanyName': '茂生農經',
+                 '營業收入': '689952', '營業毛利（毛損）淨額': '88232',
+                 '基本每股盈餘（元）': '0.89'}]
+        a = fundamental_parser.parse_income_statement(twse)
+        b = fundamental_parser.parse_income_statement(tpex)
+        self.assertEqual(len(a), 1)
+        self.assertEqual(len(b), 1, "英文欄名的上櫃資料不可被漏掉")
+        self.assertEqual(b.iloc[0]['Code'], '1240')
+        self.assertEqual(b.iloc[0]['EPS'], 0.89)
+
+    def test_financial_holding_has_eps_but_no_gross_margin(self):
+        """金控/保險沒有「營業收入/營業毛利」欄位,毛利率為空是正確的。
+
+        金控股在 _fh 變體而不是 _ci——只抓 _ci 會漏掉富邦金/國泰金等全部
+        金控股 (實測抓到的缺口)。
+        """
+        fh = [{'公司代號': '2881', '公司名稱': '富邦金', '淨收益': '100',
+               '基本每股盈餘（元）': '2.40'}]
+        df = fundamental_parser.parse_income_statement(fh)
+        self.assertEqual(df.iloc[0]['EPS'], 2.40)
+        self.assertTrue(pd.isna(df.iloc[0]['GrossMarginPct']),
+                        "金控沒有毛利率概念,應為空而不是 0")
+
+    def test_balance_sheet_derives_equity_from_assets_minus_debts(self):
+        """上櫃資產負債表沒有「權益總額」,用會計恆等式推導。"""
+        twse = [{'公司代號': '2330', '權益總額': '5000'}]
+        tpex = [{'SecuritiesCompanyCode': '1240', '資產總計': '3000', '負債總計': '1200'}]
+        self.assertEqual(fundamental_parser.parse_balance_sheet(twse).iloc[0]['Equity'], 5000)
+        self.assertEqual(fundamental_parser.parse_balance_sheet(tpex).iloc[0]['Equity'], 1800)
+
+    def test_roc_date_to_iso(self):
+        """櫃買日行情的 Date 是民國 7 碼;沒解析它會讓整批資料日期為空。"""
+        self.assertEqual(fundamental_parser.roc_date_to_iso('1150724'), '2026-07-24')
+        self.assertEqual(fundamental_parser.roc_date_to_iso('20260724'), '2026-07-24')
+        self.assertIsNone(fundamental_parser.roc_date_to_iso(''))
+
+    def test_tpex_daily_all_parses_own_date_field(self):
+        rows = [{'Date': '1150724', 'SecuritiesCompanyCode': '6488', 'CompanyName': '環球晶',
+                 'Open': '1020', 'High': '1035', 'Low': '1010', 'Close': '1030',
+                 'TradingShares': '5000'}]
+        df = fundamental_parser.parse_tpex_daily_all(rows)
+        self.assertEqual(df.iloc[0]['Date'], '2026-07-24',
+                         "呼叫端沒傳日期時要能自己從 Date 欄解析")
+        self.assertEqual(df.iloc[0]['Close'], 1030.0)
+
     def test_merge_fills_eps_from_pe_when_income_missing(self):
         """上櫃沒有損益表端點,EPS 要能從 收盤價/本益比 補上。"""
         val = pd.DataFrame([{'Code': '6488', 'Name': 'A', 'Close': 100.0,

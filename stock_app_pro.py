@@ -3838,7 +3838,10 @@ class StockTradingAppPro(tk.Tk):
         full = f"{url}?{urllib.parse.urlencode(params)}"
         req = urllib.request.Request(full, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode('utf-8'))
+            # 用 utf-8-sig:證交所 OpenAPI 的部分端點帶 BOM,純 utf-8 解碼後
+            # 開頭會多一個 \ufeff 讓 json.loads 直接失敗。utf-8-sig 對「沒有
+            # BOM 的 UTF-8」行為完全相同,所以一律用它比較安全。
+            return json.loads(resp.read().decode('utf-8-sig'))
 
     def _chips_http_taifex(self, start_d, end_d, timeout=60):
         """POST 期交所三大法人 CSV (支援日期區間,一次可抓一整個月)。回傳 bytes。"""
@@ -11272,13 +11275,46 @@ class StockTradingAppPro(tk.Tk):
     SC_TWSE_MI_URL = 'https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX'
     SC_TWSE_VAL_URL = 'https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU_d'
     SC_TWSE_REV_URL = 'https://openapi.twse.com.tw/v1/opendata/t187ap05_L'
-    SC_TWSE_INC_URL = 'https://openapi.twse.com.tw/v1/opendata/t187ap06_L_ci'
-    SC_TWSE_BAL_URL = 'https://openapi.twse.com.tw/v1/opendata/t187ap07_L_ci'
     SC_TPEX_VAL_URL = 'https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis'
     SC_TPEX_REV_URL = 'https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O'
     SC_TPEX_QUOTE_URL = 'https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes'
+
+    # 【ADR-103 修正】財報依「產業別」分成六個端點,必須全部抓才完整。
+    # 實測踩到的坑:只抓 _ci 會**漏掉全部金控股** (2881 富邦金、2882 國泰金、
+    # 2884 玉山金… 都在 _fh),而金控是台股權值股的重要部分。
+    #   ci   一般業 (最大宗)      basi 基本 (少數)
+    #   bd   建設業               fh   金融控股
+    #   ins  保險業               mim  其他
+    # 金控/保險沒有「營業收入/營業毛利」欄位 (損益結構本就不同),解析時
+    # 毛利率自然為空——那是正確的,不是資料缺失。EPS 則六種都有。
+    SC_FIN_VARIANTS = ('ci', 'basi', 'bd', 'fh', 'ins', 'mim')
+    SC_TWSE_INC_TPL = 'https://openapi.twse.com.tw/v1/opendata/t187ap06_L_{v}'
+    SC_TWSE_BAL_TPL = 'https://openapi.twse.com.tw/v1/opendata/t187ap07_L_{v}'
+    SC_TPEX_INC_TPL = 'https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap06_O_{v}'
+    SC_TPEX_BAL_TPL = 'https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap07_O_{v}'
     SC_REQUEST_INTERVAL = 1.0      # 禮貌節流,同 ADR-100 的精神
     SC_HISTORY_DAYS = 180          # 技術面需要的歷史深度 (約 120 個交易日)
+
+    def _sc_http_json_retry(self, url, params=None, tries=3, timeout=45):
+        """帶重試的 JSON 下載。回傳 (資料, 錯誤訊息);成功時錯誤訊息為 ''。
+
+        【為什麼一定要重試】實測發現官方的財報大檔端點 (t187ap06/07 的 _ci
+        變體,單檔 1000+ 筆) 會**間歇性失敗**:同一個網址連續請求 4 次,
+        第 1 次 JSONDecodeError、後 3 次都正常回 884 筆。沒有重試的話,
+        使用者更新時只要剛好碰上那一次失敗,就會少掉整批資料 (例如全部上櫃
+        損益表),而且畫面上看不出來——這正是本次驗證所抓到的實際問題。
+        """
+        last = ''
+        for attempt in range(1, int(tries) + 1):
+            if self._closing or self._sc_cancel:
+                return None, '已中止'
+            try:
+                return self._chips_http_json(url, params or {}, timeout=timeout), ''
+            except Exception as e:
+                last = f"{type(e).__name__}: {str(e)[:60]}"
+                if attempt < tries:
+                    time.sleep(self.SC_REQUEST_INTERVAL * attempt * 2)
+        return None, last
 
     def _build_screener_panel(self, parent):
         self._sc_running = False
@@ -11453,9 +11489,12 @@ class StockTradingAppPro(tk.Tk):
             self.safe_after(0, self._sc_set_idle)
 
     def _sc_update_fundamental(self):
-        """抓五個基本面來源並合併存檔。每個來源獨立 try (鐵則8)。"""
-        def _get(url, params=None):
-            return self._chips_http_json(url, params or {})
+        """抓齊所有基本面來源並合併存檔。
+
+        每個來源都走 _sc_http_json_retry (帶重試),且**逐一回報實際筆數**:
+        官方財報大檔會間歇性失敗,靜默少掉一整批資料是最危險的情況——
+        使用者會以為篩選結果是完整的。重試後仍失敗一定要出現在日誌。
+        """
         val = rev = inc = bal = None
         daily = market_store.load_daily_range(
             self.SCREENER_BASE_DIR,
@@ -11465,39 +11504,84 @@ class StockTradingAppPro(tk.Tk):
             latest = daily['Date'].astype(str).max()
             daily = daily[daily['Date'].astype(str) == latest]
         parts_v, parts_r, parts_b = [], [], []
-        for name, fn in (
-            ('上市估值', lambda: fundamental_parser.parse_twse_valuation(
-                _get(self.SC_TWSE_VAL_URL, {'date': datetime.now().strftime('%Y%m%d'),
-                                            'selectType': 'ALL', 'response': 'json'}))),
-            ('上櫃估值', lambda: fundamental_parser.parse_tpex_valuation(_get(self.SC_TPEX_VAL_URL))),
+        for name, url, params, parser in (
+            ('上市估值', self.SC_TWSE_VAL_URL,
+             {'date': datetime.now().strftime('%Y%m%d'), 'selectType': 'ALL', 'response': 'json'},
+             fundamental_parser.parse_twse_valuation),
+            ('上櫃估值', self.SC_TPEX_VAL_URL, None, fundamental_parser.parse_tpex_valuation),
         ):
-            try:
-                d = fn()
+            self.safe_after(0, self._sc_set_status, f"下載{name} ...")
+            payload, err = self._sc_http_json_retry(url, params)
+            if payload is None:
+                self.safe_after(0, self.log_message, f"【選股】⚠ {name}重試後仍失敗:{err}")
+            else:
+                d = parser(payload)
                 if d is not None and not d.empty:
                     parts_v.append(d)
-            except Exception as e:
-                self.safe_after(0, self.log_message, f"【選股】{name}下載失敗:{e}")
+                    self.safe_after(0, self.log_message, f"【選股】{name}:{len(d)} 檔")
             time.sleep(self.SC_REQUEST_INTERVAL)
         for name, url in (('上市月營收', self.SC_TWSE_REV_URL), ('上櫃月營收', self.SC_TPEX_REV_URL)):
-            try:
-                d = fundamental_parser.parse_monthly_revenue(_get(url))
+            self.safe_after(0, self._sc_set_status, f"下載{name} ...")
+            payload, err = self._sc_http_json_retry(url)
+            if payload is None:
+                self.safe_after(0, self.log_message, f"【選股】⚠ {name}重試後仍失敗:{err}")
+            else:
+                d = fundamental_parser.parse_monthly_revenue(payload)
                 if d is not None and not d.empty:
                     parts_r.append(d)
-            except Exception as e:
-                self.safe_after(0, self.log_message, f"【選股】{name}下載失敗:{e}")
+                    self.safe_after(0, self.log_message, f"【選股】{name}:{len(d)} 檔")
             time.sleep(self.SC_REQUEST_INTERVAL)
-        try:
-            inc = fundamental_parser.parse_income_statement(_get(self.SC_TWSE_INC_URL))
-        except Exception as e:
-            self.safe_after(0, self.log_message, f"【選股】損益表下載失敗:{e}")
+        # 【ADR-103 修正】財報六個產業別變體全部抓 (見 SC_FIN_VARIANTS 說明:
+        # 只抓 _ci 會漏掉全部金控股)。單一變體失敗不影響其他 (鐵則8)。
+        parts_i, parts_bal = [], []
+        for tpl, bucket, kind, parser in (
+            (self.SC_TWSE_INC_TPL, parts_i, '上市損益表', fundamental_parser.parse_income_statement),
+            (self.SC_TPEX_INC_TPL, parts_i, '上櫃損益表', fundamental_parser.parse_income_statement),
+            (self.SC_TWSE_BAL_TPL, parts_bal, '上市資產負債表', fundamental_parser.parse_balance_sheet),
+            (self.SC_TPEX_BAL_TPL, parts_bal, '上櫃資產負債表', fundamental_parser.parse_balance_sheet),
+        ):
+            got, failed = 0, []
+            for v in self.SC_FIN_VARIANTS:
+                if self._closing or self._sc_cancel:
+                    break
+                self.safe_after(0, self._sc_set_status, f"下載 {kind} ({v}) ...")
+                payload, err = self._sc_http_json_retry(tpl.format(v=v))
+                if payload is None:
+                    failed.append(v)      # 重試後仍失敗:一定要讓使用者看見
+                else:
+                    try:
+                        d = parser(payload)
+                        if d is not None and not d.empty:
+                            bucket.append(d)
+                            got += len(d)
+                    except Exception:
+                        failed.append(v)
+                time.sleep(self.SC_REQUEST_INTERVAL)
+            msg = f"【選股】{kind}:{got} 筆 (六種產業別合計)"
+            if failed:
+                # 靜默少掉一整批資料是最危險的:使用者會以為篩選結果是完整的
+                msg += f";⚠ {'/'.join(failed)} 重試後仍失敗,這批股票的相關欄位會是空值"
+            self.safe_after(0, self.log_message, msg)
+
+        # 【ADR-103 修正】補上櫃日行情:櫃買的估值端點沒有收盤價,少了它
+        # 上櫃股票就算不出 ROE (ROE 需要每股淨值 = 收盤價 ÷ 股價淨值比),
+        # 實測 ROE 覆蓋率因此只有 55%,且上櫃全是空值。
+        self.safe_after(0, self._sc_set_status, "下載上櫃日行情 ...")
+        otc_daily, err = self._sc_http_json_retry(self.SC_TPEX_QUOTE_URL)
+        if otc_daily is not None:
+            d_otc = fundamental_parser.parse_tpex_daily_all(otc_daily)
+            if d_otc is not None and not d_otc.empty:
+                market_store.upsert_daily(self.SCREENER_BASE_DIR, d_otc)
+                daily = pd.concat([daily, d_otc], ignore_index=True) if daily is not None else d_otc
+                self.safe_after(0, self.log_message, f"【選股】上櫃日行情:{len(d_otc)} 檔")
+        else:
+            self.safe_after(0, self.log_message, f"【選股】⚠ 上櫃日行情重試後仍失敗:{err}")
         time.sleep(self.SC_REQUEST_INTERVAL)
-        try:
-            bal = fundamental_parser.parse_balance_sheet(_get(self.SC_TWSE_BAL_URL))
-        except Exception as e:
-            self.safe_after(0, self.log_message, f"【選股】資產負債表下載失敗:{e}")
 
         val = pd.concat(parts_v, ignore_index=True) if parts_v else None
         rev = pd.concat(parts_r, ignore_index=True) if parts_r else None
+        inc = pd.concat(parts_i, ignore_index=True).drop_duplicates('Code') if parts_i else None
+        bal = pd.concat(parts_bal, ignore_index=True).drop_duplicates('Code') if parts_bal else None
         merged = fundamental_parser.merge_fundamentals(
             valuation=val, revenue=rev, income=inc, balance=bal, daily=daily)
         if merged is not None and not merged.empty:

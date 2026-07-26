@@ -213,6 +213,20 @@ def parse_twse_mi_index(payload, date_iso=None):
     return pd.DataFrame(out, columns=DAILY_COLS)
 
 
+def roc_date_to_iso(v):
+    """民國 7 碼日期 '1150724' → '2026-07-24';無法解析回 None。
+
+    櫃買 OpenAPI 的 Date 欄是這種格式。第一版沒有解析它、只靠呼叫端傳
+    date_iso,結果呼叫端沒傳時整批資料的日期是 None,存檔後永遠讀不回來。
+    """
+    s = str(v or '').strip()
+    if len(s) == 7 and s.isdigit():
+        return f"{int(s[:3]) + 1911:04d}-{s[3:5]}-{s[5:7]}"
+    if len(s) == 8 and s.isdigit():
+        return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+    return None
+
+
 def parse_tpex_daily_all(rows, date_iso=None):
     """TPEx tpex_mainboard_daily_close_quotes (list of dict) → 全市場日 OHLCV。"""
     out = []
@@ -225,7 +239,8 @@ def parse_tpex_daily_all(rows, date_iso=None):
         close = to_float(d.get('Close') or d.get('ClosingPrice'))
         if close is None:
             continue
-        out.append({'Date': date_iso, COL_CODE: code,
+        day = date_iso or roc_date_to_iso(d.get('Date'))
+        out.append({'Date': day, COL_CODE: code,
                     COL_NAME: str(d.get('CompanyName') or d.get('Name') or '').strip(),
                     'Open': to_float(d.get('Open') or d.get('OpeningPrice')),
                     'High': to_float(d.get('High') or d.get('HighestPrice')),
@@ -264,18 +279,36 @@ def parse_monthly_revenue(rows):
 # ---------------------------------------------------------------------------
 # 4. 綜合損益表 (EPS / 毛利率) — 僅上市有此端點
 # ---------------------------------------------------------------------------
+def _code_of(d):
+    """取公司代號。
+
+    【實測踩到的坑】上市 (TWSE openapi) 用中文欄名「公司代號」,上櫃 (TPEx
+    openapi) 用英文欄名「SecuritiesCompanyCode」——同一張財報、兩種欄名。
+    只讀其中一種會**整批漏掉另一個市場**且完全看不出來 (筆數少了但不報錯),
+    這正是本模組第一版把上櫃損益表全部濾掉的原因。
+    """
+    return _norm_code(d.get('公司代號') or d.get('SecuritiesCompanyCode')
+                      or d.get('公司代號 ') or d.get('Code'))
+
+
 def parse_income_statement(rows):
-    """t187ap06_L_ci → DataFrame[Code,EPS,GrossMarginPct]。
+    """綜合損益表 (上市 t187ap06_L_* / 上櫃 mopsfin_t187ap06_O_*)
+    → DataFrame[Code,EPS,GrossMarginPct]。
+
+    【六種產業別】財報依產業分成 ci/basi/bd/fh/ins/mim 六個端點,必須全部抓
+    才完整:只抓 ci 會漏掉全部金控股 (富邦金/國泰金/玉山金都在 fh)。
+    金控與保險沒有「營業收入/營業毛利」欄位 (損益結構本就不同),此時毛利率
+    為空——那是正確的,不是資料缺失。EPS 則六種都有。
 
     毛利率 = 營業毛利 / 營業收入 × 100。營收為 0 或缺值時回 None
-    (不可回 0——那會讓「毛利率 > 20%」這種條件的判斷變成「不符合」而不是
-    「無資料」,兩者在選股上意義不同,見 to_float 的說明)。
+    (不可回 0——那會讓「毛利率 > 20%」的判斷變成「不符合」而不是「無資料」,
+    兩者在選股上意義不同,見 to_float 的說明)。
     """
     out = []
     for d in (rows or []):
         if not isinstance(d, dict):
             continue
-        code = _norm_code(d.get('公司代號'))
+        code = _code_of(d)
         if not is_listed_equity(code):
             continue
         rev = to_float(d.get('營業收入'))
@@ -290,17 +323,27 @@ def parse_income_statement(rows):
 
 
 def parse_balance_sheet(rows):
-    """t187ap07_L_ci / mopsfin_t187ap07_O_ci → DataFrame[Code,Equity]。"""
+    """資產負債表 (上市 t187ap07_L_* / 上櫃 mopsfin_t187ap07_O_*)
+    → DataFrame[Code,Equity]。
+
+    【欄位差異】上市有「權益總額」;上櫃**沒有**這個欄位,只有「資產總計」與
+    「負債總計」,因此用會計恆等式 權益 = 資產 − 負債 推導 (這是定義,不是估計)。
+    """
     out = []
     for d in (rows or []):
         if not isinstance(d, dict):
             continue
-        code = _norm_code(d.get('公司代號') or d.get('SecuritiesCompanyCode'))
+        code = _code_of(d)
         if not is_listed_equity(code):
             continue
         eq = to_float(d.get('權益總額'))
         if eq is None:
             eq = to_float(d.get('歸屬於母公司業主之權益合計'))
+        if eq is None:
+            assets = to_float(d.get('資產總計')) or to_float(d.get('資產總額'))
+            debts = to_float(d.get('負債總計')) or to_float(d.get('負債總額'))
+            if assets is not None and debts is not None:
+                eq = assets - debts
         out.append({COL_CODE: code, COL_EQUITY: eq})
     return pd.DataFrame(out, columns=[COL_CODE, COL_EQUITY])
 
