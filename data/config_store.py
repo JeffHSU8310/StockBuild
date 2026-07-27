@@ -180,11 +180,20 @@ def load_telegram_config(path: str) -> dict:
         return {}
 
 
-def save_telegram_config(path: str, bot_token: str, chat_id: str, enabled: bool):
-    """儲存 Telegram 通知設定 (token 僅存本機,注意檔案不要外流)。"""
+def save_telegram_config(path: str, bot_token: str, chat_id: str, enabled: bool,
+                         remote_control: bool = False):
+    """儲存 Telegram 設定 (token 僅存本機,注意檔案不要外流)。
+
+    【ADR-108】remote_control:是否允許用手機下指令控制系統 (查詢/開關策略)。
+    與 enabled (通知) 分開存放,因為兩者的風險等級完全不同——通知只是唯讀
+    推播,遠端控制則能讓系統開始下單。舊設定檔沒有這個欄位時讀回 False,
+    也就是「預設不開放遠端控制」。
+    """
     with open(path, 'w', encoding='utf-8') as f:
         json.dump({'bot_token': str(bot_token or ''), 'chat_id': str(chat_id or ''),
-                  'enabled': bool(enabled)}, f, ensure_ascii=False, indent=2)
+                  'enabled': bool(enabled),
+                  'remote_control': bool(remote_control)}, f,
+                  ensure_ascii=False, indent=2)
 
 
 # ---------------------------------------------------------------------------

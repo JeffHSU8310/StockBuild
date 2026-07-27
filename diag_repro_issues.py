@@ -6,7 +6,7 @@ diag_repro_issues.py — 重現使用者第五輪回報的三個問題 (修正�
    檢查 my_orders 與 tree_orders 的實際內容。
 3. 版面數值變更後重繪,面板位置有沒有真的改變。
 """
-import sys, os
+import sys, os, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import diag_mock_tkinter
 diag_mock_tkinter.install_mock_tkinter()
@@ -2151,6 +2151,233 @@ def _screener_industry_and_backtest():
 
 
 run_case("ADR-105/106: 產業篩選 + 選股回測/未來函數防護/紅綠上色", _screener_industry_and_backtest)
+
+
+def _telegram_remote_control():
+    """【ADR-108】手機遠端控制:授權、二次確認、啟用/停用策略的完整路徑。
+
+    這條路能讓一個「不在電腦前的人」改變會真實下單的系統狀態,所以每個
+    安全關卡都要在 GUI 這條路上實測,不能只測 core 的純函式。
+    """
+    from core import strategy_engine as _se
+    from core import paper_account as _pa
+
+    sent = []
+    orig_reply = app._tg_reply
+    orig_cfg = getattr(app, 'telegram_cfg', None)
+    orig_strats = app.strategies
+    orig_running = app._qt_running
+    orig_save = app._qt_save
+    orig_save_state = app._qt_save_state
+    orig_accts = app.paper_accts
+    orig_rts = app.strategy_runtimes
+    try:
+        app._tg_reply = lambda t: sent.append(str(t))
+        app._qt_save = lambda: None          # 診斷不要動到使用者的策略檔
+        app._qt_save_state = lambda: None
+        # 前面的案例會在共用帳戶留下部位,會誤觸「持倉核對」而擋下啟用。
+        # 這裡用乾淨帳戶,持倉核對本身在下面第 7 項單獨測。
+        app.paper_accts = {_pa.DEFAULT_ACCOUNT_ID:
+                           _pa.new_account(account_id=_pa.DEFAULT_ACCOUNT_ID)}
+        app.strategy_runtimes = {}
+        app.telegram_cfg = {'bot_token': '123:ABC', 'chat_id': '999888',
+                            'enabled': True, 'remote_control': True}
+        app._tg_pending = None
+        app._qt_running = False
+        s = {'id': 'tg1', 'name': '遠端測試策略', 'enabled': False, 'mode': '模擬',
+             'symbol': '2330', 'timeframe': '日K', 'direction': '做多', 'qty': 1,
+             'account_id': 'default', 'stop_loss_pct': 3.0,
+             'entry': [{'type': 'ma_cross_up', 'params': {'fast': 5, 'slow': 20}}],
+             'exit_signals': []}
+        ok, why = _se.validate_strategy(s)
+        assert ok, f"測試策略本身要是合法的,否則測不到後面的路徑:{why}"
+        app.strategies = [s]
+
+        # --- 1. 未授權的 chat_id 一律無效,且不回覆 (不確認 Bot 存在) ---
+        sent.clear()
+        app._tg_handle_command('123456', '/stop_all')
+        assert not sent, "未授權的指令不該有任何回覆"
+        app._tg_handle_command('123456', '/on 1')
+        assert s['enabled'] is False and not sent, "未授權的指令絕不可改變任何狀態"
+
+        # --- 2. 唯讀指令 ---
+        sent.clear()
+        app._tg_handle_command('999888', '/status')
+        assert '系統狀態' in sent[-1]
+        app._tg_handle_command('999888', '/list')
+        assert '遠端測試策略' in sent[-1]
+        app._tg_handle_command('999888', '/positions')
+        assert '實單庫存' in sent[-1], "持倉回覆必須講明看不到實單"
+        app._tg_handle_command('999888', '/pnl')
+        assert '模擬帳戶' in sent[-1]
+        app._tg_handle_command('999888', '/help')
+        assert '不提供下單' in sent[-1]
+        assert s['enabled'] is False, "唯讀指令不可改變任何狀態"
+
+        # --- 3. 啟用策略必須二次確認 ---
+        sent.clear()
+        app._tg_handle_command('999888', '/on 1')
+        assert s['enabled'] is False, "只下 /on 不該直接啟用"
+        assert '/yes' in sent[-1] and '遠端測試策略' in sent[-1]
+        assert '2330' in sent[-1], "確認訊息要講明啟用的是哪一個標的"
+        code = app._tg_pending['code']
+
+        # 錯的確認碼不放行
+        app._tg_handle_command('999888', '/yes ZZZZ')
+        assert s['enabled'] is False, "確認碼錯誤仍被啟用 = 安全破口"
+
+        # 正確的確認碼才生效
+        app._tg_handle_command('999888', f'/yes {code}')
+        assert s['enabled'] is True, "正確確認碼後應啟用"
+        assert '已啟用' in sent[-1]
+        assert '總開關目前是關閉' in sent[-1], "總開關沒開時要提醒策略不會實際運作"
+        assert app._tg_pending is None, "確認碼用過就要作廢"
+
+        # 用過的碼不能重播
+        s['enabled'] = False
+        app._tg_handle_command('999888', f'/yes {code}')
+        assert s['enabled'] is False, "確認碼被重播成功 = 安全破口"
+        s['enabled'] = True
+
+        # --- 4. 停用不需確認 (往安全方向,不可拖延) ---
+        sent.clear()
+        app._tg_handle_command('999888', '/off 1')
+        assert s['enabled'] is False, "/off 應立刻生效,不需確認"
+        assert app._tg_pending is None
+
+        # --- 5. 總開關:開需確認、關不需要 ---
+        s['enabled'] = True
+        sent.clear()
+        app._tg_handle_command('999888', '/start_all')
+        assert app._qt_running is False, "/start_all 不該直接開啟總開關"
+        assert '/yes' in sent[-1] and '模擬 1' in sent[-1]
+        app._tg_handle_command('999888', '/yes ' + app._tg_pending['code'])
+        assert app._qt_running is True, "確認後應開啟總開關"
+
+        sent.clear()
+        app._tg_handle_command('999888', '/stop_all')
+        assert app._qt_running is False, "/stop_all 必須立刻關閉,不需確認"
+
+        # --- 6. 過期的確認碼失效 ---
+        s['enabled'] = False
+        app._tg_handle_command('999888', '/on 1')
+        app._tg_pending['expire'] = time.time() - 1
+        app._tg_handle_command('999888', '/yes ' + app._tg_pending['code'])
+        assert s['enabled'] is False, "過期確認碼仍生效 = 安全破口"
+        assert app._tg_pending is None, "過期的待確認指令要丟掉,不可一直掛著"
+
+        # --- 7. 設定不完整的策略,遠端也不得啟用 (與畫面同一套檢查) ---
+        bad = dict(s); bad['id'] = 'tg2'; bad['name'] = '壞策略'
+        bad['entry'] = []; bad['enabled'] = False
+        app.strategies = [bad]
+        sent.clear()
+        app._tg_handle_command('999888', '/on 1')
+        assert bad['enabled'] is False and app._tg_pending is None, \
+            "設定不合格的策略不該進到確認階段"
+        assert '❌' in sent[-1]
+
+        # --- 7b. 持倉狀態與模擬帳戶對不上時,遠端不得啟用 (手機上做不了核對) ---
+        s['enabled'] = False
+        app.strategies = [s]
+        acct = app.paper_accts[_pa.DEFAULT_ACCOUNT_ID]
+        _pa.apply_fill(acct, '2026-07-26 09:05:00', '台股', '2330',
+                       '買進', 'OPEN', 1, 600.0)   # 帳戶有倉、策略以為 FLAT
+        sent.clear()
+        app._tg_handle_command('999888', '/on 1')
+        assert '持倉核對' in sent[-1], f"應直接擋下並說明原因,實際:{sent[-1]}"
+        assert app._tg_pending is None, "註定失敗的操作不該還要使用者確認"
+        app._tg_handle_command('999888', '/yes ' + (app._tg_pending or {}).get('code', 'X'))
+        assert s['enabled'] is False, "持倉對不上仍被遠端啟用 = 起點就錯的策略"
+        acct['positions'].clear()
+
+        # --- 8. 沒有任何下單指令 ---
+        sent.clear()
+        for bad_cmd in ('/buy 2330 1', '/sell 2330 1', '/order 2330'):
+            app._tg_handle_command('999888', bad_cmd)
+        assert not sent, "遠端介面不得存在任何下單指令 (鐵則14)"
+
+        # --- 9. 沒開遠端控制時,輪詢執行緒不會做事 ---
+        app.telegram_cfg = dict(app.telegram_cfg, remote_control=False)
+        assert app._tg_control_enabled() is False
+        app.telegram_cfg = dict(app.telegram_cfg, remote_control=True, bot_token='')
+        assert app._tg_control_enabled() is False, "token 沒填也不能啟動遠端控制"
+    finally:
+        app._tg_reply = orig_reply
+        app.telegram_cfg = orig_cfg
+        app.strategies = orig_strats
+        app._qt_running = orig_running
+        app._qt_save = orig_save
+        app._qt_save_state = orig_save_state
+        app.paper_accts = orig_accts
+        app.strategy_runtimes = orig_rts
+        app._tg_pending = None
+
+
+run_case("ADR-108: Telegram 遠端控制授權/二次確認/啟用停用策略", _telegram_remote_control)
+
+
+def _volume_axis_starts_at_zero():
+    """【ADR-109】成交量副圖的 Y 軸必須從 0 起算。
+
+    這條原本有寫,但因為 auto_scale_indicator_panels 被重複定義了兩次、
+    後面那份把前面那份整個蓋掉而靜默失效 (量能長條被從底部裁掉一截)。
+    修好之後補這個案例,讓它再壞掉時會被抓到而不是又靜悄悄地錯。
+    """
+    class _Ax:
+        def __init__(s): s.ylim = None
+        def set_ylim(s, lo, hi): s.ylim = (float(lo), float(hi))
+
+    old_df, old_axl = app.plot_df, getattr(app, 'axlist', None)
+    old_ap = getattr(app, 'active_panels', None)
+    old_pc = getattr(app, 'panel_columns', None)
+    try:
+        n = 40
+        idx = pd.date_range('2026-01-01', periods=n, freq='D')
+        # 量刻意「全部都很大且彼此接近」(80萬~100萬):最小值遠離 0,
+        # 若用一般副圖的 low-padding 當下限,長條就會被從底部裁掉。
+        vol = np.linspace(800000, 1000000, n)
+        macd = np.linspace(-5, 5, n)
+        app.plot_df = pd.DataFrame({
+            'Open': np.linspace(100, 110, n), 'High': np.linspace(101, 111, n),
+            'Low': np.linspace(99, 109, n), 'Close': np.linspace(100, 110, n),
+            'Volume': vol, 'MACD': macd}, index=idx)
+        ax_vol, ax_macd = _Ax(), _Ax()
+        # axlist 的排列是 panel_index * 2 (mplfinance 每個 panel 有主/次兩個軸)
+        app.axlist = [_Ax(), _Ax(), ax_vol, _Ax(), ax_macd, _Ax()]
+        app.active_panels = {'Volume': 1, 'MACD': 2}
+        app.panel_columns = {'Volume': ['Volume'], 'MACD': ['MACD']}
+
+        app.auto_scale_indicator_panels(0, n)
+
+        assert ax_vol.ylim is not None, "成交量副圖的 Y 軸沒有被設定"
+        lo, hi = ax_vol.ylim
+        assert lo == 0.0, f"成交量 Y 軸下限必須是 0,實際 {lo} (長條會被從底部裁掉)"
+        assert hi >= float(vol.max()), f"成交量 Y 軸上限要容得下最大量,實際 {hi}"
+
+        # 其他副圖不適用「從 0 起算」:MACD 有負值,硬從 0 起算會看不到負的那半
+        assert ax_macd.ylim is not None
+        mlo, mhi = ax_macd.ylim
+        assert mlo < float(macd.min()) and mhi > float(macd.max()), \
+            "一般副圖仍應依視角內極值上下留白"
+        assert mlo < 0, "MACD 有負值,Y 軸不可從 0 起算"
+
+        # 主圖:視角內價格完全沒波動時,仍要給得出一個範圍 (漲停鎖死/單根K棒)
+        flat = app.plot_df.copy()
+        flat['High'] = flat['Low'] = flat['Close'] = flat['Open'] = 100.0
+        app.plot_df = flat
+        ax_main = _Ax()
+        app.auto_scale_y(ax_main, 0, n)
+        assert ax_main.ylim is not None, "價格完全沒波動時仍要設定 Y 軸,否則K棒會被壓成一條線"
+        assert ax_main.ylim[0] < 100.0 < ax_main.ylim[1]
+    finally:
+        app.plot_df = old_df
+        app.axlist = old_axl
+        app.active_panels = old_ap
+        app.panel_columns = old_pc
+
+
+run_case("ADR-109: 成交量Y軸從0起算 + 無波動時仍給範圍 (重複定義修正)",
+         _volume_axis_starts_at_zero)
 
 print(f"{'案例':60s} 結果")
 print("-" * 76)
