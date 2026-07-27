@@ -219,13 +219,16 @@ G:\StockBuild\
 │   ├─ indicators.py
 │   ├─ futures_session.py
 │   ├─ order_intent.py      券商中立的委託意圖 (ADR-110)
+│   ├─ broker_ipc.py        券商子行程 IPC 協定 (ADR-112)
 │   └─ order_rules.py
 ├─ data/
 │   └─ config_store.py     設定 / 自選股 / 版面 I/O
 ├─ brokers/                券商 adapter (零 tkinter,可依賴券商 SDK,ADR-097)
 │   ├─ base.py              BrokerClient 介面:連線/下單/帳號 (ADR-110)
 │   ├─ sinopac.py           永豐 shioaji adapter (連線 + 委託翻譯 + 帳號解析)
-│   └─ kgi.py               凱基 kgisuperpy adapter (ADR-111;帳號綁定需上鎖)
+│   ├─ kgi.py               凱基 kgisuperpy adapter (ADR-111;帳號綁定需上鎖)
+│   ├─ kgi_proxy.py         凱基「獨立 3.13 子行程」代理 (ADR-112)
+│   └─ kgi_worker.py        凱基子行程本體 (**用 Python 3.13 執行**)
 ├─ tests/
 │   ├─ test_core.py        core/ + data/ 離線單元測試
 │   └─ test_brokers.py     brokers/ 離線測試 (照 SDK 原始碼複刻的假模組,ADR-111)

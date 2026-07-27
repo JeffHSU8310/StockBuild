@@ -192,6 +192,9 @@ def save_telegram_config(path: str, bot_token: str, chat_id: str, enabled: bool)
 # 偏好等)。用一份 JSON 存放,讀不到/壞掉一律回傳預設,絕不因設定檔壞掉就當掉。
 # ---------------------------------------------------------------------------
 DEFAULT_APP_SETTINGS = {
+    # 【ADR-112】凱基子行程用的直譯器路徑。空字串 = 自動找 python3.13。
+    # 主程式的 Python 版本載不動 kgisuperpy 時才會用到 (見 P-59)。
+    'kgi_python': '',
     'odd_lot_open': '09:10',       # 盤中零股開盤時刻 (現制 09:10;未來改 09:00 自己切)
     'auto_reconnect': False,       # 斷線自動重連開關 (記憶體憑證)
     'remember_creds': False,       # 記住憑證並開機自動登入 (加密存本機)

@@ -2243,11 +2243,13 @@ def _order_intent_preserves_shioaji_order():
         # --- 8. 策略沒設 broker 欄位時要落到永豐,不能變成「找不到券商」---
         assert app._broker_key_of({}) == 'sinopac'
         assert app._broker_key_of({'broker': 'kgi'}) == 'kgi'
+        # 'mega' (兆豐) 還沒接 adapter:指定一家沒註冊的券商要明確報錯,
+        # 而且訊息要講出是哪一家 (用 kgi 測不到這件事——它已經註冊了)。
         ok, msg = app._place_strategy_order(
             {'id': 'x', 'symbol': '2330', 'trade_type': '股票', 'price_type': '限價',
-             'qty': 1, 'broker': 'kgi'},
+             'qty': 1, 'broker': 'mega'},
             {'action': '買進', 'qty': 1, 'price': 600.0}, object(), 'stock')
-        assert not ok and 'kgi' in msg, f"未接上的券商應明確報錯,實際:{msg}"
+        assert not ok and 'mega' in msg, f"未接上的券商應明確報錯,實際:{msg}"
     finally:
         broker.api = orig_api
 
@@ -2331,8 +2333,10 @@ def _strategy_level_account_routing():
         assert 'XXXX-0000' in msg, f"錯誤訊息要指出是哪個帳號找不到,實際:{msg}"
 
         # --- 5. 指定一家還沒接上的券商 → 擋下並說清楚是哪一家 ---
-        ok, msg = _send(_s(broker='kgi'))
-        assert not ok and 'kgi' in msg, msg
+        # 用 'mega' 而不是 'kgi':凱基已經有 adapter (ADR-111/112) 會真的
+        # 去啟動子行程,那是 tests/test_brokers.py 的守備範圍,不是這裡。
+        ok, msg = _send(_s(broker='mega'))
+        assert not ok and 'mega' in msg, msg
 
         # --- 6. 畫面上要看得出「這張單會下到哪裡」---
         t = app._qt_live_target_text(_s(broker_account='F031-7654321'))

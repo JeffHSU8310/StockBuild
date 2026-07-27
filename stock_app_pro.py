@@ -66,6 +66,10 @@ from brokers.sinopac import SinopacBroker
 # 【ADR-111】凱基 adapter。HAS_KGI 為 False 代表套件沒裝或載不起來
 # (Python 3.14 就是這種情況),主程式照常運作,只是沒有凱基這個選項。
 from brokers.kgi import KGIBroker, HAS_KGI
+# 【ADR-112】主程式的 Python 版本載不了 kgisuperpy 時,凱基改用獨立
+# 3.13 子行程 + IPC (見 DECISIONS_ADR112.md)。
+from brokers.kgi_proxy import KGIProcessBroker
+from core import broker_ipc
 
 # 嘗試載入永豐金 API
 try:
@@ -243,12 +247,6 @@ class StockTradingAppPro(tk.Tk):
         if HAS_SJ:
             self.brokers['sinopac'] = SinopacBroker()
             self.sj_api = self.brokers['sinopac'].api
-        # 【ADR-111】凱基 adapter:套件裝不起來 (例如 Python 3.14) 時
-        # HAS_KGI=False,這裡就完全不註冊 —— 策略編輯器的下拉自然不會出現
-        # 凱基的帳號,使用者不會選到一個根本不能用的目標。
-        if HAS_KGI:
-            self.brokers['kgi'] = KGIBroker()
-
         self.config_file = app_path("broker_config.json")
         self.wl_file = app_path("watchlists.json")
         # 【ADR-072】一般 App 設定 (零股開盤時刻、自動重連/自動登入偏好)。
@@ -256,6 +254,18 @@ class StockTradingAppPro(tk.Tk):
         self.app_settings = config_store.load_app_settings(self.app_settings_file)
         # 套用盤中零股開盤時刻到 market_session (預設 09:10,可設定)。
         market_session.set_odd_lot_open_hhmm(self.app_settings.get('odd_lot_open', '09:10'))
+
+        # 【ADR-111/112】(註冊時機要在 app_settings 載入之後:子行程模式
+        # 需要讀使用者設定的 3.13 直譯器路徑)
+        # 【ADR-111/112】凱基:主程式的直譯器載得動 kgisuperpy 就直接用
+        # (少一層行程邊界);載不動 (例如 Python 3.14) 就改用獨立 3.13 子行程
+        # + IPC。兩者對上層是同一個介面,策略設定完全不用改。
+        if HAS_KGI:
+            self.brokers['kgi'] = KGIBroker()
+        else:
+            self.brokers['kgi'] = KGIProcessBroker(
+                python_path=self.app_settings.get('kgi_python', ''))
+
         # 【ADR-071/073】加密憑證存放檔 (只在勾選「記住憑證」時才會有內容)。
         self.secure_creds_file = app_path("broker_secure.json")
         # 【第十二輪修正】登入進行中旗標:防止使用者在「畫面看起來沒反應」時
@@ -438,6 +448,19 @@ class StockTradingAppPro(tk.Tk):
             # 先 logout 舊連線,不會被殭屍 session 卡住)。
             try:
                 t = threading.Thread(target=lambda: self.brokers['sinopac'].logout(), daemon=True)
+                t.start()
+                t.join(timeout=3.0)
+            except Exception:
+                pass
+        # 【ADR-112】券商子行程 (凱基) 必須明確收掉。它是獨立行程,不會隨
+        # os._exit(0) 一起死 —— 留著會變成孤兒行程,還握著券商 session,
+        # 下次啟動可能因此登不進去。同樣丟背景執行緒 + 限時,不讓它拖住關閉。
+        for _bk, _b in (getattr(self, 'brokers', None) or {}).items():
+            _stop = getattr(_b, '_stop', None)
+            if _stop is None:
+                continue
+            try:
+                t = threading.Thread(target=_stop, daemon=True)
                 t.start()
                 t.join(timeout=3.0)
             except Exception:
@@ -7203,8 +7226,29 @@ class StockTradingAppPro(tk.Tk):
             unit = strategy_engine.qty_unit_of(strategy)
             return True, (f"{oi['price_label']} x{oi['qty']}{unit} ({oi['trade_type']}) "
                           f"已送出 (狀態 {broker.order_status_text(trade)})")
+        except broker_ipc.OrderOutcomeUnknown as e:
+            # 【ADR-112】委託送進子行程但沒收到回應 —— **不知道**券商收到沒有。
+            # 回 False 會讓策略維持 FLAT、下一根 K 棒再進場一次 (可能重複下單);
+            # 回 True 會記一個可能不存在的部位。兩種猜法都會賠錢,所以第三條路:
+            # 停掉這個策略,要求人工到券商端確認。
+            self._qt_halt_strategy_unknown(strategy, str(e))
+            return False, f"⚠️ 結果不確定,已自動停用此策略: {e}"
         except Exception as e:
             return False, f"{type(e).__name__}: {e}"
+
+    def _qt_halt_strategy_unknown(self, strategy, detail):
+        """下單結果不確定時,把策略停掉並大聲告知 (ADR-112)。
+
+        自動停用是刻意的:在人確認券商端狀態之前,這個策略的持倉認知已經
+        不可信,讓它繼續跑只會把錯誤放大。停用比「猜一個狀態繼續跑」安全。
+        """
+        try:
+            self.safe_after(0, self._qt_finish_set_enabled, strategy, False)
+        except Exception:
+            strategy['enabled'] = False
+        self.safe_after(0, self.log_message,
+                        f"【自動交易-結果不明】🚨 策略「{strategy.get('name')}」的委託"
+                        f"送出後失去回應,已自動停用。{detail}")
 
     # ------------------------------------------------------------------
     # 【ADR-110 階段2】self.sj_api 改成 self.brokers['sinopac'].api 的別名
