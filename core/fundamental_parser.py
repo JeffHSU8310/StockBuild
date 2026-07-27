@@ -137,9 +137,17 @@ DAILY_COLS = ['Date', COL_CODE, COL_NAME, 'Open', 'High', 'Low', 'Close', 'Volum
 def parse_twse_daily_all(raw, date_iso=None):
     """TWSE STOCK_DAY_ALL (CSV bytes/str) → 全市場日 OHLCV。
 
-    這個端點是整個選股工具能成立的關鍵:一次請求就拿到全上市股票的當日
-    OHLCV,技術面篩選因此完全不需要逐檔打 shioaji (那會直接撞上鐵則 5 的
-    API 配額上限)。
+    這個端點一次請求就拿到全上市股票的當日 OHLCV,技術面篩選因此完全
+    不需要逐檔打 shioaji (那會直接撞上鐵則 5 的 API 配額上限)。
+
+    ⚠️【已停用,ADR-103 後改用 `parse_twse_mi_index()`】STOCK_DAY_ALL **只有
+    當天**、不吃 `date=` 參數,拿不到歷史,選股回測 (ADR-106) 需要的歷史
+    日線因此完全補不起來。現行下載路徑走的是
+    `MI_INDEX?type=ALLBUT0999&date=YYYYMMDD`,可逐日回補。
+
+    這個函式目前沒有任何呼叫端,保留是因為若哪天 MI_INDEX 改版失效,它是
+    現成的「今日快照」備援。要用它之前先確認你要的是不是歷史——不是的話
+    請用 `parse_twse_mi_index()`。
     """
     text = raw.decode('utf-8-sig', errors='replace') if isinstance(raw, (bytes, bytearray)) else str(raw)
     rows = list(csv.reader(io.StringIO(text)))
