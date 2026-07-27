@@ -137,6 +137,27 @@ def mark_price(acct, symbol, price):
         pos['mark_price'] = float(price)
 
 
+def realized_pnl_on(acct, day):
+    """【ADR-108】某一天已實現損益 = 該日 history 裡所有 pnl 相加。
+
+    刻意用「ts 字串前綴比對」而不是解析日期:ts 由呼叫端以
+    `'%Y-%m-%d %H:%M:%S'` 寫入 (見 apply_fill 的呼叫點),前綴比對不會因為
+    時區或 strptime 失敗而整個炸掉——查詢損益不該有機會讓程式當掉。
+    格式不符的舊記錄只是不被計入,不影響 realized_pnl 累計值。
+    """
+    d = str(day or '').strip()
+    if not d:
+        return 0.0
+    total = 0.0
+    for rec in (acct or {}).get('history') or []:
+        if str(rec.get('ts', '')).startswith(d):
+            try:
+                total += float(rec.get('pnl') or 0.0)
+            except (TypeError, ValueError):
+                continue
+    return total
+
+
 def unrealized_pnl(acct):
     total = 0.0
     for sym, pos in acct['positions'].items():

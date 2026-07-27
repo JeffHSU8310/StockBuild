@@ -41,6 +41,7 @@ from core import paper_account
 from core import taifex_daily
 from core import chukuangren_band
 from core import telegram_notify
+from core import telegram_control
 from core import market_pattern
 from core import chips_parser
 from core import chips_features
@@ -1445,6 +1446,197 @@ class TestTelegramConfigStore(unittest.TestCase):
         self.assertEqual(d['bot_token'], '')
         self.assertFalse(d['enabled'])
         os.remove(p)
+
+    def test_remote_control_defaults_off(self):
+        """【ADR-108】遠端控制預設關閉:沒有明講要開,就不能開。
+        舊設定檔沒有這個欄位時,讀回來也必須是 False。"""
+        import tempfile
+        p = os.path.join(tempfile.gettempdir(), '_telegram_cfg_remote.json')
+        config_store.save_telegram_config(p, '123:ABC', '999', True)   # 沒帶 remote_control
+        self.assertFalse(config_store.load_telegram_config(p)['remote_control'])
+        config_store.save_telegram_config(p, '123:ABC', '999', True, True)
+        self.assertTrue(config_store.load_telegram_config(p)['remote_control'])
+        # 通知關、遠端開:兩個開關互不牽動
+        config_store.save_telegram_config(p, '123:ABC', '999', False, True)
+        d = config_store.load_telegram_config(p)
+        self.assertFalse(d['enabled'])
+        self.assertTrue(d['remote_control'])
+        os.remove(p)
+
+
+class TestTelegramControlAuth(unittest.TestCase):
+    """【ADR-108】遠端控制的授權與指令解析。
+
+    這一組測的是「別人能不能控制我的交易系統」,任何一條紅燈都等於安全破口。
+    """
+
+    def test_only_configured_chat_id_allowed(self):
+        self.assertTrue(telegram_control.is_authorized('999888', '999888'))
+        self.assertTrue(telegram_control.is_authorized(999888, '999888'))     # 型別不同也要通過
+        self.assertTrue(telegram_control.is_authorized('-100123', '-100123'))  # 群組是負數
+        self.assertFalse(telegram_control.is_authorized('999889', '999888'))
+        self.assertFalse(telegram_control.is_authorized('9998880', '999888'))  # 不可前綴符合就放行
+
+    def test_empty_config_never_authorizes(self):
+        """沒設定 chat_id 時,不能變成「誰都可以」。"""
+        for allowed in ('', None, '   '):
+            self.assertFalse(telegram_control.is_authorized('999888', allowed))
+        for who in ('', None, '   '):
+            self.assertFalse(telegram_control.is_authorized(who, '999888'))
+
+    def test_parse_command(self):
+        self.assertEqual(telegram_control.parse_command('/status'), ('/status', ''))
+        self.assertEqual(telegram_control.parse_command('  /ON  策略A '), ('/on', '策略A'))
+        self.assertEqual(telegram_control.parse_command('/status@MyBot'), ('/status', ''))
+        self.assertEqual(telegram_control.parse_command('/off@MyBot 3'), ('/off', '3'))
+
+    def test_non_command_ignored(self):
+        """一般聊天不能被當成指令 (也不該回覆,避免洩漏 Bot 在運作)。"""
+        for text in ('早安', '', None, 'status', '/不存在的指令'):
+            self.assertIsNone(telegram_control.parse_command(text)[0])
+
+    def test_enable_needs_confirm_disable_does_not(self):
+        """停用往安全方向走,不可以拖延;啟用會讓系統開始下單,必須確認。"""
+        for cmd in ('/on', '/start_all'):
+            self.assertTrue(telegram_control.needs_confirm(cmd), cmd)
+        for cmd in ('/off', '/stop_all', '/status', '/list', '/positions', '/pnl'):
+            self.assertFalse(telegram_control.needs_confirm(cmd), cmd)
+
+    def test_no_order_commands_exist(self):
+        """鐵則 14:下單只能走主程式的確認視窗,遠端介面不得有任何下單指令。"""
+        for bad in ('/buy', '/sell', '/order', '/close', '/cover'):
+            self.assertNotIn(bad, telegram_control.COMMANDS)
+
+    def test_confirm_code_roundtrip(self):
+        code, expire = telegram_control.new_confirm_code(now=1000.0)
+        pending = {'code': code, 'expire': expire, 'cmd': '/on', 'arg': '1'}
+        self.assertEqual(len(code), telegram_control.CONFIRM_CODE_LEN)
+        ok, _ = telegram_control.check_confirm(pending, code, now=1001.0)
+        self.assertTrue(ok)
+        ok, _ = telegram_control.check_confirm(pending, code.lower(), now=1001.0)
+        self.assertTrue(ok, "手機輸入常是小寫,大小寫要一致視之")
+
+    def test_confirm_rejects_wrong_expired_and_missing(self):
+        code, expire = telegram_control.new_confirm_code(now=1000.0)
+        pending = {'code': code, 'expire': expire, 'cmd': '/on', 'arg': '1'}
+        self.assertFalse(telegram_control.check_confirm(pending, 'ZZZZ', now=1001.0)[0])
+        self.assertFalse(telegram_control.check_confirm(pending, '', now=1001.0)[0])
+        # 過期
+        later = 1000.0 + telegram_control.CONFIRM_TTL_SEC + 1
+        self.assertFalse(telegram_control.check_confirm(pending, code, now=later)[0])
+        # 沒有待確認指令時,任何碼都不該通過
+        self.assertFalse(telegram_control.check_confirm(None, code, now=1001.0)[0])
+        self.assertFalse(telegram_control.check_confirm({}, code, now=1001.0)[0])
+
+
+class TestTelegramControlStrategyMatch(unittest.TestCase):
+    """【ADR-108】遠端選策略。選錯策略 = 啟用了不該啟用的東西。"""
+
+    def setUp(self):
+        self.items = [
+            {'name': '台積電順勢', 'enabled': False, 'mode': '模擬',
+             'symbol': '2330', 'timeframe': '日K'},
+            {'name': '台積電逆勢', 'enabled': True, 'mode': '實單',
+             'symbol': '2330', 'timeframe': '60分'},
+            {'name': '大盤期指', 'enabled': False, 'mode': '模擬',
+             'symbol': 'TXF', 'timeframe': '日K'},
+        ]
+
+    def test_match_by_number(self):
+        self.assertIs(telegram_control.match_strategy(self.items, '2')[0], self.items[1])
+        self.assertIsNone(telegram_control.match_strategy(self.items, '0')[0])
+        self.assertIsNone(telegram_control.match_strategy(self.items, '4')[0])
+
+    def test_exact_name_wins_over_partial(self):
+        got, _ = telegram_control.match_strategy(self.items, '台積電順勢')
+        self.assertIs(got, self.items[0])
+
+    def test_ambiguous_partial_requires_number(self):
+        """兩個都叫「台積電…」時必須拒絕,不可以自作主張挑第一個。"""
+        got, why = telegram_control.match_strategy(self.items, '台積電')
+        self.assertIsNone(got)
+        self.assertIn('編號', why)
+
+    def test_unique_partial_ok(self):
+        self.assertIs(telegram_control.match_strategy(self.items, '期指')[0], self.items[2])
+
+    def test_missing_and_empty(self):
+        self.assertIsNone(telegram_control.match_strategy(self.items, '不存在')[0])
+        self.assertIsNone(telegram_control.match_strategy(self.items, '')[0])
+        self.assertIsNone(telegram_control.match_strategy([], '1')[0])
+
+
+class TestTelegramControlTexts(unittest.TestCase):
+    """【ADR-108】回覆文字:遠端看不到畫面,文字說錯等於判斷錯。"""
+
+    def setUp(self):
+        self.items = [
+            {'name': 'A', 'enabled': True, 'mode': '實單', 'symbol': '2330', 'timeframe': '日K'},
+            {'name': 'B', 'enabled': False, 'mode': '模擬', 'symbol': '2317', 'timeframe': '日K'},
+        ]
+
+    def test_status_counts_real_money_strategies(self):
+        t = telegram_control.status_text(True, True, self.items)
+        self.assertIn('實單 1', t)
+        self.assertIn('啟用 1', t)
+
+    def test_status_shows_switch_off(self):
+        self.assertIn('已停止', telegram_control.status_text(True, False, self.items))
+        self.assertIn('未登入', telegram_control.status_text(False, False, self.items))
+
+    def test_list_marks_mode_and_state(self):
+        t = telegram_control.list_text(self.items)
+        self.assertIn('1.', t)
+        self.assertIn('實單', t)
+        self.assertIn('模擬', t)
+        self.assertEqual(telegram_control.list_text([]), '目前沒有任何策略')
+
+    def test_help_covers_every_command(self):
+        t = telegram_control.help_text()
+        for cmd in telegram_control.COMMANDS:
+            self.assertIn(cmd, t)
+        self.assertIn('不提供下單', t)
+
+    def test_confirm_prompt_states_what_will_happen(self):
+        t = telegram_control.confirm_prompt('/on', '1', 'AB12', 'A', '2330 日K [實單] x1')
+        self.assertIn('/yes AB12', t)
+        self.assertIn('「A」', t)
+        self.assertIn('實單', t)
+
+    def test_positions_text_says_simulation_only(self):
+        acct = paper_account.new_account(name='模擬一')
+        paper_account.apply_fill(acct, '2026-07-26 09:05:00', '台股', '2330',
+                                 '買進', 'OPEN', 1, 600.0)
+        t = telegram_control.positions_text({acct['id']: acct})
+        self.assertIn('2330', t)
+        self.assertIn('實單庫存', t)      # 必須講明這裡看不到實單
+        self.assertIn('無持倉', telegram_control.positions_text({}))
+
+    def test_pnl_text_only_counts_the_given_day(self):
+        """今日已實現只能算今天的:算進昨天的會讓使用者誤判當日風險。"""
+        acct = paper_account.new_account(initial_cash=1000000.0, name='模擬一')
+        paper_account.apply_fill(acct, '2026-07-25 09:05:00', '台股', '2330',
+                                 '買進', 'OPEN', 1, 600.0)
+        paper_account.apply_fill(acct, '2026-07-25 13:05:00', '台股', '2330',
+                                 '賣出', 'CLOSE', 1, 610.0)      # 昨天賺
+        paper_account.apply_fill(acct, '2026-07-26 09:05:00', '台股', '2317',
+                                 '買進', 'OPEN', 1, 200.0)
+        paper_account.apply_fill(acct, '2026-07-26 13:05:00', '台股', '2317',
+                                 '賣出', 'CLOSE', 1, 190.0)      # 今天賠
+        y = paper_account.realized_pnl_on(acct, '2026-07-25')
+        t = paper_account.realized_pnl_on(acct, '2026-07-26')
+        self.assertGreater(y, 0)
+        self.assertLess(t, 0)
+        self.assertAlmostEqual(y + t, acct['realized_pnl'], places=2)
+        self.assertIn('2026-07-26', telegram_control.pnl_text({acct['id']: acct}, '2026-07-26'))
+
+    def test_realized_pnl_on_survives_bad_records(self):
+        """查詢損益不該有機會讓程式當掉。"""
+        acct = {'history': [{'ts': None, 'pnl': 1}, {'ts': '2026-07-26', 'pnl': 'x'},
+                            {'ts': '2026-07-26 10:00:00', 'pnl': 5.0}]}
+        self.assertAlmostEqual(paper_account.realized_pnl_on(acct, '2026-07-26'), 5.0)
+        self.assertEqual(paper_account.realized_pnl_on(acct, ''), 0.0)
+        self.assertEqual(paper_account.realized_pnl_on(None, '2026-07-26'), 0.0)
 
 
 class TestTelegramNotify(unittest.TestCase):

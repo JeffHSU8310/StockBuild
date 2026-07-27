@@ -191,6 +191,20 @@ set_order_callback → on_order_deal_callback (背景執行緒)
 （`set_bottom_tab` 切換）。**排查委託問題時要看「系統日誌」分頁**，seed 的
 成功/失敗日誌印在那裡（P-11）。
 
+### (D) 遠端控制：手機指令 → 主執行緒 → 狀態變更（ADR-108）
+```
+_tg_poll_worker (背景 daemon,getUpdates long polling)
+  · remote_control 沒開就不建立這個執行緒 (沒用這功能 = 行為與加它之前相同)
+  → safe_after(0, _tg_handle_command, chat_id, text)   ← 一律排回主執行緒 (鐵則13)
+      · is_authorized:只認設定檔那一個 chat_id;未授權不回覆、只記日誌
+      · 唯讀 (/status /list /positions /pnl /help) → 直接回覆
+      · 停用 (/off /stop_all) → _tg_apply 立即生效,不需確認
+      · 啟用 (/on /start_all) → _qt_enable_blockers 先擋 → 發確認碼
+            → /yes <碼> → _tg_confirm → _tg_apply (再檢查一次)
+      · 狀態變更一律走 _qt_finish_set_enabled / _qt_stop_all,與畫面同一條路
+  ※ 沒有任何下單/改單指令 —— 買賣一律回主程式走 (C) 的確認視窗 (鐵則14)
+```
+
 ---
 
 ## 五、驗證方式速查
@@ -201,6 +215,7 @@ set_order_callback → on_order_deal_callback (背景執行緒)
 | `draw_chart`/版面/下單流程等 GUI 耦合 | `diag_repro_issues.py` 等假 tkinter 診斷 |
 | 任何檔案 | `python -m py_compile` + AST 掃描（無孤兒 `self.xxx`、無重複方法） |
 | shioaji 連線、即時報價、實鍵盤輸入法、實機排版顏色 | **只能請使用者實機驗證**，交付時附「怎麼驗」 |
+| Telegram 遠端控制 | `core/telegram_control.py` 測純邏輯 + diag 走 GUI 派送路徑；真實 Bot 收發只能實機驗證 |
 
 ---
 
@@ -217,6 +232,7 @@ G:\StockBuild\
 │   ├─ tick_rules.py
 │   ├─ indicators.py
 │   ├─ futures_session.py
+│   ├─ telegram_control.py  遠端控制:授權/確認碼/指令解析 (ADR-108)
 │   └─ order_rules.py
 ├─ data/
 │   └─ config_store.py     設定 / 自選股 / 版面 I/O

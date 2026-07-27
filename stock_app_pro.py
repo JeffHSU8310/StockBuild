@@ -43,6 +43,7 @@ from core import market_session
 from core import secure_store
 from core import chukuangren_band
 from core import telegram_notify
+from core import telegram_control
 from core import market_pattern
 # 【ADR-100】籌碼資料:解析純邏輯在 core/,本地 CSV 存取在 data/。
 from core import chips_parser
@@ -374,6 +375,11 @@ class StockTradingAppPro(tk.Tk):
         self.telegram_cfg = config_store.load_telegram_config(self.TELEGRAM_CONFIG_FILE)
         self._qt_load()
         self._qt_refresh_tree()
+        # 【ADR-108】手機遠端控制:設定檔有開才真的啟動輪詢執行緒。沒開就
+        # 完全不建立執行緒 (不是建立後閒置),讓「沒開這個功能的人」的行為
+        # 與加這個功能之前一模一樣。
+        if (self.telegram_cfg or {}).get('remote_control'):
+            self.start_telegram_control()
         threading.Thread(target=self.fetch_market_indices_worker, daemon=True).start()
         threading.Thread(target=self.fetch_realtime_worker, daemon=True).start()
         # 【ADR-028】自選股即時報價 worker:每 10 秒批次抓一次目前群組的快照
@@ -6058,6 +6064,224 @@ class StockTradingAppPro(tk.Tk):
                 self.safe_after(0, self.log_message, f"【Telegram通知】送出失敗: {type(e).__name__}: {e}")
         threading.Thread(target=_worker, daemon=True).start()
 
+    # ======================================================================
+    # 【ADR-108】Telegram 遠端控制:手機下指令查詢狀態、開關策略
+    #
+    # 用 getUpdates 輪詢 (不是 webhook):webhook 需要公網 IP 與憑證,一般
+    # 家用環境架不起來;輪詢只要能連外就行,零額外基礎設施。
+    #
+    # 安全機制全部在 core/telegram_control.py 且可離線測試——這是能遠端
+    # 控制真實下單系統的功能,絕不允許沒測過就上。
+    # ======================================================================
+    TG_POLL_INTERVAL = 3.0          # 輪詢間隔 (秒)
+    TG_POLL_TIMEOUT = 25            # long polling 等待秒數
+
+    def _tg_control_enabled(self):
+        cfg = getattr(self, 'telegram_cfg', None) or {}
+        return bool(cfg.get('remote_control')) and telegram_notify.config_ready(cfg)
+
+    def start_telegram_control(self):
+        """啟動遠端控制輪詢執行緒 (只啟動一次)。"""
+        if getattr(self, '_tg_ctrl_thread_started', False):
+            return
+        self._tg_ctrl_thread_started = True
+        self._tg_offset = 0
+        self._tg_pending = None      # 待確認指令 {'code','expire','cmd','arg'}
+        threading.Thread(target=self._tg_poll_worker, daemon=True).start()
+
+    def _tg_poll_worker(self):
+        """背景輪詢 Telegram 指令。整段包 try,絕不讓它影響主程式。"""
+        import urllib.request
+        import urllib.parse
+        while not self._closing:
+            try:
+                if not self._tg_control_enabled():
+                    time.sleep(self.TG_POLL_INTERVAL)
+                    continue
+                cfg = self.telegram_cfg
+                url = (f"https://api.telegram.org/bot{cfg.get('bot_token','')}/getUpdates?"
+                       + urllib.parse.urlencode({'offset': self._tg_offset,
+                                                 'timeout': self.TG_POLL_TIMEOUT}))
+                req = urllib.request.Request(url, headers={'User-Agent': 'StockBuild'})
+                with urllib.request.urlopen(req, timeout=self.TG_POLL_TIMEOUT + 10) as resp:
+                    payload = json.loads(resp.read().decode('utf-8'))
+                for upd in (payload.get('result') or []):
+                    self._tg_offset = max(self._tg_offset, int(upd.get('update_id', 0)) + 1)
+                    msg = upd.get('message') or upd.get('edited_message') or {}
+                    chat_id = str((msg.get('chat') or {}).get('id', ''))
+                    text = str(msg.get('text') or '')
+                    if not text:
+                        continue
+                    # 指令一律排回主執行緒執行:它會改策略狀態、讀 tkinter 變數,
+                    # 在背景執行緒直接改會與 UI 競態 (鐵則 13 的精神)。
+                    self.safe_after(0, self._tg_handle_command, chat_id, text)
+            except Exception:
+                # 網路不穩/Telegram 暫時故障都很常見,靜默重試即可;
+                # 真的設定錯誤會在使用者按「測試」時就發現。
+                time.sleep(self.TG_POLL_INTERVAL * 2)
+                continue
+            time.sleep(self.TG_POLL_INTERVAL)
+
+    def _tg_reply(self, text):
+        self._send_telegram_async(text)
+
+    def _tg_handle_command(self, chat_id, text):
+        """在主執行緒處理一則指令。所有分支都會回覆並記錄日誌。"""
+        try:
+            cfg = getattr(self, 'telegram_cfg', None) or {}
+            cmd, arg = telegram_control.parse_command(text)
+            if cmd is None:
+                return          # 不是指令就不理會 (避免一般聊天觸發回覆)
+
+            # 【安全第一關】只有設定檔那個 chat_id 能下指令
+            if not telegram_control.is_authorized(chat_id, cfg.get('chat_id')):
+                self.log_message(f"【遠端控制】⛔ 拒絕未授權的指令 (chat_id={chat_id}): {text}")
+                return          # 刻意不回覆,不讓對方確認 Bot 存在
+
+            self.log_message(f"【遠端控制】收到指令:{text}")
+
+            if cmd == '/help':
+                return self._tg_reply(telegram_control.help_text())
+            if cmd == '/status':
+                return self._tg_reply(telegram_control.status_text(
+                    bool(self.api_logged_in), bool(self._qt_running), self.strategies))
+            if cmd == '/list':
+                return self._tg_reply(telegram_control.list_text(self.strategies))
+            if cmd == '/positions':
+                return self._tg_reply(self._tg_positions_text())
+            if cmd == '/pnl':
+                return self._tg_reply(self._tg_pnl_text())
+            if cmd == '/yes':
+                return self._tg_confirm(arg)
+
+            # 停用類:不需確認 (往安全方向,緊急時不該還要多打一則訊息)
+            if cmd == '/stop_all':
+                return self._tg_apply('/stop_all', '')
+            if cmd == '/off':
+                return self._tg_apply('/off', arg)
+
+            # 啟用類:先發確認碼。確認訊息要把「這一步會讓什麼開始動」講清楚
+            # ——遠端看不到畫面,確認碼本身不構成知情同意。
+            if cmd in ('/on', '/start_all'):
+                target_name = None
+                detail = None
+                if cmd == '/on':
+                    st, why = telegram_control.match_strategy(self.strategies, arg)
+                    if st is None:
+                        return self._tg_reply(f'❌ {why}')
+                    # 前置檢查提前到「發確認碼之前」:不要讓使用者確認了一個
+                    # 註定會失敗的操作。_tg_apply 在確認後會再檢查一次,因為
+                    # 這 120 秒之間狀態可能被改動。
+                    ok, blk, pend = self._qt_enable_blockers(st)
+                    if not ok:
+                        return self._tg_reply(f'❌ {blk}')
+                    if pend:
+                        return self._tg_reply(
+                            f"❌ 策略「{st.get('name')}」的持倉狀態與模擬帳戶對不上,\n"
+                            f"需要在主程式做「持倉核對」後才能啟用。")
+                    target_name = str(st.get('name'))
+                    detail = (f"{st.get('symbol')} {st.get('timeframe')} "
+                              f"[{st.get('mode', '模擬')}] x{st.get('qty')}")
+                else:
+                    en = [s for s in (self.strategies or []) if s.get('enabled')]
+                    if not en:
+                        return self._tg_reply('❌ 沒有任何啟用中的策略,啟動總開關沒有意義。')
+                    lv = [s for s in en if s.get('mode') == '實單']
+                    detail = (f"將啟動 {len(en)} 個策略 (實單 {len(lv)} / 模擬 {len(en) - len(lv)})"
+                              + (f"\n⚠️ 實單策略:{'、'.join(str(s.get('name')) for s in lv[:5])}"
+                                 if lv else ''))
+                code, expire = telegram_control.new_confirm_code()
+                self._tg_pending = {'code': code, 'expire': expire, 'cmd': cmd, 'arg': arg}
+                return self._tg_reply(
+                    telegram_control.confirm_prompt(cmd, arg, code, target_name, detail))
+        except Exception as e:
+            self.log_message(f"【遠端控制】處理指令失敗:{type(e).__name__}: {e}")
+            try:
+                self._tg_reply(f'❌ 指令處理失敗:{type(e).__name__}')
+            except Exception:
+                pass
+
+    def _tg_confirm(self, arg):
+        ok, why = telegram_control.check_confirm(getattr(self, '_tg_pending', None), arg)
+        if not ok:
+            # 過期的待確認指令直接丟掉:留著只會讓下一次 /yes 收到「確認碼
+            # 不正確」這種誤導性訊息,也避免一個舊指令長期掛在那裡。
+            if '過期' in why:
+                self._tg_pending = None
+            return self._tg_reply(f'❌ {why}')
+        pending = self._tg_pending
+        self._tg_pending = None
+        self._tg_apply(pending['cmd'], pending['arg'])
+
+    def _tg_apply(self, cmd, arg):
+        """真正改變狀態的地方。每個動作都寫進系統日誌 + 回覆手機。"""
+        if cmd == '/stop_all':
+            # 走跟畫面上「⛔ 全部停止」同一個方法,行為完全一致。
+            self._qt_stop_all()
+            self.log_message('【自動交易】⛔ 上述停止是由遠端指令觸發。')
+            return self._tg_reply('🛑 已關閉自動交易總開關。\n(既有持倉不會自動平倉。)')
+
+        if cmd == '/start_all':
+            enabled = [s for s in (self.strategies or []) if s.get('enabled')]
+            if not enabled:
+                return self._tg_reply('❌ 沒有任何啟用中的策略,啟動總開關沒有意義。')
+            live = [s for s in enabled if s.get('mode') == '實單']
+            # 只有「有實單策略」才要求券商已登入:全模擬的策略不需要連線,
+            # 不該因為沒登入就連模擬都不能跑。
+            if live and not self.api_logged_in:
+                return self._tg_reply('❌ 有實單策略但券商未登入,不予啟動。')
+            self._qt_running = True
+            self._qt_update_status_label()
+            self._qt_refresh_tree()
+            self.log_message(f'【自動交易】✅ 已由遠端指令開啟總開關:{len(enabled)} 個策略運轉中 '
+                             f'(實單 {len(live)} 個 / 模擬 {len(enabled) - len(live)} 個)。')
+            return self._tg_reply(f'🟢 已開啟自動交易總開關。\n'
+                                  f'運轉中 {len(enabled)} 個策略 (實單 {len(live)} / '
+                                  f'模擬 {len(enabled) - len(live)})。')
+
+        st, why = telegram_control.match_strategy(self.strategies, arg)
+        if st is None:
+            return self._tg_reply(f'❌ {why}')
+        name = str(st.get('name'))
+        if cmd == '/off':
+            self._qt_finish_set_enabled(st, False)
+            self.log_message(f'【自動交易】⛔ 已由遠端指令停用策略「{name}」。')
+            return self._tg_reply(f'🛑 已停用策略「{name}」。')
+        if cmd == '/on':
+            # 走跟畫面上「▶ 啟用」完全相同的前置檢查,不因為是遠端就放寬。
+            ok, why, pending = self._qt_enable_blockers(st)
+            if not ok:
+                self.log_message(f'【自動交易】遠端啟用被擋下:{why}')
+                return self._tg_reply(f'❌ {why}')
+            if pending:
+                # 持倉核對需要開視窗讓使用者選處理方式,手機上沒辦法做決定,
+                # 也不該用預設值幫他決定 (起點錯了整條策略後續都是錯的)。
+                self.log_message(f'【自動交易】遠端啟用被擋下:策略「{name}」持倉狀態與模擬帳戶不一致。')
+                return self._tg_reply(
+                    f'❌ 策略「{name}」的持倉狀態與模擬帳戶對不上,\n'
+                    f'需要在主程式做「持倉核對」後才能啟用。')
+            self._qt_finish_set_enabled(st, True)
+            mode = str(st.get('mode', '模擬'))
+            self.log_message(f'【自動交易】▶ 已由遠端指令啟用策略「{name}」({mode})。')
+            tail = ('\n⚠️ 這是實單策略,總開關開啟後會用真實資金下單。'
+                    if mode == '實單' else '')
+            extra = ('' if self._qt_running else
+                     '\n提醒:自動交易總開關目前是關閉的,策略不會實際運作。')
+            return self._tg_reply(f'🟢 已啟用策略「{name}」({mode})。{tail}{extra}')
+
+    def _tg_positions_text(self):
+        try:
+            return telegram_control.positions_text(getattr(self, 'paper_accts', None) or {})
+        except Exception as e:
+            return f'❌ 查詢持倉失敗:{type(e).__name__}'
+
+    def _tg_pnl_text(self):
+        try:
+            return telegram_control.pnl_text(getattr(self, 'paper_accts', None) or {},
+                                             datetime.now().strftime('%Y-%m-%d'))
+        except Exception as e:
+            return f'❌ 查詢損益失敗:{type(e).__name__}'
+
     def _telegram_test_send(self, bot_token, chat_id, text, status_cb):
         """設定視窗的「測試發送」用:直接用畫面上目前 (可能還沒存檔) 的
         bot_token/chat_id 送一則測試訊息,結果回報給 status_cb (更新對話框
@@ -6084,9 +6308,9 @@ class StockTradingAppPro(tk.Tk):
         訊息 (【自動交易-xxx】開頭) 都會額外推播一份到這裡設定的聊天。"""
         cfg = dict(self.telegram_cfg or {})
         dlg = tk.Toplevel(self)
-        dlg.title("📱 Telegram 通知設定")
+        dlg.title("📱 Telegram 通知/遠端控制設定")
         dlg.configure(bg="#1A2026")
-        self.center_window(dlg, 560, 380)
+        self.center_window(dlg, 560, 480)
         dlg.transient(self)
         try:
             dlg.lift(); dlg.focus_force()
@@ -6112,6 +6336,18 @@ class StockTradingAppPro(tk.Tk):
                        bg="#1A2026", fg="#00E676", selectcolor="#2A323D", activebackground="#1A2026",
                        font=('微軟正黑體', 9, 'bold')).pack(anchor='w', padx=12, pady=(8, 2))
 
+        # 【ADR-108】遠端控制跟通知分開兩個開關:通知只是唯讀推播,遠端控制
+        # 則能讓系統開始下單,風險等級完全不同,不該被同一個勾選一起打開。
+        var_remote = tk.BooleanVar(value=bool(cfg.get('remote_control', False)))
+        tk.Checkbutton(dlg, text="⚠️ 啟用手機遠端控制 (可查詢狀態、開關策略)", variable=var_remote,
+                       bg="#1A2026", fg="#FFA726", selectcolor="#2A323D", activebackground="#1A2026",
+                       font=('微軟正黑體', 9, 'bold')).pack(anchor='w', padx=12, pady=(2, 0))
+        tk.Label(dlg, text=("開啟後,只有上面填的那一個 Chat ID 可以下指令 (其他人一律拒絕並記錄)。"
+                            "手機可用 /status /list /positions /pnl 查詢、/off /stop_all 停用;"
+                            "「啟用策略」與「開啟總開關」需回傳確認碼才生效。本介面不提供下單/改單。"),
+                 bg="#12181F", fg="#8A99AD", font=('微軟正黑體', 8), wraplength=520,
+                 justify='left').pack(fill=tk.X, padx=12, pady=(2, 2))
+
         lbl_status = tk.Label(dlg, text="", bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 9),
                               wraplength=520, justify='left', anchor='w')
         lbl_status.pack(fill=tk.X, padx=12, pady=(4, 0))
@@ -6136,12 +6372,19 @@ class StockTradingAppPro(tk.Tk):
             token = e_token.get().strip()
             chat_id = e_chat.get().strip()
             enabled = bool(var_enabled.get())
-            if enabled and not (token and chat_id):
-                _set_status("✗ 啟用通知前,Bot Token 與 Chat ID 都要先填", False)
+            remote = bool(var_remote.get())
+            if (enabled or remote) and not (token and chat_id):
+                _set_status("✗ 啟用通知/遠端控制前,Bot Token 與 Chat ID 都要先填", False)
                 return
-            config_store.save_telegram_config(self.TELEGRAM_CONFIG_FILE, token, chat_id, enabled)
-            self.telegram_cfg = {'bot_token': token, 'chat_id': chat_id, 'enabled': enabled}
+            config_store.save_telegram_config(self.TELEGRAM_CONFIG_FILE, token, chat_id,
+                                              enabled, remote)
+            self.telegram_cfg = {'bot_token': token, 'chat_id': chat_id,
+                                 'enabled': enabled, 'remote_control': remote}
             self.log_message(f"【Telegram通知】設定已儲存 ({'已啟用' if enabled else '已停用'})。")
+            self.log_message("【遠端控制】" + ('⚠️ 已啟用手機遠端控制;只有設定的 Chat ID 可以下指令。'
+                                            if remote else '已停用手機遠端控制。'))
+            if remote:
+                self.start_telegram_control()
             dlg.destroy()
 
         foot = tk.Frame(dlg, bg="#1A2026"); foot.pack(pady=10)
@@ -6805,39 +7048,55 @@ class StockTradingAppPro(tk.Tk):
             except Exception:
                 pass
 
+    def _qt_enable_blockers(self, s):
+        """【ADR-108】啟用某策略前的所有前置檢查,抽成一個共用方法。
+
+        回傳 (ok, 原因字串, 持倉不一致資訊 tuple 或 None)。ok=False 代表
+        設定本身不合格;ok=True 但 mismatch 不是 None 代表要先做持倉核對。
+
+        抽出來的理由:遠端控制 (/on) 也必須跑完全一樣的檢查,不能因為走
+        另一條路就繞過驗證——那等於留了一個「從手機啟用一個設定不完整或
+        持倉對不上的策略」的破口。
+        """
+        if s.get('kind') == 'custom':
+            if not s.get('source_code') or s.get('qty', 0) <= 0:
+                return False, f"自訂策略「{s.get('name')}」設定不完整,無法啟用。", None
+        elif s.get('kind') == chukuangren_band.KIND:
+            ok, msg = chukuangren_band.validate(s)
+            if not ok:
+                return False, f"策略「{s.get('name')}」無法啟用: {msg}", None
+        else:
+            ok, msg = strategy_engine.validate_strategy(s)
+            if not ok:
+                return False, f"策略「{s.get('name')}」無法啟用: {msg}", None
+        # 【新ADR 持倉核對】重新啟用前,比對策略記錄的持倉狀態跟它指定的
+        # 模擬帳戶內實際部位是否一致——帳戶檔可能因為手動重置/刪除帳戶等
+        # 操作跟策略以為的狀態不同步,不一致就先讓使用者確認/處理,不要
+        # 悄悄地用錯誤的起點繼續運轉 (實單模式的部位在券商端,不是模擬
+        # 帳戶,不適用這項核對)。
+        if s.get('mode') != '實單':
+            rt = self._qt_runtime(s['id'])
+            acct = self._qt_paper_acct_for(s, warn=False)
+            sym = str(s.get('symbol', '')).upper()
+            mismatch = strategy_engine.position_mismatch(s, rt, acct['positions'].get(sym))
+            if mismatch:
+                return True, '', (rt, acct, mismatch)
+        return True, '', None
+
     def _qt_set_enabled(self, flag):
         s = self._qt_selected()
         if not s:
             self.log_message("【自動交易】請先在清單中選取策略。")
             return
         if flag:
-            if s.get('kind') == 'custom':
-                if not s.get('source_code') or s.get('qty', 0) <= 0:
-                    self.log_message(f"【自動交易】自訂策略「{s.get('name')}」設定不完整,無法啟用。")
-                    return
-            elif s.get('kind') == chukuangren_band.KIND:
-                ok, msg = chukuangren_band.validate(s)
-                if not ok:
-                    self.log_message(f"【自動交易】策略「{s.get('name')}」無法啟用: {msg}")
-                    return
-            else:
-                ok, msg = strategy_engine.validate_strategy(s)
-                if not ok:
-                    self.log_message(f"【自動交易】策略「{s.get('name')}」無法啟用: {msg}")
-                    return
-            # 【新ADR 持倉核對】重新啟用前,比對策略記錄的持倉狀態跟它指定的
-            # 模擬帳戶內實際部位是否一致——帳戶檔可能因為手動重置/刪除帳戶等
-            # 操作跟策略以為的狀態不同步,不一致就先讓使用者確認/處理,不要
-            # 悄悄地用錯誤的起點繼續運轉 (實單模式的部位在券商端,不是模擬
-            # 帳戶,不適用這項核對)。
-            if s.get('mode') != '實單':
-                rt = self._qt_runtime(s['id'])
-                acct = self._qt_paper_acct_for(s, warn=False)
-                sym = str(s.get('symbol', '')).upper()
-                mismatch = strategy_engine.position_mismatch(s, rt, acct['positions'].get(sym))
-                if mismatch:
-                    self._qt_open_reconcile_dialog(s, rt, acct, mismatch)
-                    return
+            ok, why, pending = self._qt_enable_blockers(s)
+            if not ok:
+                self.log_message(f"【自動交易】{why}")
+                return
+            if pending:
+                rt, acct, mismatch = pending
+                self._qt_open_reconcile_dialog(s, rt, acct, mismatch)
+                return
         self._qt_finish_set_enabled(s, flag)
 
     def _qt_finish_set_enabled(self, s, flag):
