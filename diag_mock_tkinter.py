@@ -278,8 +278,17 @@ class _Tk(_MockWidget):
 def _build_ttk():
     ttk = types.ModuleType("tkinter.ttk")
     ttk.Treeview = _Treeview
+    # 【ADR-110】current() 原本永遠回 0 且忽略設定值,等於「下拉選單選了什麼」
+    # 在診斷環境完全測不到 —— 而「策略指定哪一個實單帳號」正是靠這個讀出來的,
+    # 選錯就是真錢下錯戶頭。改成真的記住索引,讓 current(i) → current() 能往返。
+    def _cb_current(self, i=None):
+        if i is None:
+            return getattr(self, '_cur_index', 0)
+        self._cur_index = int(i)
+        return None
+
     ttk.Combobox = type("Combobox", (_Entry,), {
-        "current": lambda self, i=None: 0,
+        "current": _cb_current,
         "set": lambda self, v: (self._tv.set(v) if self._tv else None),
     })
     ttk.Button = _MockWidget

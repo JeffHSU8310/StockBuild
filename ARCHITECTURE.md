@@ -212,6 +212,7 @@ _tg_poll_worker (背景 daemon,getUpdates long polling)
 | 改動範圍 | 驗證方式 |
 |---|---|
 | `core/`、`data/` 純邏輯 | `python tests/test_core.py`（必跑）+ 補對應測試 |
+| `brokers/` 券商 adapter | `python tests/test_brokers.py`（必跑）；真實連線只能實機 |
 | `draw_chart`/版面/下單流程等 GUI 耦合 | `diag_repro_issues.py` 等假 tkinter 診斷 |
 | 任何檔案 | `python -m py_compile` + `python diag_crossref.py`（跨模組斷鏈 **與重複定義**，ADR-109） |
 | shioaji 連線、即時報價、實鍵盤輸入法、實機排版顏色 | **只能請使用者實機驗證**，交付時附「怎麼驗」 |
@@ -233,14 +234,20 @@ G:\StockBuild\
 │   ├─ indicators.py
 │   ├─ futures_session.py
 │   ├─ telegram_control.py  遠端控制:授權/確認碼/指令解析 (ADR-108)
+│   ├─ order_intent.py      券商中立的委託意圖 (ADR-110)
+│   ├─ broker_ipc.py        券商子行程 IPC 協定 (ADR-112)
 │   └─ order_rules.py
 ├─ data/
 │   └─ config_store.py     設定 / 自選股 / 版面 I/O
 ├─ brokers/                券商 adapter (零 tkinter,可依賴券商 SDK,ADR-097)
-│   ├─ base.py              BrokerClient 共用介面骨架
-│   └─ sinopac.py           永豐 shioaji adapter (目前只涵蓋連線生命週期)
+│   ├─ base.py              BrokerClient 介面:連線/下單/帳號 (ADR-110)
+│   ├─ sinopac.py           永豐 shioaji adapter (連線 + 委託翻譯 + 帳號解析)
+│   ├─ kgi.py               凱基 kgisuperpy adapter (ADR-111;帳號綁定需上鎖)
+│   ├─ kgi_proxy.py         凱基「獨立 3.13 子行程」代理 (ADR-112)
+│   └─ kgi_worker.py        凱基子行程本體 (**用 Python 3.13 執行**)
 ├─ tests/
-│   └─ test_core.py        core/ + data/ 離線單元測試
+│   ├─ test_core.py        core/ + data/ 離線單元測試
+│   └─ test_brokers.py     brokers/ 離線測試 (照 SDK 原始碼複刻的假模組,ADR-111)
 ├─ diag_mock_tkinter.py    假 tkinter/mplfinance 環境 (開發用)
 ├─ diag_repro_issues.py    問題重現/驗證腳本 (開發用)
 ├─ broker_config.json      券商設定

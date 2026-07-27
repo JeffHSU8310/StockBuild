@@ -29,6 +29,7 @@ from core import futures_session
 from core import market_session
 from core import secure_store
 from core import order_rules
+from core import order_intent
 from core import indicators
 from core import strategy_engine
 from core import backtest
@@ -5145,6 +5146,156 @@ class TestScreenerBacktest(unittest.TestCase):
     def test_should_stop_aborts(self):
         r = self._run(should_stop=lambda: True)
         self.assertTrue(any('中止' in w for w in r['warnings']))
+
+
+class TestOrderIntent(unittest.TestCase):
+    """【ADR-110 階段1】券商中立的委託意圖。
+
+    這一層算出來的東西會被四家券商的 adapter 各自翻譯後送出去成為真實委託,
+    所以「讓價方向」「檔位對齊」「零股限價」這三件事錯一個就是真的賠錢。
+    """
+
+    def _s(self, **kw):
+        s = {'symbol': '2330', 'trade_type': '股票', 'price_type': '限價',
+             'slippage_ticks': 2, 'qty': 1}
+        s.update(kw)
+        return s
+
+    def _build(self, strategy, action='買進', price=600.0, qty=1,
+               asset='stock', exec_price=None):
+        return order_intent.build_live_order(
+            strategy, {'action': action, 'qty': qty, 'price': price},
+            asset, exec_price=exec_price)
+
+    # --- 讓價方向 ---
+    def test_buy_slips_up_sell_slips_down(self):
+        """讓價的用意是「寧可貴一點也要成交」;方向寫反會變成掛一個更不可能
+        成交的價,策略看起來就像從來不進場——這種 bug 不會報錯,只會沒交易。"""
+        self.assertEqual(self._build(self._s(), '買進')['price'], 602.0)
+        self.assertEqual(self._build(self._s(), '賣出')['price'], 598.0)
+
+    def test_zero_slippage(self):
+        oi = self._build(self._s(slippage_ticks=0), '買進')
+        self.assertEqual(oi['price'], 600.0)
+
+    # --- 檔位 (鐵則7) ---
+    def test_price_aligned_to_tick_across_bands(self):
+        """跨價格帶時要用對的 tick,送非法價位會被券商直接退單。"""
+        # 99.9 (<100 → tick 0.1) 讓 2 檔 = 100.1,不是 101.9
+        self.assertAlmostEqual(self._build(self._s(), '買進', price=99.9)['price'], 100.1)
+        # 49.95 (<50 → tick 0.05) 讓 2 檔 = 50.05
+        self.assertAlmostEqual(self._build(self._s(), '買進', price=49.95)['price'], 50.05)
+        # ETF (00 開頭) 有自己的一套檔位
+        oi = self._build(self._s(symbol='0050'), '買進', price=150.0)
+        self.assertAlmostEqual(oi['tick'], 0.05)
+        self.assertAlmostEqual(oi['price'], 150.1)
+
+    def test_futures_tick_is_one_point(self):
+        oi = self._build(self._s(symbol='TXFR1', trade_type='期貨'),
+                         '買進', price=18000.0, asset='future')
+        self.assertEqual(oi['tick'], 1.0)
+        self.assertEqual(oi['price'], 18002.0)
+
+    # --- 限價 / 市價 ---
+    def test_market_order_sends_zero_price_but_keeps_limit_for_display(self):
+        """市價單價格必須送 0;但讓價後的參考價仍要留著給日誌/確認視窗看,
+        否則使用者事後完全查不到「當時打算用什麼價成交」。"""
+        oi = self._build(self._s(trade_type='期貨', symbol='TXFR1', price_type='市價'),
+                         '買進', price=18000.0, asset='future')
+        self.assertEqual(oi['price'], 0.0)
+        self.assertEqual(oi['limit_price'], 18002.0)
+        self.assertEqual(oi['price_label'], '市價')
+
+    def test_limit_label_shows_actual_price(self):
+        self.assertEqual(self._build(self._s(), '買進')['price_label'], '限價602')
+
+    # --- 零股 (鐵則6) ---
+    def test_odd_lot_forced_to_limit(self):
+        """零股送市價 = 交易所規則違規,券商會退單。策略就算存了市價也要擋。"""
+        oi = self._build(self._s(trade_type='零股', price_type='市價'), '買進', qty=100)
+        self.assertEqual(oi['price_type'], '限價')
+        self.assertEqual(oi['price'], 602.0)
+        self.assertEqual(oi['order_lot'], order_intent.LOT_ODD)
+
+    def test_round_lot_marked_common(self):
+        self.assertEqual(self._build(self._s())['order_lot'], order_intent.LOT_COMMON)
+
+    # --- 看A做B (ADR-075) ---
+    def test_exec_price_overrides_signal_price(self):
+        """看A做B:訊號價是 A 的,但下單一定要用 B 的價,否則會用完全不相干
+        的價格去掛單 (例如用大盤指數的點數去掛個股)。"""
+        oi = self._build(self._s(), '買進', price=999.0, exec_price=600.0)
+        self.assertEqual(oi['price'], 602.0)
+
+    # --- 其餘欄位 ---
+    def test_neutral_fields_have_no_broker_specific_values(self):
+        """意圖 dict 裡不可出現任何一家券商的 SDK 常數——出現了就代表抽象
+        層漏了,下一家 adapter 會被迫去看懂永豐的列舉值。"""
+        oi = self._build(self._s())
+        for v in oi.values():
+            self.assertNotIn('shioaji', str(type(v)).lower())
+        self.assertEqual(oi['time_in_force'], 'ROD')
+        self.assertEqual(oi['order_cond'], order_intent.COND_CASH)
+        self.assertIn(oi['action'], order_intent.ACTIONS)
+        self.assertIn(oi['trade_type'], order_intent.TRADE_TYPES)
+        self.assertIn(oi['price_type'], order_intent.PRICE_TYPES)
+
+    def test_describe_is_readable(self):
+        d = order_intent.describe(self._build(self._s(), '買進', qty=3))
+        self.assertIn('買進', d)
+        self.assertIn('2330', d)
+        self.assertIn('限價602', d)
+
+
+class TestOrderIntentBrokerRouting(unittest.TestCase):
+    """【ADR-110 階段2】策略指定券商/帳號。
+
+    這一組守的是「單會下到哪裡」。下錯帳戶不會有任何錯誤訊息,只會在對帳時
+    才發現真錢跑到別的戶頭去了,所以預設值與 None 的語意都要精確。
+    """
+
+    def test_missing_broker_falls_back_to_sinopac(self):
+        """舊策略檔沒有 broker 欄位,不能因此變成「沒有券商可用」而全部停擺。"""
+        for s in ({}, {'broker': ''}, {'broker': '   '}, None):
+            self.assertEqual(order_intent.broker_of(s), 'sinopac')
+
+    def test_explicit_broker_respected(self):
+        self.assertEqual(order_intent.broker_of({'broker': 'kgi'}), 'kgi')
+        self.assertEqual(order_intent.broker_of({'broker': ' mega '}), 'mega')
+
+    def test_account_none_means_sdk_default(self):
+        """None 與空字串必須等價地代表「使用者沒選」,才能沿用舊行為;
+        若回空字串,adapter 會以為「有指定」而去查一個不存在的帳號。"""
+        for s in ({}, {'broker_account': ''}, {'broker_account': '  '}, None):
+            self.assertIsNone(order_intent.account_of(s))
+        self.assertEqual(order_intent.account_of({'broker_account': 'F-123456'}), 'F-123456')
+
+    def test_order_intent_carries_routing(self):
+        oi = order_intent.build_live_order(
+            {'symbol': '2330', 'trade_type': '股票', 'price_type': '限價',
+             'slippage_ticks': 0, 'broker': 'kgi', 'broker_account': 'A-1'},
+            {'action': '買進', 'qty': 1, 'price': 600.0}, 'stock')
+        self.assertEqual(oi['broker'], 'kgi')
+        self.assertEqual(oi['account'], 'A-1')
+
+    def test_order_intent_account_none_for_legacy_strategy(self):
+        """沒指定帳號時 account 必須是 None —— adapter 靠這個判斷「完全不要帶
+        account 參數」,也就是跟加這個功能之前送出完全相同的委託。"""
+        oi = order_intent.build_live_order(
+            {'symbol': '2330', 'trade_type': '股票', 'price_type': '限價',
+             'slippage_ticks': 0},
+            {'action': '買進', 'qty': 1, 'price': 600.0}, 'stock')
+        self.assertIsNone(oi['account'])
+        self.assertEqual(oi['broker'], 'sinopac')
+
+    def test_describe_target_readable(self):
+        self.assertIn('預設帳號', order_intent.describe_target({}))
+        t = order_intent.describe_target({'broker': 'kgi', 'broker_account': 'A-1'})
+        self.assertIn('kgi', t)
+        self.assertIn('A-1', t)
+        # 呼叫端可以覆寫成人看得懂的名稱 (券商中文名/帳號暱稱)
+        t2 = order_intent.describe_target({'broker': 'sinopac'}, '永豐金', '證券戶')
+        self.assertEqual(t2, '永豐金 / 證券戶')
 
 
 if __name__ == "__main__":
