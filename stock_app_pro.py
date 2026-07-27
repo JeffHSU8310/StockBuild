@@ -63,6 +63,9 @@ from data import taifex_store
 from data import chips_store
 # 【ADR-097 階段0】券商連線生命週期抽到 brokers/ 套件,詳見 DECISIONS_ADR097.md。
 from brokers.sinopac import SinopacBroker
+# 【ADR-111】凱基 adapter。HAS_KGI 為 False 代表套件沒裝或載不起來
+# (Python 3.14 就是這種情況),主程式照常運作,只是沒有凱基這個選項。
+from brokers.kgi import KGIBroker, HAS_KGI
 
 # 嘗試載入永豐金 API
 try:
@@ -240,7 +243,12 @@ class StockTradingAppPro(tk.Tk):
         if HAS_SJ:
             self.brokers['sinopac'] = SinopacBroker()
             self.sj_api = self.brokers['sinopac'].api
-        
+        # 【ADR-111】凱基 adapter:套件裝不起來 (例如 Python 3.14) 時
+        # HAS_KGI=False,這裡就完全不註冊 —— 策略編輯器的下拉自然不會出現
+        # 凱基的帳號,使用者不會選到一個根本不能用的目標。
+        if HAS_KGI:
+            self.brokers['kgi'] = KGIBroker()
+
         self.config_file = app_path("broker_config.json")
         self.wl_file = app_path("watchlists.json")
         # 【ADR-072】一般 App 設定 (零股開盤時刻、自動重連/自動登入偏好)。

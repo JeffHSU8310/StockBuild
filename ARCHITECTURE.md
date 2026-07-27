@@ -198,6 +198,7 @@ set_order_callback → on_order_deal_callback (背景執行緒)
 | 改動範圍 | 驗證方式 |
 |---|---|
 | `core/`、`data/` 純邏輯 | `python tests/test_core.py`（必跑）+ 補對應測試 |
+| `brokers/` 券商 adapter | `python tests/test_brokers.py`（必跑）；真實連線只能實機 |
 | `draw_chart`/版面/下單流程等 GUI 耦合 | `diag_repro_issues.py` 等假 tkinter 診斷 |
 | 任何檔案 | `python -m py_compile` + AST 掃描（無孤兒 `self.xxx`、無重複方法） |
 | shioaji 連線、即時報價、實鍵盤輸入法、實機排版顏色 | **只能請使用者實機驗證**，交付時附「怎麼驗」 |
@@ -223,9 +224,11 @@ G:\StockBuild\
 │   └─ config_store.py     設定 / 自選股 / 版面 I/O
 ├─ brokers/                券商 adapter (零 tkinter,可依賴券商 SDK,ADR-097)
 │   ├─ base.py              BrokerClient 介面:連線/下單/帳號 (ADR-110)
-│   └─ sinopac.py           永豐 shioaji adapter (連線 + 委託翻譯 + 帳號解析)
+│   ├─ sinopac.py           永豐 shioaji adapter (連線 + 委託翻譯 + 帳號解析)
+│   └─ kgi.py               凱基 kgisuperpy adapter (ADR-111;帳號綁定需上鎖)
 ├─ tests/
-│   └─ test_core.py        core/ + data/ 離線單元測試
+│   ├─ test_core.py        core/ + data/ 離線單元測試
+│   └─ test_brokers.py     brokers/ 離線測試 (照 SDK 原始碼複刻的假模組,ADR-111)
 ├─ diag_mock_tkinter.py    假 tkinter/mplfinance 環境 (開發用)
 ├─ diag_repro_issues.py    問題重現/驗證腳本 (開發用)
 ├─ broker_config.json      券商設定
