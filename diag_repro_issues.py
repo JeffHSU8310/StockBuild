@@ -2152,6 +2152,232 @@ def _screener_industry_and_backtest():
 
 run_case("ADR-105/106: 產業篩選 + 選股回測/未來函數防護/紅綠上色", _screener_industry_and_backtest)
 
+
+def _order_intent_preserves_shioaji_order():
+    """【ADR-110 階段1】委託抽象化必須是「零行為改變」。
+
+    這個案例的驗收標準只有一條:**送給 shioaji 的 Order,每一個欄位都跟
+    重構前一模一樣**。下面的期望值是照著重構前 `_place_strategy_order()`
+    那段程式碼逐行抄出來的硬編碼常數,不是從新程式反推的——若從新程式
+    反推,這個測試就只是在確認「新程式等於新程式」,證明不了任何事。
+    """
+    class _RecOrder:
+        def __init__(s, **kw):
+            s.kw = dict(kw)
+
+    class _Trade:
+        class status:
+            status = 'Submitted'
+
+    class _FakeApi:
+        def __init__(s):
+            s.sent = []
+        def Order(s, **kw):
+            return _RecOrder(**kw)
+        def place_order(s, contract, order):
+            s.sent.append((contract, order))
+            return _Trade()
+
+    broker = app.brokers['sinopac']
+    orig_api = broker.api
+    fake = _FakeApi()
+    broker.api = fake
+    try:
+        def _mk(tt, ptype, action='買進', symbol='2330', price=600.0, qty=2, ticks=2):
+            s = {'id': 'oi1', 'name': '委託抽象化測試', 'symbol': symbol,
+                 'trade_type': tt, 'price_type': ptype, 'slippage_ticks': ticks,
+                 'qty': qty, 'mode': '實單'}
+            intent = {'action': action, 'qty': qty, 'price': price}
+            asset = 'future' if tt == '期貨' else 'stock'
+            ok, msg = app._place_strategy_order(s, intent, object(), asset)
+            assert ok, f"送單應成功,實際:{msg}"
+            return fake.sent[-1][1].kw, msg
+
+        # --- 1. 股票 / 限價:600 買進讓 2 檔,500~1000 的檔位是 1 元 → 602 ---
+        kw, msg = _mk('股票', '限價')
+        assert kw == {'price': 602.0, 'quantity': 2, 'action': 'Buy',
+                      'price_type': 'LMT', 'order_type': 'ROD',
+                      'order_lot': 'Common', 'order_cond': 'Cash'}, kw
+        assert '限價602' in msg, msg
+
+        # --- 2. 股票 / 市價:價格一律送 0,但讓價後的價仍要出現在訊息裡嗎? ---
+        # 重構前市價的 label 就只是「市價」(不帶價格),這裡確認沒有變。
+        kw, msg = _mk('股票', '市價')
+        assert kw['price'] == 0.0 and kw['price_type'] == 'MKT', kw
+        assert '市價 x' in msg and '限價' not in msg, msg
+
+        # --- 3. 賣出要往下讓價 (讓錯方向 = 掛一個不可能成交的價) ---
+        kw, _ = _mk('股票', '限價', action='賣出')
+        assert kw['price'] == 598.0 and kw['action'] == 'Sell', kw
+
+        # --- 4. 零股:IntradayOdd,且【鐵則6】強制限價 ---
+        kw, _ = _mk('零股', '限價', qty=100)
+        assert kw == {'price': 602.0, 'quantity': 100, 'action': 'Buy',
+                      'price_type': 'LMT', 'order_type': 'ROD',
+                      'order_lot': 'IntradayOdd', 'order_cond': 'Cash'}, kw
+        # 就算策略被改成市價,零股也必須退回限價,不可送市價給券商
+        kw, _ = _mk('零股', '市價', qty=100)
+        assert kw['price_type'] == 'LMT' and kw['price'] == 602.0, \
+            f"零股送出市價單 = 違反鐵則6,實際 {kw}"
+
+        # --- 5. 期貨:另一組常數,且沒有 order_lot/order_cond 欄位 ---
+        kw, _ = _mk('期貨', '限價', symbol='TXFR1', price=18000.0)
+        assert kw == {'price': 18002.0, 'quantity': 2, 'action': 'Buy',
+                      'price_type': 'LMT', 'order_type': 'ROD'}, kw
+        kw, _ = _mk('期貨', '範圍市價', symbol='TXFR1', price=18000.0)
+        assert kw['price'] == 0.0 and kw['price_type'] == 'MKP', kw
+
+        # --- 6. 檔位跨價格帶時要用對的 tick (鐵則7) ---
+        # 99.9 元買進讓 2 檔:<100 的檔位是 0.1 → 100.1 (不是 101.9)
+        kw, _ = _mk('股票', '限價', price=99.9)
+        assert abs(kw['price'] - 100.1) < 1e-9, f"檔位算錯,實際 {kw['price']}"
+
+        # --- 7. 看A做B:exec_price 帶進來時要用 B 的價,不是訊號商品的價 ---
+        s = {'id': 'oi2', 'name': 'AB', 'symbol': '2330', 'trade_type': '股票',
+             'price_type': '限價', 'slippage_ticks': 0, 'qty': 1, 'mode': '實單'}
+        app._place_strategy_order(s, {'action': '買進', 'qty': 1, 'price': 999.0},
+                                  object(), 'stock', exec_price=600.0)
+        assert fake.sent[-1][1].kw['price'] == 600.0, \
+            "看A做B時應以 B 的 exec_price 為準"
+
+        # --- 8. 策略沒設 broker 欄位時要落到永豐,不能變成「找不到券商」---
+        assert app._broker_key_of({}) == 'sinopac'
+        assert app._broker_key_of({'broker': 'kgi'}) == 'kgi'
+        ok, msg = app._place_strategy_order(
+            {'id': 'x', 'symbol': '2330', 'trade_type': '股票', 'price_type': '限價',
+             'qty': 1, 'broker': 'kgi'},
+            {'action': '買進', 'qty': 1, 'price': 600.0}, object(), 'stock')
+        assert not ok and 'kgi' in msg, f"未接上的券商應明確報錯,實際:{msg}"
+    finally:
+        broker.api = orig_api
+
+
+run_case("ADR-110階段1: 委託抽象化後送出的 shioaji Order 逐欄位不變",
+         _order_intent_preserves_shioaji_order)
+
+
+def _strategy_level_account_routing():
+    """【ADR-110 階段2】策略指定帳號要真的送到那個帳號。
+
+    這個功能最嚴重的失效模式不是「送不出去」(那會報錯,看得見),而是
+    **默默送到別的帳戶** —— 沒有錯誤訊息,對帳時才發現真錢跑錯戶頭。
+    所以下面每一條都在確認「錯的時候會擋下來並說清楚」。
+    """
+    from core import order_intent as _oi
+
+    class _Acc:
+        def __init__(s, bid, aid, user):
+            s.broker_id, s.account_id, s.username = bid, aid, user
+
+    class _RecOrder:
+        def __init__(s, **kw):
+            s.kw = dict(kw)
+
+    class _Trade:
+        class status:
+            status = 'Submitted'
+
+    class _FakeApi:
+        def __init__(s, accounts):
+            s._accs = accounts
+            s.sent = []
+        def list_accounts(s):
+            return list(s._accs)
+        def Order(s, **kw):
+            return _RecOrder(**kw)
+        def place_order(s, contract, order):
+            s.sent.append(order)
+            return _Trade()
+
+    a1 = _Acc('9A95', '1234567', '證券戶')
+    a2 = _Acc('F031', '7654321', '期貨戶')
+    broker = app.brokers['sinopac']
+    orig_api = broker.api
+    fake = _FakeApi([a1, a2])
+    broker.api = fake
+    try:
+        def _s(**kw):
+            s = {'id': 'r1', 'name': '路由測試', 'symbol': '2330', 'trade_type': '股票',
+                 'price_type': '限價', 'slippage_ticks': 0, 'qty': 1, 'mode': '實單'}
+            s.update(kw)
+            return s
+
+        def _send(s):
+            return app._place_strategy_order(
+                s, {'action': '買進', 'qty': 1, 'price': 600.0}, object(), 'stock')
+
+        # --- 1. 帳號清單能列出來,id 用「分公司-帳號」(重登後不會變) ---
+        accs = dict(broker.list_accounts())
+        assert '9A95-1234567' in accs and 'F031-7654321' in accs, accs
+        assert '證券戶' in accs['9A95-1234567'], accs
+
+        # --- 2. 沒指定帳號 → 完全不帶 account 參數 (等同加功能之前) ---
+        ok, _ = _send(_s())
+        assert ok
+        assert 'account' not in fake.sent[-1].kw, \
+            f"沒指定帳號時不該帶 account,實際 {fake.sent[-1].kw}"
+
+        # --- 3. 指定帳號 → 帶對的那個 Account 物件 ---
+        ok, _ = _send(_s(broker_account='F031-7654321'))
+        assert ok
+        assert fake.sent[-1].kw.get('account') is a2, \
+            "指定的帳號沒有被帶進委託,單會下到預設帳戶去"
+
+        # --- 4. 指定了一個不存在的帳號 → 必須拒單,絕不可退回預設帳號 ---
+        n = len(fake.sent)
+        ok, msg = _send(_s(broker_account='XXXX-0000'))
+        assert not ok, "找不到指定帳號卻仍然送出 = 真錢下錯戶頭"
+        assert len(fake.sent) == n, "拒單時不可有任何委託被送出"
+        assert 'XXXX-0000' in msg, f"錯誤訊息要指出是哪個帳號找不到,實際:{msg}"
+
+        # --- 5. 指定一家還沒接上的券商 → 擋下並說清楚是哪一家 ---
+        ok, msg = _send(_s(broker='kgi'))
+        assert not ok and 'kgi' in msg, msg
+
+        # --- 6. 畫面上要看得出「這張單會下到哪裡」---
+        t = app._qt_live_target_text(_s(broker_account='F031-7654321'))
+        assert '永豐金' in t and '期貨戶' in t, t
+        assert '預設帳號' in app._qt_live_target_text(_s()), \
+            "沒指定帳號時要明講是預設帳號,不能空白讓人以為沒設定好"
+        # 設定了但現在找不到 → 要看得出異常,不可顯示成正常的預設帳號
+        bad = app._qt_live_target_text(_s(broker_account='XXXX-0000'))
+        assert '找不到' in bad and '預設帳號' not in bad, bad
+
+        # --- 7b. 策略編輯器的「實單帳戶」下拉 ---
+        choices = app._qt_live_account_choices()
+        assert choices[0][0] == ('', ''), "第一項必須是「用券商預設帳號」"
+        refs = [r for r, _l in choices]
+        assert ('sinopac', 'F031-7654321') in refs, refs
+        # 讀既有設定:選到的就是策略存的那一個
+        get1 = app._qt_build_live_account_row(app, _s(broker_account='F031-7654321'))
+        assert get1() == ('sinopac', 'F031-7654321'), get1()
+        # 沒設定的策略要落在預設項 (不可自作主張挑第一個真實帳號)
+        get2 = app._qt_build_live_account_row(app, _s())
+        assert get2() == ('', ''), get2()
+        # 設定了一個現在不存在的帳號:不可默默選到別的帳號
+        get3 = app._qt_build_live_account_row(app, _s(broker_account='XXXX-0000'))
+        assert get3() == ('', ''), \
+            "找不到原設定時應退回預設項並在畫面上警示,不可選到別人的帳號"
+
+        # --- 7c. 存進策略的欄位,build_live_order 讀得回來 (端到端) ---
+        st = _s(); st['broker'], st['broker_account'] = ('sinopac', 'F031-7654321')
+        oi = _oi.build_live_order(st, {'action': '買進', 'qty': 1, 'price': 600.0}, 'stock')
+        assert oi['broker'] == 'sinopac' and oi['account'] == 'F031-7654321', oi
+
+        # --- 7. sj_api 與 adapter.api 必須是同一個東西 (不可能不同步) ---
+        assert app.sj_api is fake, "self.sj_api 應直接反映 adapter 的連線"
+        probe = object()
+        app.sj_api = probe
+        assert broker.api is probe, "寫 self.sj_api 要同步寫進 adapter"
+        broker.api = fake
+        assert app.sj_api is fake, "寫 adapter 要同步反映到 self.sj_api"
+    finally:
+        broker.api = orig_api
+
+
+run_case("ADR-110階段2: 策略層級帳號路由/找不到帳號拒單/連線不分岔",
+         _strategy_level_account_routing)
+
 print(f"{'案例':60s} 結果")
 print("-" * 76)
 for name, st, msg in results:

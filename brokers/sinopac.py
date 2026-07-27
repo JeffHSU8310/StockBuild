@@ -22,6 +22,7 @@ except ImportError:
 
 class SinopacBroker(BrokerClient):
     name = "sinopac"
+    display_name = "永豐金"
 
     def __init__(self):
         super().__init__()
@@ -52,3 +53,106 @@ class SinopacBroker(BrokerClient):
     def logout(self):
         self.api.logout()
         self.logged_in = False
+
+    # ------------------------------------------------------------------
+    # 【ADR-110 階段 1】委託意圖 → shioaji Order
+    #
+    # 這段是從 stock_app_pro.py 的 _place_strategy_order() 原封不動搬過來的,
+    # 每一個常數與參數都保持一致 —— 這次搬動的驗收標準是「組出來的 Order
+    # 跟搬動前逐欄位相同」,有診斷案例守著 (見 diag_repro_issues.py)。
+    # ------------------------------------------------------------------
+    # ---- 帳號 (ADR-110 階段2) ----
+    @staticmethod
+    def account_id(acc):
+        """shioaji Account → 穩定的字串 id。
+
+        用「分公司代碼-帳號」而不是物件本身,因為這個 id 要存進策略檔;
+        重新登入後 Account 物件是新的,只有這組數字不會變。
+        """
+        return f"{getattr(acc, 'broker_id', '')}-{getattr(acc, 'account_id', '')}"
+
+    def _accounts(self):
+        try:
+            return list(self.api.list_accounts() or [])
+        except Exception:
+            # 未登入 / 連線異常時回空 list:編輯器只是填不出下拉選單,
+            # 不該因此拋例外把整個視窗打掉。
+            return []
+
+    def list_accounts(self):
+        out = []
+        for a in self._accounts():
+            kind = type(a).__name__.replace('Account', '') or ''
+            name = getattr(a, 'username', '') or getattr(a, 'account_id', '')
+            out.append((self.account_id(a), f"{name} ({kind})".strip()))
+        return out
+
+    def account_object(self, account_id):
+        want = str(account_id or '').strip()
+        if not want:
+            return None
+        for a in self._accounts():
+            if self.account_id(a) == want:
+                return a
+        return None
+
+    def build_order(self, oi):
+        """把 core.order_intent 的輸出翻成 shioaji Order。
+
+        零股與整股分開組,是因為 shioaji 的零股單要多帶 order_lot=IntradayOdd;
+        期貨則是完全另一組常數 (FuturesPriceType),連欄位都不一樣 —— 這正是
+        「委託組裝必須各家 adapter 自己實作」的具體理由。
+        """
+        action = sj.constant.Action.Buy if oi['action'] == '買進' else sj.constant.Action.Sell
+        px = float(oi['price'])
+        qty = int(oi['qty'])
+        ptype = oi['price_type']
+
+        # 【ADR-110 階段2】策略沒指定帳號時**完全不帶** account 參數,讓 shioaji
+        # 沿用它自己的預設帳號 —— 這樣舊策略送出的委託跟加這個功能之前逐欄位
+        # 相同。指定了卻找不到,是呼叫端 (place_order) 要擋的錯誤,不在這裡默默
+        # 退回預設帳號。
+        extra = {}
+        if oi.get('account'):
+            acc = self.account_object(oi['account'])
+            if acc is not None:
+                extra['account'] = acc
+
+        if oi['trade_type'] == '期貨':
+            fut_ptype = {'限價': sj.constant.FuturesPriceType.LMT,
+                         '市價': sj.constant.FuturesPriceType.MKT,
+                         '範圍市價': sj.constant.FuturesPriceType.MKP}[ptype]
+            return self.api.Order(price=px, quantity=qty, action=action,
+                                  price_type=fut_ptype,
+                                  order_type=sj.constant.OrderType.ROD, **extra)
+        if oi['trade_type'] == '零股':
+            # 【鐵則6】盤中零股單,數量單位=股,只能限價 (order_intent 已保證)。
+            return self.api.Order(price=px, quantity=qty, action=action,
+                                  price_type=sj.constant.StockPriceType.LMT,
+                                  order_type=sj.constant.OrderType.ROD,
+                                  order_lot=sj.constant.StockOrderLot.IntradayOdd,
+                                  order_cond=sj.constant.StockOrderCond.Cash, **extra)
+        stk_ptype = (sj.constant.StockPriceType.MKT if ptype == '市價'
+                     else sj.constant.StockPriceType.LMT)
+        return self.api.Order(price=px, quantity=qty, action=action,
+                              price_type=stk_ptype,
+                              order_type=sj.constant.OrderType.ROD,
+                              order_lot=sj.constant.StockOrderLot.Common,
+                              order_cond=sj.constant.StockOrderCond.Cash, **extra)
+
+    def place_order(self, contract, oi):
+        """送出委託,回傳 shioaji trade 物件。
+
+        不吞例外 —— 呼叫端要能分辨「送出失敗」與「送出成功但被退單」,
+        在這裡包成 False 會讓上游失去例外型別與訊息 (階段 0 已定的原則)。
+        """
+        # 【ADR-110 階段2】指定了帳號卻找不到 → 直接拒單。絕不可退回預設帳號:
+        # 使用者指定 A 戶、系統默默送到 B 戶,是這個功能最嚴重的失效模式。
+        if oi.get('account') and self.account_object(oi['account']) is None:
+            raise ValueError(f"找不到指定的永豐帳號 {oi['account']} (請重新登入或在策略中重選帳號)")
+        return self.api.place_order(contract, self.build_order(oi))
+
+    def order_status_text(self, trade):
+        """從 trade 物件取出狀態字串。各家 SDK 的回傳結構不同,所以放 adapter。"""
+        st = getattr(getattr(trade, 'status', None), 'status', '')
+        return getattr(st, 'name', st) or '送出'

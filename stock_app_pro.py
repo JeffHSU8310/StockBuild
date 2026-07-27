@@ -31,6 +31,9 @@ from core import tick_rules
 from core import indicators as core_indicators
 from core import futures_session
 from core import order_rules
+# 【ADR-110 階段1】券商中立的委託意圖:讓價/檔位/限市價的判斷從這裡出來,
+# 各家券商 adapter 再把它翻成自家 SDK 的委託物件。
+from core import order_intent
 from core import strategy_engine
 from core import backtest
 from core import custom_strategy
@@ -6511,6 +6514,60 @@ class StockTradingAppPro(tk.Tk):
         模擬帳戶視窗的帳戶下拉選單用。"""
         return [(aid, a.get('name', aid)) for aid, a in self.paper_accts.items()]
 
+    def _qt_live_account_choices(self):
+        """【ADR-110 階段2】實單可選的「券商 / 帳號」清單。
+
+        回傳 [((broker_key, account_id), 顯示名稱), ...],第一項固定是
+        「用券商預設帳號」= ('', '') —— 舊策略與沒特別指定的策略都落在這一項,
+        行為與加這個功能之前完全相同。
+
+        未登入時各家 adapter 的 list_accounts() 會回空 list,這時清單只剩
+        預設那一項。這不是錯誤:使用者常在還沒登入時就打開策略編輯器。
+        """
+        out = [(('', ''), '(用券商預設帳號)')]
+        for key, b in (getattr(self, 'brokers', None) or {}).items():
+            blabel = getattr(b, 'display_name', None) or key
+            try:
+                accs = b.list_accounts()
+            except Exception:
+                accs = []
+            for aid, aname in accs:
+                out.append(((key, aid), f"{blabel} / {aname}"))
+        return out
+
+    def _qt_build_live_account_row(self, parent, s):
+        """在策略編輯器裡加一列「實單帳戶」。回傳讀取目前選擇的函式。
+
+        三個編輯器 (一般/自訂/終極波段) 共用這一個建構函式,不各寫一份——
+        下單目標的選法若三處分歧,使用者會在不同編輯器看到不同行為,
+        而這個欄位錯了就是真錢下錯戶頭。
+        """
+        fr = tk.Frame(parent, bg="#1A2026")
+        fr.pack(fill=tk.X, padx=12, pady=(2, 0))
+        tk.Label(fr, text="實單帳戶", bg="#1A2026", fg="white",
+                 font=('微軟正黑體', 9)).pack(side=tk.LEFT)
+        choices = self._qt_live_account_choices()
+        refs = [r for r, _lab in choices]
+        cb = ttk.Combobox(fr, width=26, state='readonly', style="BlackText.TCombobox",
+                          values=[lab for _r, lab in choices])
+        cur = ((order_intent.broker_of(s), order_intent.account_of(s) or '')
+               if order_intent.account_of(s) else ('', ''))
+        cb.current(refs.index(cur) if cur in refs else 0)
+        cb.pack(side=tk.LEFT, padx=6)
+        # 設定過但目前找不到 (換帳號/未登入) 一定要講出來,不能靜靜地退回
+        # 預設帳號讓使用者以為設定還在。
+        warn = ''
+        if order_intent.account_of(s) and cur not in refs:
+            warn = f"⚠ 原設定 {order_intent.account_of(s)} 目前不在清單中 (未登入或帳號已變更)"
+        tk.Label(fr, text=warn or "(只在「模式=實單」時有意義;未登入時只會有預設項)",
+                 bg="#1A2026", fg=("#FFA726" if warn else "#8A99AD"),
+                 font=('微軟正黑體', 8)).pack(side=tk.LEFT, padx=(6, 0))
+
+        def _get():
+            i = cb.current()
+            return refs[i] if 0 <= i < len(refs) else ('', '')
+        return _get
+
     def _qt_runtime(self, sid):
         if sid not in self.strategy_runtimes:
             self.strategy_runtimes[sid] = strategy_engine.new_runtime()
@@ -6586,7 +6643,11 @@ class StockTradingAppPro(tk.Tk):
                 else:
                     tf_disp = s.get('timeframe', '')
                 # 【新ADR 多帳戶】只有模擬模式才有意義 (實單直接下到真實券商帳戶)
-                acct_disp = self._qt_paper_acct_for(s, warn=False).get('name', '') if s.get('mode') != '實單' else '--'
+                # 【ADR-110 階段2】實單策略原本這一欄固定顯示 '--',等於清單上
+                # 看不出「這張單會下到哪一家券商、哪一個帳號」。多券商之後這是
+                # 必要資訊,改成顯示實際的下單目標。
+                acct_disp = (self._qt_paper_acct_for(s, warn=False).get('name', '')
+                             if s.get('mode') != '實單' else self._qt_live_target_text(s))
                 prepared.append((s['id'], (s.get('name',''), sym_disp, sym_name, tf_disp,
                                             dir_disp, conds, s.get('mode','模擬'), acct_disp, status, running_disp,
                                             rt.get('trades_today', 0), pos, unreal_pnl_str), tag))
@@ -6689,7 +6750,10 @@ class StockTradingAppPro(tk.Tk):
             # 【修正】跟策略清單一致:終極波段策略固定顯示「日K」,不要顯示
             # 對它其實沒有作用的 s['timeframe'] 殘留值 (見 _qt_refresh_tree 註解)。
             tf_disp = '日K' if s.get('kind') == chukuangren_band.KIND else s.get('timeframe')
-            box.insert(tk.END, f"[{s.get('mode')}] {s.get('name')} — {s.get('symbol')} {tf_disp} {dir_disp} x{s.get('qty')}")
+            # 【ADR-110 階段2】實單策略要在這裡就看到下單目標 (券商/帳號)。
+            # 這是使用者按下「確認啟動」前最後一次能發現「下錯帳戶」的機會。
+            tgt = f" → {self._qt_live_target_text(s)}" if s.get('mode') == '實單' else ''
+            box.insert(tk.END, f"[{s.get('mode')}] {s.get('name')} — {s.get('symbol')} {tf_disp} {dir_disp} x{s.get('qty')}{tgt}")
         if live:
             tk.Label(dlg, text=f"⚠ 注意:有 {len(live)} 個「實單」策略,啟動後將自動送出真實委託,無人工確認!",
                      bg="#1A2026", fg="#FF1744", font=('微軟正黑體', 10, 'bold')).pack(anchor='w', padx=14, pady=(8, 0))
@@ -7115,49 +7179,85 @@ class StockTradingAppPro(tk.Tk):
 
         【鐵則6】零股一律強制限價 (price_type_of 已做防呆退回限價),不因這裡
         新增的委託方式選項而放寬,交易所規則不可繞過。
+
+        【ADR-110 階段1】讓價/檔位/限市價的判斷搬到 core/order_intent.py,
+        委託物件的組裝搬到 brokers/<券商>.py;這裡只負責「選一家券商、送出、
+        回報結果」。這樣同一個策略要改送別家券商時,改的是它綁定的 adapter,
+        不是再抄一份下單邏輯。
         """
         try:
-            sym = str(strategy.get('symbol', '')).upper()
-            qty = int(intent['qty'])
-            base_px = float(exec_price) if exec_price is not None else float(intent['price'])
-            ticks = int(strategy.get('slippage_ticks', 2) or 0)
-            tick = tick_rules.get_tick(base_px, asset_type, sym)
-            px = base_px + ticks * tick if intent['action'] == '買進' else base_px - ticks * tick
-            px = round(round(px / tick) * tick, 4)
-            sj_action = sj.constant.Action.Buy if intent['action'] == '買進' else sj.constant.Action.Sell
-            tt = strategy_engine.trade_type_of(strategy)
-            ptype = strategy_engine.price_type_of(strategy)
-            is_lmt = (ptype == '限價')
-            order_px = px if is_lmt else 0.0
-            ptype_label = {'限價': f"限價{px:g}", '市價': "市價", '範圍市價': "範圍市價"}[ptype]
-            if tt == '期貨':
-                fut_ptype = {'限價': sj.constant.FuturesPriceType.LMT,
-                             '市價': sj.constant.FuturesPriceType.MKT,
-                             '範圍市價': sj.constant.FuturesPriceType.MKP}[ptype]
-                order = self.sj_api.Order(price=order_px, quantity=qty, action=sj_action,
-                                          price_type=fut_ptype,
-                                          order_type=sj.constant.OrderType.ROD)
-            elif tt == '零股':
-                # 【ADR-043 第4項/鐵則6】零股:盤中零股單 (IntradayOdd),數量單位=股,
-                # 只能限價 (price_type_of 已強制退回限價,order_px 一定等於 px)。
-                order = self.sj_api.Order(price=order_px, quantity=qty, action=sj_action,
-                                          price_type=sj.constant.StockPriceType.LMT,
-                                          order_type=sj.constant.OrderType.ROD,
-                                          order_lot=sj.constant.StockOrderLot.IntradayOdd,
-                                          order_cond=sj.constant.StockOrderCond.Cash)
-            else:  # 股票 (整股)
-                stk_ptype = sj.constant.StockPriceType.MKT if ptype == '市價' else sj.constant.StockPriceType.LMT
-                order = self.sj_api.Order(price=order_px, quantity=qty, action=sj_action,
-                                          price_type=stk_ptype,
-                                          order_type=sj.constant.OrderType.ROD,
-                                          order_lot=sj.constant.StockOrderLot.Common,
-                                          order_cond=sj.constant.StockOrderCond.Cash)
-            trade = self.sj_api.place_order(contract, order)
-            st = getattr(getattr(trade, 'status', None), 'status', '')
+            oi = order_intent.build_live_order(strategy, intent, asset_type,
+                                               exec_price=exec_price)
+            broker = self._broker_for(strategy)
+            if broker is None:
+                return False, f"找不到策略指定的券商連線 ({self._broker_key_of(strategy)})"
+            trade = broker.place_order(contract, oi)
             unit = strategy_engine.qty_unit_of(strategy)
-            return True, f"{ptype_label} x{qty}{unit} ({tt}) 已送出 (狀態 {getattr(st, 'name', st) or '送出'})"
+            return True, (f"{oi['price_label']} x{oi['qty']}{unit} ({oi['trade_type']}) "
+                          f"已送出 (狀態 {broker.order_status_text(trade)})")
         except Exception as e:
             return False, f"{type(e).__name__}: {e}"
+
+    # ------------------------------------------------------------------
+    # 【ADR-110 階段2】self.sj_api 改成 self.brokers['sinopac'].api 的別名
+    #
+    # 【為什麼要改】ADR-097 階段0 把連線搬進 adapter 之後,系統裡同時存在
+    # 兩個指向同一個 shioaji 實例的名字。它們**現在**是同步的,但那只是因為
+    # 兩處賦值剛好都有一起更新——只要有人 (包含診斷腳本) 只改其中一個,
+    # 就會出現「查詢用 A 連線、下單用 B 連線」這種極難查的錯誤。
+    # 實際上這在 ADR-110 階段1 就發生過:診斷腳本設了 app.sj_api,下單卻走
+    # adapter,委託送到另一個物件去,測試才抓到。
+    #
+    # 用 property 讓兩者共用同一份儲存,divergence 從「要小心避免」變成
+    # 「不可能發生」。對外行為完全不變:讀寫 self.sj_api 的上百處都照舊。
+    # ------------------------------------------------------------------
+    @property
+    def sj_api(self):
+        b = (getattr(self, 'brokers', None) or {}).get('sinopac')
+        if b is not None:
+            return b.api
+        return self.__dict__.get('_sj_api_nobroker')
+
+    @sj_api.setter
+    def sj_api(self, value):
+        b = (getattr(self, 'brokers', None) or {}).get('sinopac')
+        if b is not None:
+            b.api = value
+        else:
+            # 沒安裝 shioaji (HAS_SJ=False) 時沒有 adapter 可放,退回自己存,
+            # 讓既有「未安裝也不能當掉」的行為維持不變。
+            self.__dict__['_sj_api_nobroker'] = value
+
+    def _broker_key_of(self, strategy):
+        """策略要用哪一家券商下單 (判斷邏輯在 core,這裡只是轉呼叫)。"""
+        return order_intent.broker_of(strategy)
+
+    def _broker_for(self, strategy):
+        """取得策略綁定的券商 adapter;找不到回 None (呼叫端負責報錯)。"""
+        return (getattr(self, 'brokers', None) or {}).get(self._broker_key_of(strategy))
+
+    def _broker_label(self, broker_key):
+        b = (getattr(self, 'brokers', None) or {}).get(broker_key)
+        return getattr(b, 'display_name', None) or broker_key
+
+    def _qt_live_target_text(self, strategy):
+        """【ADR-110 階段2】「這個策略的實單會下到哪裡」——券商 + 帳號的人話。
+
+        多券商之後,下錯帳戶是全新的風險:策略設定改一個字,單就送到別家去,
+        而且是真錢。所以凡是會讓實單開始運作的畫面 (策略清單、啟動總開關的
+        確認視窗) 都要顯示這一行,不能只有下單當下才看得到。
+        """
+        bkey = self._broker_key_of(strategy)
+        acc_id = order_intent.account_of(strategy)
+        acc_label = None
+        if acc_id:
+            broker = (getattr(self, 'brokers', None) or {}).get(bkey)
+            if broker is not None:
+                acc_label = dict(broker.list_accounts()).get(acc_id)
+            # 找不到對應帳號時要看得出來是「設定了但現在找不到」,
+            # 不可顯示成「預設帳號」讓使用者以為一切正常。
+            acc_label = acc_label or f"{acc_id} ⚠找不到"
+        return order_intent.describe_target(strategy, self._broker_label(bkey), acc_label)
 
     def _qt_log_session_closed(self, s, trade_type, include_night):
         """【ADR-070】策略因休市被跳過時記錄——但只在「開盤→休市」轉換那一刻記
@@ -7805,6 +7905,7 @@ class StockTradingAppPro(tk.Tk):
                  wraplength=720, justify='left').pack(fill=tk.X, padx=10, pady=(10, 4))
 
         top = tk.Frame(dlg, bg="#1A2026"); top.pack(fill=tk.X, padx=12, pady=2)
+        _live_get = self._qt_build_live_account_row(dlg, s)   # 【ADR-110階段2】
         def _lbl(p, t): return tk.Label(p, text=t, bg="#1A2026", fg="white", font=('微軟正黑體', 9))
         def _ent(p, v, w=10):
             e = tk.Entry(p, width=w, bg="#2A323D", fg="white", justify="center"); e.insert(0, str(v)); return e
@@ -7978,6 +8079,8 @@ class StockTradingAppPro(tk.Tk):
             s['specific_entry_time'] = e_sp_en.get().strip()
             s['mode'] = cb_mode.get()
             s['account_id'] = _ids2[cb_acct2.current()] if cb_acct2.current() >= 0 else 'default'
+            # 【ADR-110階段2】實單要下到哪一家券商的哪一個帳號
+            s['broker'], s['broker_account'] = _live_get()
             s['custom_params'] = _parse_params()
             s['source_code'] = txt.get('1.0', 'end-1c')
             s.update(watch_ui['get']())  # 【ADR-074】看A做B 設定
@@ -8411,6 +8514,7 @@ class StockTradingAppPro(tk.Tk):
             e = tk.Entry(p, width=w, bg="#2A323D", fg="white", justify="center"); e.insert(0, str(v)); return e
 
         top = tk.Frame(body, bg="#1A2026"); top.pack(fill=tk.X, padx=12, pady=2)
+        _live_get = self._qt_build_live_account_row(body, s)  # 【ADR-110階段2】
         _lbl(top, "策略名稱").grid(row=0, column=0, sticky='w')
         e_name = _ent(top, s.get('name', chukuangren_band.STRATEGY_NAME), 20); e_name.grid(row=0, column=1, padx=4, columnspan=2, sticky='w')
 
@@ -8602,6 +8706,8 @@ class StockTradingAppPro(tk.Tk):
             s['mode'] = cb_mode.get()
             s['price_type'] = cb_ptype.get() or '限價'
             s['account_id'] = _ids2[cb_acct2.current()] if cb_acct2.current() >= 0 else 'default'
+            # 【ADR-110階段2】實單要下到哪一家券商的哪一個帳號
+            s['broker'], s['broker_account'] = _live_get()
             s['watch_enabled'] = True
             s['watch_symbol'] = e_wsym.get().strip().upper() or '^TWII'
             s['watch_trade_type'] = '指數'
@@ -8738,6 +8844,7 @@ class StockTradingAppPro(tk.Tk):
             e.insert(0, str(val)); return e
 
         top = tk.Frame(dlg, bg="#1A2026"); top.pack(fill=tk.X, padx=12, pady=(10, 2))
+        _live_get = self._qt_build_live_account_row(dlg, s)   # 【ADR-110階段2】
         top.columnconfigure(6, weight=1)
         _lbl(top, "策略名稱").grid(row=0, column=0, sticky='w')
         e_name = _ent(top, s.get('name', ''), 16); e_name.grid(row=0, column=1, padx=4)
@@ -9169,6 +9276,8 @@ class StockTradingAppPro(tk.Tk):
             except (TypeError, ValueError): s['slippage_ticks'] = 2
             s['price_type'] = cb_ptype.get() or '限價'
             s['account_id'] = _ids2[cb_acct2.current()] if cb_acct2.current() >= 0 else 'default'
+            # 【ADR-110階段2】實單要下到哪一家券商的哪一個帳號
+            s['broker'], s['broker_account'] = _live_get()
             try: s['max_trades_per_day'] = int(e_maxd.get().strip())
             except (TypeError, ValueError): s['max_trades_per_day'] = 3
             s['entry_time_start'] = e_en_st.get().strip()

@@ -217,12 +217,13 @@ G:\StockBuild\
 │   ├─ tick_rules.py
 │   ├─ indicators.py
 │   ├─ futures_session.py
+│   ├─ order_intent.py      券商中立的委託意圖 (ADR-110)
 │   └─ order_rules.py
 ├─ data/
 │   └─ config_store.py     設定 / 自選股 / 版面 I/O
 ├─ brokers/                券商 adapter (零 tkinter,可依賴券商 SDK,ADR-097)
-│   ├─ base.py              BrokerClient 共用介面骨架
-│   └─ sinopac.py           永豐 shioaji adapter (目前只涵蓋連線生命週期)
+│   ├─ base.py              BrokerClient 介面:連線/下單/帳號 (ADR-110)
+│   └─ sinopac.py           永豐 shioaji adapter (連線 + 委託翻譯 + 帳號解析)
 ├─ tests/
 │   └─ test_core.py        core/ + data/ 離線單元測試
 ├─ diag_mock_tkinter.py    假 tkinter/mplfinance 環境 (開發用)
