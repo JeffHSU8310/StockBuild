@@ -213,7 +213,7 @@ _tg_poll_worker (背景 daemon,getUpdates long polling)
 |---|---|
 | `core/`、`data/` 純邏輯 | `python tests/test_core.py`（必跑）+ 補對應測試 |
 | `draw_chart`/版面/下單流程等 GUI 耦合 | `diag_repro_issues.py` 等假 tkinter 診斷 |
-| 任何檔案 | `python -m py_compile` + AST 掃描（無孤兒 `self.xxx`、無重複方法） |
+| 任何檔案 | `python -m py_compile` + `python diag_crossref.py`（跨模組斷鏈 **與重複定義**，ADR-109） |
 | shioaji 連線、即時報價、實鍵盤輸入法、實機排版顏色 | **只能請使用者實機驗證**，交付時附「怎麼驗」 |
 | Telegram 遠端控制 | `core/telegram_control.py` 測純邏輯 + diag 走 GUI 派送路徑；真實 Bot 收發只能實機驗證 |
 

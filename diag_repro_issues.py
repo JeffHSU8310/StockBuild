@@ -2315,6 +2315,70 @@ def _telegram_remote_control():
 
 run_case("ADR-108: Telegram 遠端控制授權/二次確認/啟用停用策略", _telegram_remote_control)
 
+
+def _volume_axis_starts_at_zero():
+    """【ADR-109】成交量副圖的 Y 軸必須從 0 起算。
+
+    這條原本有寫,但因為 auto_scale_indicator_panels 被重複定義了兩次、
+    後面那份把前面那份整個蓋掉而靜默失效 (量能長條被從底部裁掉一截)。
+    修好之後補這個案例,讓它再壞掉時會被抓到而不是又靜悄悄地錯。
+    """
+    class _Ax:
+        def __init__(s): s.ylim = None
+        def set_ylim(s, lo, hi): s.ylim = (float(lo), float(hi))
+
+    old_df, old_axl = app.plot_df, getattr(app, 'axlist', None)
+    old_ap = getattr(app, 'active_panels', None)
+    old_pc = getattr(app, 'panel_columns', None)
+    try:
+        n = 40
+        idx = pd.date_range('2026-01-01', periods=n, freq='D')
+        # 量刻意「全部都很大且彼此接近」(80萬~100萬):最小值遠離 0,
+        # 若用一般副圖的 low-padding 當下限,長條就會被從底部裁掉。
+        vol = np.linspace(800000, 1000000, n)
+        macd = np.linspace(-5, 5, n)
+        app.plot_df = pd.DataFrame({
+            'Open': np.linspace(100, 110, n), 'High': np.linspace(101, 111, n),
+            'Low': np.linspace(99, 109, n), 'Close': np.linspace(100, 110, n),
+            'Volume': vol, 'MACD': macd}, index=idx)
+        ax_vol, ax_macd = _Ax(), _Ax()
+        # axlist 的排列是 panel_index * 2 (mplfinance 每個 panel 有主/次兩個軸)
+        app.axlist = [_Ax(), _Ax(), ax_vol, _Ax(), ax_macd, _Ax()]
+        app.active_panels = {'Volume': 1, 'MACD': 2}
+        app.panel_columns = {'Volume': ['Volume'], 'MACD': ['MACD']}
+
+        app.auto_scale_indicator_panels(0, n)
+
+        assert ax_vol.ylim is not None, "成交量副圖的 Y 軸沒有被設定"
+        lo, hi = ax_vol.ylim
+        assert lo == 0.0, f"成交量 Y 軸下限必須是 0,實際 {lo} (長條會被從底部裁掉)"
+        assert hi >= float(vol.max()), f"成交量 Y 軸上限要容得下最大量,實際 {hi}"
+
+        # 其他副圖不適用「從 0 起算」:MACD 有負值,硬從 0 起算會看不到負的那半
+        assert ax_macd.ylim is not None
+        mlo, mhi = ax_macd.ylim
+        assert mlo < float(macd.min()) and mhi > float(macd.max()), \
+            "一般副圖仍應依視角內極值上下留白"
+        assert mlo < 0, "MACD 有負值,Y 軸不可從 0 起算"
+
+        # 主圖:視角內價格完全沒波動時,仍要給得出一個範圍 (漲停鎖死/單根K棒)
+        flat = app.plot_df.copy()
+        flat['High'] = flat['Low'] = flat['Close'] = flat['Open'] = 100.0
+        app.plot_df = flat
+        ax_main = _Ax()
+        app.auto_scale_y(ax_main, 0, n)
+        assert ax_main.ylim is not None, "價格完全沒波動時仍要設定 Y 軸,否則K棒會被壓成一條線"
+        assert ax_main.ylim[0] < 100.0 < ax_main.ylim[1]
+    finally:
+        app.plot_df = old_df
+        app.axlist = old_axl
+        app.active_panels = old_ap
+        app.panel_columns = old_pc
+
+
+run_case("ADR-109: 成交量Y軸從0起算 + 無波動時仍給範圍 (重複定義修正)",
+         _volume_axis_starts_at_zero)
+
 print(f"{'案例':60s} 結果")
 print("-" * 76)
 for name, st, msg in results:

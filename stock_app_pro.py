@@ -2501,62 +2501,6 @@ class StockTradingAppPro(tk.Tk):
             return core_indicators.calculate_indicators(
                 df, ma_flags, ma_types, ma_periods, **common_kwargs)
 
-    def auto_scale_y(self, ax, xmin, xmax):
-        """主圖 (價格) 動態 Y 軸放縮 (依視角內最高極值)"""
-        if self.plot_df is None or len(self.plot_df) == 0:
-            return
-        try:
-            imin, imax = max(0, int(np.floor(xmin))), min(len(self.plot_df), int(np.ceil(xmax)))
-            if imin >= imax:
-                return
-            sub_df = self.plot_df.iloc[imin:imax]
-            low = float(sub_df['Low'].min())
-            high = float(sub_df['High'].max())
-            if high <= low:
-                low, high = low - 1, high + 1
-            padding = (high - low) * 0.05
-            ax.set_ylim(low - padding, high + padding)
-        except Exception:
-            pass
-
-    def auto_scale_indicator_panels(self, xmin, xmax):
-        """
-        副圖 (成交量/MACD/RSI/KDJ/DMI/布林寬) 動態 Y 軸放縮，依視角內最高極值調整。
-        """
-        if self.plot_df is None or len(self.plot_df) == 0 or not self.axlist:
-            return
-        try:
-            imin, imax = max(0, int(np.floor(xmin))), min(len(self.plot_df), int(np.ceil(xmax)))
-            if imin >= imax:
-                return
-            sub_df = self.plot_df.iloc[imin:imax]
-            for name, p_idx in getattr(self, 'active_panels', {}).items():
-                cols = getattr(self, 'panel_columns', {}).get(name)
-                if not cols:
-                    continue
-                cols = [c for c in cols if c in sub_df.columns]
-                if not cols:
-                    continue
-                ax_idx = p_idx * 2
-                if ax_idx >= len(self.axlist):
-                    continue
-                ax = self.axlist[ax_idx]
-                values = sub_df[cols].to_numpy(dtype=float)
-                valid = values[~np.isnan(values)]
-                if valid.size == 0:
-                    continue
-                low, high = float(valid.min()), float(valid.max())
-                if name == 'Volume':
-                    padding = max(high * 0.15, 1.0)
-                    ax.set_ylim(0.0, max(high + padding, 10.0))
-                else:
-                    if high <= low:
-                        low, high = low - 1, high + 1
-                    padding = (high - low) * 0.12
-                    ax.set_ylim(low - padding, high + padding)
-        except Exception:
-            pass
-
     # ================= 🚀 大盤與櫃買指數 API 數據滿載化 =================
     def fetch_market_indices_worker(self):
         while True:
@@ -3104,9 +3048,16 @@ class StockTradingAppPro(tk.Tk):
             sub_df = self.plot_df.iloc[imin:imax]
             low = sub_df['Low'].min()
             high = sub_df['High'].max()
-            if pd.notna(low) and pd.notna(high) and high > low:
-                padding = (high - low) * 0.05
-                ax.set_ylim(low - padding, high + padding)
+            if not (pd.notna(low) and pd.notna(high)):
+                return
+            if high <= low:
+                # 【ADR-109】視角內價格完全沒有波動 (漲停鎖死一整天、或只剩
+                # 一根K棒)。原本這裡直接 return,結果是沿用 mplfinance 依
+                # 「整個資料集」算出來的 Y 軸範圍,那根K棒會被壓成畫面中間
+                # 一條看不出來的線。給一個對稱小範圍讓它至少畫得出來。
+                low, high = float(low) - 1.0, float(high) + 1.0
+            padding = (high - low) * 0.05
+            ax.set_ylim(low - padding, high + padding)
         except Exception: pass
 
     def auto_scale_indicator_panels(self, xmin, xmax):
@@ -3148,6 +3099,14 @@ class StockTradingAppPro(tk.Tk):
                 if valid.size == 0:
                     continue
                 low, high = float(valid.min()), float(valid.max())
+                # 【ADR-109】成交量必須從 0 起算。量是「長條圖」,底邊代表 0;
+                # 若照其他副圖那樣用 low - padding 當下限,軸底會落在「視角內
+                # 最小的那根量」之下一點點,於是每一根長條都被從底部裁掉一截,
+                # 看起來像是所有成交量都差不多大 —— 量能的相對關係整個失真。
+                if name == 'Volume':
+                    padding = max(high * 0.15, 1.0)
+                    ax.set_ylim(0.0, max(high + padding, 10.0))
+                    continue
                 if high <= low:
                     # 資料是常數 (例如全部都是0),給一個對稱的小範圍避免 set_ylim 出錯
                     low, high = low - 1, high + 1
@@ -3602,8 +3561,6 @@ class StockTradingAppPro(tk.Tk):
             if not tx_id:
                 return pub_df
             
-            # TODO: ... (taifex logic remains exactly as is, this is just to anchor the new method)
-            # Actually I don't need to replace `_extend_with_taifex`, I will prepend `_extend_with_yahoo` before `_extend_with_taifex` definition.
             rank = getattr(self, '_month_rank_of', lambda x: 1)(contract)
             
             # 【ADR-058】依回測選定的盤別口徑取用對應的那一份期交所資料

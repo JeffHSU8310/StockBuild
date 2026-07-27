@@ -92,16 +92,19 @@ def _collect_local_aliases(tree, local_module_stems):
     return aliases
 
 
-def scan(root_dir):
-    """回傳 (問題清單, stem->path 對照)。
-    問題清單項目:(呼叫檔, 行號, 本地別名, 目標模組stem, 屬性名稱)"""
-    py_files = []
+def _iter_py_files(root_dir):
     for dirpath, dirnames, filenames in os.walk(root_dir):
         dirnames[:] = [d for d in dirnames if d not in
                        ('.git', '__pycache__', 'node_modules', '.venv', 'venv')]
         for fn in filenames:
             if fn.endswith('.py'):
-                py_files.append(os.path.join(dirpath, fn))
+                yield os.path.join(dirpath, fn)
+
+
+def scan(root_dir):
+    """回傳 (問題清單, stem->path 對照)。
+    問題清單項目:(呼叫檔, 行號, 本地別名, 目標模組stem, 屬性名稱)"""
+    py_files = list(_iter_py_files(root_dir))
 
     trees = {}
     for path in py_files:
@@ -148,11 +151,59 @@ def scan(root_dir):
     return problems, stem_path
 
 
+def scan_duplicate_defs(root_dir):
+    """【ADR-109】掃描「同一個類別/模組裡定義了兩次的同名函式」。
+
+    【緣起】`auto_scale_y` / `auto_scale_indicator_panels` 在
+    stock_app_pro.py 裡各被定義了**兩次**:後面那份把前面那份整個蓋掉,
+    Python 不會有任何警告。前一份裡「成交量副圖 Y 軸要從 0 起算」的特例
+    因此靜默失效,量能長條被從底部裁掉一截,而程式看起來完全正常。
+
+    這種錯誤 py_compile 抓不到、跨模組斷鏈掃描也抓不到 (名字是存在的),
+    只能靠這種「同一個 scope 裡有沒有重名定義」的檢查。
+    """
+    dups = []
+    for path in _iter_py_files(root_dir):
+        try:
+            tree = ast.parse(open(path, encoding='utf-8').read())
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+        scopes = [('模組層級', tree.body)]
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                scopes.append((f'class {node.name}', node.body))
+        for scope_name, body in scopes:
+            seen = {}
+            for n in body:
+                if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                # @overload / @property+setter 是合法的同名重複,不報。
+                deco = {getattr(d, 'attr', getattr(d, 'id', '')) for d in n.decorator_list}
+                if deco & {'overload', 'setter', 'getter', 'deleter', 'register'}:
+                    continue
+                if n.name in seen:
+                    dups.append((path, seen[n.name], n.lineno, scope_name, n.name))
+                seen[n.name] = n.lineno
+    return dups
+
+
 def main():
     root_dir = sys.argv[1] if len(sys.argv) > 1 else '.'
     problems, stem_path = scan(root_dir)
+
+    dups = scan_duplicate_defs(root_dir)
+    if dups:
+        print(f"❌ diag_crossref: 發現 {len(dups)} 處重複定義 (後面那份會靜默蓋掉前面那份):\n")
+        for path, first, second, scope_name, name in sorted(dups):
+            rel = os.path.relpath(path, root_dir)
+            print(f"  {rel}  {scope_name} 的 `{name}`:"
+                  f"第 {first} 行定義後,第 {second} 行又定義一次")
+        print("\n請確認:是不是新增功能時沒發現已經有同名的方法?"
+              "兩份的內容常常不一樣,先比對差異再決定保留哪些行為,不要直接砍掉一份。")
+        return 1
+
     if not problems:
-        print("✅ diag_crossref: 沒有發現跨模組斷鏈。")
+        print("✅ diag_crossref: 沒有發現跨模組斷鏈或重複定義。")
         return 0
     print(f"❌ diag_crossref: 發現 {len(problems)} 處可能的跨模組斷鏈:\n")
     for path, lineno, local_name, target_stem, attr in sorted(problems):
