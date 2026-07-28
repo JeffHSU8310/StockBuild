@@ -34,6 +34,7 @@ from core import order_rules
 # 【ADR-110 階段1】券商中立的委託意圖:讓價/檔位/限市價的判斷從這裡出來,
 # 各家券商 adapter 再把它翻成自家 SDK 的委託物件。
 from core import order_intent
+from core import sj_compat
 from core import strategy_engine
 from core import backtest
 from core import custom_strategy
@@ -4567,7 +4568,11 @@ class StockTradingAppPro(tk.Tk):
                 try:
                     if market == "台期貨":
                         contract = self._resolve_futures_contract(raw_sym)
-                        if contract: search_sym = contract.symbol; stock_name = fut_catalog.display_name(contract.symbol, contract.name); self.asset_type = "future"
+                        # 【ADR-114 追修】1.7 的 FuturesInfo 移除了 symbol,要改用 code。
+                        # 這裡原本直接讀 .symbol,升級後會取不到而讓期貨查詢整個失效。
+                        if contract:
+                            _fs = sj_compat.contract_symbol(contract)
+                            search_sym = _fs; stock_name = fut_catalog.display_name(_fs, contract.name); self.asset_type = "future"
                     elif raw_sym == "^TWII":
                         contract = self.brokers['sinopac'].index_contract('TSE')   # 【ADR-114】
                         if contract: search_sym = raw_sym; stock_name = "加權指數"; self.asset_type = "index_tw"
@@ -4578,7 +4583,11 @@ class StockTradingAppPro(tk.Tk):
                         # 【第十一輪修正】台股模式下輸入/點選期貨完整代號 (TXFR2 等)
                         # 也走期貨解析,不再掉進股票查詢報「合約查無」。
                         contract = self._resolve_futures_contract(raw_sym)
-                        if contract: search_sym = contract.symbol; stock_name = fut_catalog.display_name(contract.symbol, contract.name); self.asset_type = "future"
+                        # 【ADR-114 追修】1.7 的 FuturesInfo 移除了 symbol,要改用 code。
+                        # 這裡原本直接讀 .symbol,升級後會取不到而讓期貨查詢整個失效。
+                        if contract:
+                            _fs = sj_compat.contract_symbol(contract)
+                            search_sym = _fs; stock_name = fut_catalog.display_name(_fs, contract.name); self.asset_type = "future"
                     else:
                         contract = self.brokers['sinopac'].stock_contract(raw_sym)  # 【ADR-114】
                         if contract: search_sym = raw_sym; stock_name = contract.name; self.asset_type = "stock"
