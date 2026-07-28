@@ -5439,5 +5439,44 @@ class TestSjCompatLoginKwargs(unittest.TestCase):
         self.assertEqual(dropped, [])
 
 
+class TestScreenerNaNText(unittest.TestCase):
+    """【ADR-117】全市場資料合併後,缺漏欄位會是 NaN。"""
+
+    def test_nan_never_reaches_display(self):
+        """`str(v or '')` 在 pandas 資料上是錯的:NaN 是 truthy,所以
+        `nan or ''` 得到 nan,顯示出來就是字面上的 'nan' (實機回報過)。"""
+        import numpy as np
+        for v in (float('nan'), np.nan, None, '', '  ', 'nan', 'NaN', 'NAN'):
+            self.assertEqual(market_screener._text(v), '', repr(v))
+
+    def test_keeps_real_values(self):
+        self.assertEqual(market_screener._text('  台積電 '), '台積電')
+        self.assertEqual(market_screener._text(2330), '2330')
+
+    def test_custom_default(self):
+        self.assertEqual(market_screener._text(float('nan'), '—'), '—')
+
+    def test_row_with_missing_name_shows_blank_not_nan(self):
+        """端到端:某檔股票在基本面來源缺名稱時,結果列不可出現 'nan'。"""
+        fund = pd.DataFrame([
+            {'Code': '1591', 'Name': float('nan'), 'Industry': float('nan'),
+             'Close': 41.6, 'PE': None, 'PB': None, 'YieldPct': None,
+             'EPS': None, 'GrossMarginPct': None, 'RevenueYoYPct': None,
+             'MonthRevenue': None, 'Equity': None, 'ROEPct': None},
+            {'Code': '2072', 'Name': '世紀風電', 'Industry': '綠能環保',
+             'Close': 153.0, 'PE': 11.71, 'PB': 1.26, 'YieldPct': 4.63,
+             'EPS': 13.0, 'GrossMarginPct': 20.0, 'RevenueYoYPct': 5.0,
+             'MonthRevenue': 1.0, 'Equity': 1.0, 'ROEPct': 10.0},
+        ])
+        res = market_screener.screen(fund, None, conditions=[], fundamental_conds=[])
+        by_code = {r['code']: r for r in res['rows']}
+        self.assertEqual(by_code['1591']['name'], '')
+        self.assertEqual(by_code['1591']['industry'], '')
+        self.assertEqual(by_code['2072']['name'], '世紀風電')
+        for r in res['rows']:
+            for k, v in r.items():
+                self.assertNotEqual(str(v).lower(), 'nan', f"{k} 出現 nan")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
