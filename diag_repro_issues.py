@@ -2634,6 +2634,8 @@ def _shioaji_17_compat():
         def __getitem__(s, k): return s._m[k]
         def __iter__(s): return iter(s._m.values())
 
+    from core import sj_compat
+
     broker = app.brokers['sinopac']
     orig_api = broker.api
 
@@ -2700,9 +2702,37 @@ def _shioaji_17_compat():
         assert a156.calls == [10000], "1.5.6 應照舊傳入 contracts_timeout"
         assert dropped == [], f"1.5.6 不該略過任何參數,實際 {dropped}"
 
+        # --- 1.7 官方確認:Indexs.TSE["IX0001"] 這種「群組 + 新代碼」形狀 ---
+        # 升級指南明載舊寫法 Indexs.TSE["001"] → 新寫法 Indexs.TSE["IX0001"],
+        # 也就是 1.7 仍然保留交易所群組,只是代碼變了。這個形狀一定要能解析。
+        idx_grp17 = _Grp({'TSE': _Cat({'IX0001': _C('IX0001', name='加權指數')}),
+                          'OTC': _Cat({'IX0101': _C('IX0101', name='櫃買指數')})})
+        broker.api = _Api(idx_grp17, _Cat({}))
+        assert broker.index_contract('TSE').code == 'IX0001', \
+            "官方指南的 Indexs.TSE['IX0001'] 形狀解析失敗"
+        assert broker.index_contract('OTC').code == 'IX0101', \
+            "櫃買 IX0101 (依官方規則推得) 解析失敗"
+
+        # 櫃買代碼是推論,IX0002 這個可能性也要能解析 (猜錯不會壞)
+        broker.api = _Api(_Grp({'OTC': _Cat({'IX0002': _C('IX0002')})}), _Cat({}))
+        assert broker.index_contract('OTC').code == 'IX0002', "櫃買備選代碼解析失敗"
+
+        # --- 1.7 期貨合約沒有 symbol,主圖查詢要改用 code ---
+        fut17 = _C('TXFR1', name='臺股期貨')          # 刻意不給 symbol
+        assert sj_compat.contract_symbol(fut17) == 'TXFR1', \
+            "FuturesInfo 無 symbol 時要退回 code,否則期貨查詢整個失效"
+        # 上面只測到純函式。真正的 bug 是 GUI 裡「直接讀 contract.symbol」那一行,
+        # 而那條路徑要有真連線才走得到——改用原始碼斷言守住:主程式裡不可再有
+        # 裸讀 .symbol 的地方 (1.7 的 *Info 型別都沒有這個屬性)。
+        import re as _re
+        _src = open(stock_app_pro.__file__, encoding='utf-8').read()
+        _bare = [m for m in _re.findall(r'\b\w+\.symbol\b', _src)
+                 if not m.startswith(('s.', 's2.', 'oi.'))]
+        assert not _bare, f"主程式仍有裸讀 .symbol 的地方 (1.7 會取不到): {sorted(set(_bare))}"
+
         # --- 策略層要認得新舊指數代碼 ---
         from core import strategy_engine as _se
-        for code in ('TSE001', 'OTC101', 'IX0001', 'IX0002', '^TWII'):
+        for code in ('TSE001', 'OTC101', 'IX0001', 'IX0101', 'IX0002', '^TWII'):
             assert _se.looks_like_index_symbol(code), f"{code} 應被認成指數"
         assert not _se.looks_like_index_symbol('2330')
     finally:
