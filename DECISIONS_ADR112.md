@@ -82,6 +82,13 @@ handle，而使用者的主要環境是 Windows。
 **管線要關。** 主程式長時間執行，每次重連漏掉幾個 fd，跑一整天就會累積成
 「開不了新行程」。（這是實測 `ResourceWarning` 抓到的。）
 
+### 追記（2026-07-28）：對 2.1.0 重新確認，阻擋點沒有解除
+
+`kgisuperpy` 2.1.0（當天發布）仍然只編到 cp313、仍相依 numba、METADATA 仍
+沒有 `Requires-Python`。也就是說 **`pip install kgisuperpy` 在 Python 3.14
+會「安裝成功」但 import 就炸** —— pip 不會擋，錯誤要到執行時才出現。
+本 ADR 的子行程方案因此仍然必要。詳細比對見 `DECISIONS_ADR111.md` 的追記。
+
 ### 直譯器路徑
 
 `app_settings.json` 新增 `kgi_python`（空字串 = 自動偵測）。自動偵測依序找
