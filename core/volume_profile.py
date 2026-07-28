@@ -59,6 +59,13 @@ ROLE_CURRENT = '現價附近'
 DEFAULT_BINS = 40
 DEFAULT_VALUE_AREA = 0.70
 
+# 【ADR-120】要拿哪一段 K 棒來算支撐壓力。原本這兩個字串寫死在
+# stock_app_pro 的類別常數裡,設定檔正規化 (core/regime_panel.normalize)
+# 也要用到,放在這裡當唯一出處,避免兩邊各寫一份字面值而寫岔。
+RANGE_VISIBLE = '可見範圍'
+RANGE_FIXED = '固定N根'
+RANGE_MODES = (RANGE_VISIBLE, RANGE_FIXED)
+
 
 def _clean(df):
     """取出乾淨的 OHLCV;缺欄位或空資料回 None。"""

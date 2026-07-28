@@ -51,6 +51,9 @@ for _attr, _fn in (('QT_STRATEGY_FILE', 'quant_strategies.json'),
 StockTradingAppPro.CLOSE_FORCE_EXIT = False
 app = StockTradingAppPro()
 app.flush_after = getattr(app, "flush_after")  # 來自 _Tk mock
+# 【ADR-115 延伸 / ADR-120】app_settings.json 也是使用者的真實設定檔
+# (盤勢判斷面板的偏好存在裡面),診斷案例會存檔,同樣改指到暫存目錄。
+app.app_settings_file = os.path.join(_diag_tmp, "app_settings.json")
 
 
 def place_and_settle(ctx, timeout=5.0):
@@ -1963,14 +1966,23 @@ def _sr_levels_drawn_on_chart():
     old_sym, old_at = app.current_symbol, app.asset_type
     try:
         app.current_symbol, app.asset_type = '2330', 'stock'
+        # 【ADR-120】支撐壓力現在是【盤勢判斷】底下的子項:總開關 + 子項
+        # 都要開才會畫。總開關開著但子項關掉,一樣不可以畫出線來。
+        app.regime_enabled_var.set(True)
 
-        # 關閉時不應有任何支撐壓力線
+        # 子項關閉時不應有任何支撐壓力線
         app.sr_enabled_var.set(False)
         app.draw_chart(df)
-        assert app._sr_last_result is None, "關閉時不該計算支撐壓力"
+        assert app._sr_last_result is None, "支撐壓力子項關閉時不該計算"
 
-        # 開啟後應畫出水平線
+        # 總開關關閉時,即使子項是開的也不該計算 (ADR-120)
         app.sr_enabled_var.set(True)
+        app.regime_enabled_var.set(False)
+        app.draw_chart(df)
+        assert app._sr_last_result is None, "【盤勢判斷】總開關關閉時不該計算支撐壓力"
+        app.regime_enabled_var.set(True)
+
+        # 兩個都開才畫出水平線
         app.draw_chart(df)
         r = app._sr_last_result
         assert r and r['levels'], "開啟後應算出支撐壓力點位"
@@ -1997,10 +2009,12 @@ def _sr_levels_drawn_on_chart():
         assert abs(r['profile']['poc'] - 104.5) < 2.0, \
             f"POC 應接近成交密集區 104.5,實際 {r['profile']['poc']}"
 
-        # 兩種區間模式都要能運作
-        app._sr_set_range_mode(app.SR_RANGE_FIXED)
+        # 兩種區間模式都要能運作 (ADR-120 後改由 regime_settings 決定)
+        app.regime_settings['sr_range_mode'] = app.SR_RANGE_FIXED
+        app.draw_chart(df)
         assert app._sr_last_result and app._sr_last_result['levels'], "固定N根模式應可運作"
-        app._sr_set_range_mode(app.SR_RANGE_VISIBLE)
+        app.regime_settings['sr_range_mode'] = app.SR_RANGE_VISIBLE
+        app.draw_chart(df)
         assert app._sr_last_result and app._sr_last_result['levels'], "可見範圍模式應可運作"
 
         # 計算失敗時不可影響 K 線圖 (支撐壓力只是輔助資訊)
@@ -2014,6 +2028,7 @@ def _sr_levels_drawn_on_chart():
             stock_app_pro.volume_profile.find_levels = orig
     finally:
         app.sr_enabled_var.set(False)
+        app.regime_enabled_var.set(False)
         app.current_symbol, app.asset_type = old_sym, old_at
 
 
@@ -3110,6 +3125,147 @@ def _stability_and_units_119():
 
 run_case("ADR-119: 櫃買無資料/期貨金額(億)/指數帶入編輯器/關閉保底",
          _stability_and_units_119)
+
+
+def _regime_panel_120():
+    """【ADR-120】主圖【盤勢判斷】:盤勢/型態從終極波段策略搬到主圖。
+
+    要驗四件事 (每一件都是「錯了不會有錯誤訊息、只會行為怪怪的」那種):
+      1. 加權指數日K 出現型態時會自動通知。
+      2. **重畫不可以重複通知** —— 主圖每縮放/平移一次就重畫一次。
+      3. 週期不是日K、或設定成「只在加權指數」時看的是個股 → 不評估。
+      4. 型態偵測出錯不可以害 K 線圖畫不出來。
+    另外驗終極波段策略那一區真的被移除了 (不是只是隱藏)。
+    """
+    import pandas as _pd
+
+    # 穩定上升的日K:必定會被判成「上升趨勢」且收盤貼著區間高點
+    n = 120
+    closes = [10000 + i * 60 for i in range(n)]   # 斜率要夠陡才會被判成「趨勢」而非「區間整理」
+    df = _pd.DataFrame({'Open': closes, 'High': [c + 15 for c in closes],
+                        'Low': [c - 15 for c in closes], 'Close': closes,
+                        'Volume': [100000] * n},
+                       index=_pd.date_range('2026-01-01', periods=n, freq='B'))
+
+    logs = []
+    orig_log = app.log_message
+    old = (app.current_symbol, app.asset_type, app.current_stock_name,
+           app.timeframe_var.get(), dict(app.regime_settings))
+    try:
+        app.log_message = lambda m: (logs.append(m), orig_log(m))[0]
+        app.current_symbol, app.asset_type = '^TWII', 'index'
+        app.current_stock_name = '加權指數'
+        app.timeframe_var.set('日K')
+        app.regime_settings = stock_app_pro.regime_panel.normalize(
+            {'enabled': True, 'sr_enabled': False, 'pattern_enabled': True,
+             'index_only': True})
+        app.regime_enabled_var.set(True)
+        app.sr_enabled_var.set(False)
+        app._regime_notify_state = {}
+
+        # 1) 加權指數日K 應自動通知
+        logs.clear(); app.draw_chart(df)
+        hits = [m for m in logs if m.startswith('【盤勢判斷】')]
+        assert hits, f"加權指數日K 出現型態時應自動通知,實際日誌: {logs[-5:]}"
+        assert '上升趨勢' in hits[0], f"應判成上升趨勢,實際 {hits[0]!r}"
+
+        # 2) 重畫不可重複通知 (縮放/平移會重畫;沒去重就會被洗版)
+        for _ in range(3):
+            logs.clear(); app.draw_chart(df)
+            assert not [m for m in logs if m.startswith('【盤勢判斷】')], \
+                "同一根K棒重畫不可重複通知"
+
+        # 3a) 週期不是日K → 不評估 (型態定義以「一天一根」為前提)
+        app._regime_notify_state = {}
+        app.timeframe_var.set('60分K')
+        logs.clear(); app.draw_chart(df)
+        assert not [m for m in logs if m.startswith('【盤勢判斷】')], "非日K不該評估型態"
+        app.timeframe_var.set('日K')
+
+        # 3b) 「只在加權指數」時,看個股不評估
+        app._regime_notify_state = {}
+        app.current_symbol, app.asset_type = '2330', 'stock'
+        logs.clear(); app.draw_chart(df)
+        assert not [m for m in logs if m.startswith('【盤勢判斷】')], \
+            "設定成只在加權指數判斷時,個股不該通知"
+        # 取消該設定後,個股也要能判斷
+        app.regime_settings['index_only'] = False
+        app._regime_notify_state = {}
+        logs.clear(); app.draw_chart(df)
+        assert [m for m in logs if m.startswith('【盤勢判斷】')], \
+            "取消「只在加權指數」後,個股日K也該判斷"
+        app.regime_settings['index_only'] = True
+        app.current_symbol, app.asset_type = '^TWII', 'index'
+
+        # 3c) 總開關關掉 → 完全不評估
+        app._regime_notify_state = {}
+        app.regime_enabled_var.set(False)
+        app.regime_settings['enabled'] = False
+        logs.clear(); app.draw_chart(df)
+        assert not [m for m in logs if m.startswith('【盤勢判斷】')], \
+            "【盤勢判斷】總開關關閉時不該評估型態"
+        app.regime_enabled_var.set(True)
+        app.regime_settings['enabled'] = True
+
+        # 4) 型態偵測出錯不可影響 K 線圖
+        app._regime_notify_state = {}
+        orig_eval = stock_app_pro.market_pattern.evaluate_all
+        try:
+            stock_app_pro.market_pattern.evaluate_all = lambda *a, **k: (
+                _ for _ in ()).throw(RuntimeError('診斷用假錯誤'))
+            logs.clear()
+            app.draw_chart(df)                       # 不可拋例外
+            assert app.current_fig is not None, "型態偵測出錯時 K 線圖仍應正常畫出"
+        finally:
+            stock_app_pro.market_pattern.evaluate_all = orig_eval
+    finally:
+        app.log_message = orig_log
+        (app.current_symbol, app.asset_type, app.current_stock_name,
+         _tf, app.regime_settings) = old
+        app.timeframe_var.set(_tf)
+        app.regime_enabled_var.set(bool(app.regime_settings.get('enabled')))
+        app.sr_enabled_var.set(bool(app.regime_settings.get('sr_enabled')))
+
+    # 5) ⚙ 設定對話框能建得起來,而且設定真的存得回設定檔
+    #    (版面美不美 headless 測不到,但「打開就爆掉」測得到)
+    # 別名刻意不叫 _cs —— 這個檔案裡 _cs 已經是 core.custom_strategy
+    # (diag_crossref 會把同名別名混在一起看,撞名會誤報跨模組斷鏈)
+    from data import config_store as _cfgstore
+    old_settings = dict(app.regime_settings)
+    try:
+        app.open_regime_settings()
+        app.flush_after()
+        app.regime_settings = stock_app_pro.regime_panel.normalize(
+            {'enabled': True, 'sr_enabled': False, 'sr_fixed_bars': 250,
+             'pattern_list': ['regime', 'double_top'], 'index_only': False})
+        app._save_regime_settings()
+        back = stock_app_pro.regime_panel.normalize(
+            _cfgstore.load_app_settings(app.app_settings_file).get('regime_panel'))
+        assert back == app.regime_settings, f"設定沒有正確存回:{back}"
+        assert back['sr_fixed_bars'] == 250 and back['pattern_list'] == ['regime', 'double_top'], \
+            "存回來的設定內容不對"
+    finally:
+        app.regime_settings = old_settings
+
+    # 6) 終極波段策略那一區必須真的被移除 (不是只是不顯示)
+    src = open(stock_app_pro.__file__, encoding='utf-8').read()
+    for gone in ('_qt_pattern_check', '_qt_pattern_intraday_preview',
+                 'QT_PATTERN_PERSISTENT_IDS = frozenset', "s['pattern_enabled'] = bool("):
+        assert gone not in src, f"終極波段的盤勢功能應已移除,但還找得到 {gone}"
+
+    # 7) 預設主圖 = 加權指數 日K (使用者需求2)
+    assert stock_app_pro.regime_panel.DEFAULT_INDEX_SYMBOL == '^TWII'
+    assert 'self.current_symbol = regime_panel.DEFAULT_INDEX_SYMBOL' in src, \
+        "啟動預設商品應為加權指數"
+    assert 'self.entry_symbol.insert(0, regime_panel.DEFAULT_INDEX_SYMBOL)' in src, \
+        "代碼輸入框的預設值應為加權指數"
+    assert "self.timeframe_var = tk.StringVar(value=\"日K\")" in src, \
+        "啟動預設週期應為日K"
+
+
+run_case("ADR-120: 主圖盤勢判斷 (自動通知/重畫不洗版/日K限定/移出終極波段/預設加權日K)",
+         _regime_panel_120)
+
 
 print(f"{'案例':60s} 結果")
 print("-" * 76)

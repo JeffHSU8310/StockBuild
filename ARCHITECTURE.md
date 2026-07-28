@@ -84,6 +84,15 @@ PITFALLS P-27）。它們存在的唯一理由就是「可離線單元測試」�
 - `order_rules.py`：`validate_stock_order(...)`、`is_daytrade_eligible(...)`，
   回傳 `(ok, reason)`，不做任何日誌或 I/O。常數 `MAX_QTY_LOT`（499 張）、
   `MAX_QTY_ODD`（999 股）。
+- `regime_panel.py`（ADR-120）：主圖【盤勢判斷】面板的純邏輯。
+  `normalize(raw)` 把設定檔讀到的東西整理成一份值域安全的設定（設定檔壞掉
+  絕不可以變成主圖畫不出來）；`should_evaluate(settings, symbol, timeframe)`
+  是型態偵測的三道閘門（總開關+子項／限日K／限加權指數）；
+  `plan_notifications(signals, state, bar_date)` 是通知去重 —— 主圖每縮放/
+  平移一次就重畫一次，沒有這層會被同一個型態洗版（PITFALLS P-87）。
+  它與 `market_pattern.py`（型態偵測）、`volume_profile.py`（量價支撐壓力）
+  的分工是：後兩者算「現在是什麼狀態」，`regime_panel` 決定「要不要算、
+  要不要說」。
 
 ### 設定存取層：`data/`
 - `config_store.py`：`load_broker_config`/`save_broker_config`、
@@ -217,6 +226,7 @@ _tg_poll_worker (背景 daemon,getUpdates long polling)
 | 改動範圍 | 驗證方式 |
 |---|---|
 | `core/`、`data/` 純邏輯 | `python tests/test_core.py`（必跑）+ 補對應測試 |
+| 「每次重畫都會跑」的主圖附加判斷（盤勢判斷等） | diag 要**連續 `draw_chart()` 多次**再斷言日誌沒有增加（PITFALLS P-87）|
 | `brokers/` 券商 adapter | `python tests/test_brokers.py`（必跑）；真實連線只能實機 |
 | `draw_chart`/版面/下單流程等 GUI 耦合 | `diag_repro_issues.py` 等假 tkinter 診斷 |
 | 任何檔案 | `python -m py_compile` + `python diag_crossref.py`（跨模組斷鏈 **與重複定義**，ADR-109） |
@@ -242,6 +252,9 @@ G:\StockBuild\
 │   ├─ order_intent.py      券商中立的委託意圖 (ADR-110)
 │   ├─ broker_ipc.py        券商子行程 IPC 協定 (ADR-112)
 │   ├─ sj_compat.py        shioaji 1.5.6/1.7 相容 (指數代碼/合約型別/簽名, ADR-114)
+│   ├─ market_pattern.py    加權指數盤勢/型態偵測 (只提醒,不下單)
+│   ├─ volume_profile.py    量價支撐壓力 (POC/價值區/高量節點, ADR-102)
+│   ├─ regime_panel.py      主圖【盤勢判斷】:設定正規化 + 通知去重 (ADR-120)
 │   └─ order_rules.py
 ├─ data/
 │   └─ config_store.py     設定 / 自選股 / 版面 I/O
