@@ -2391,6 +2391,151 @@ class StockTradingAppPro(tk.Tk):
         self._qt_update_status_label()
         self.log_message("【量化交易】已開啟獨立視窗 (關閉此視窗不會停止自動交易)。")
 
+    # ======================================================================
+    # 【ADR-116】籌碼 / 選股:開啟完整視窗
+    #
+    # 底部分頁的高度只夠顯示兩三列,而這兩個功能的輸出動輒數十列 —— 使用者
+    # 得一直捲動,等於看不到全貌。量化交易早就有獨立視窗 (ADR-057),這裡把
+    # 同樣的能力補給籌碼與選股。
+    #
+    # 【與量化交易不同的作法:搬家,不是複製】量化面板支援「分頁一份、視窗
+    # 一份」同時存在,代價是要維護 _qt_uis 清單、每次刷新都要走訪所有存活的
+    # UI。籌碼/選股的建構函式把 widget 直接掛在 self.*(單一實例設計),硬要
+    # 複製會讓分頁那份變成孤兒 —— self.tree_sc 指到視窗那份,分頁的表格就再
+    # 也不會更新,而且看不出哪裡壞掉。
+    #
+    # 所以改成「搬家」:開視窗時把分頁的內容拆掉、在視窗裡重建;關視窗時再
+    # 搬回分頁。永遠只有一份 panel,self.* 永遠指向它,沒有孤兒的可能。
+    # 代價是重建會清空表格,因此各自提供 restore 把最後的內容重播回來。
+    # ======================================================================
+    PANEL_WINDOWS = {
+        'chips': {
+            'title': '📊 籌碼分析 — 個股法人 / 期貨法人 / 大盤法人 / 融資融券',
+            'hint': '資料全部讀本機檔案,開關此視窗不會觸發下載。',
+            'size': (1400, 800),
+        },
+        'screener': {
+            'title': '🔍 選股 — 技術面 / 籌碼 / 基本面 條件篩選與回測',
+            'hint': '關閉此視窗會把面板搬回底部分頁,選股結果會一併帶回。',
+            'size': (1500, 820),
+        },
+    }
+
+    def _panel_close_for_test(self, kind):
+        """取得某個面板視窗的關閉函式 (診斷用;正式路徑走 WM_DELETE_WINDOW)。"""
+        return self._panel_closers.get(kind, lambda: None)
+
+    def _panel_spec(self, kind):
+        """回傳 (分頁容器, 建構函式, 還原內容的函式)。"""
+        if kind == 'chips':
+            return (self.chips_tab_frame, self._build_chips_panel,
+                    self._chips_restore_view)
+        return (self.screener_tab_frame, self._build_screener_panel,
+                self._sc_restore_view)
+
+    def _chips_restore_view(self):
+        """搬家後重播籌碼表格 —— 純讀本機檔案,不會觸發下載 (ADR-100 的保證)。"""
+        try:
+            self._chips_refresh_view()
+        except Exception:
+            pass
+
+    def _sc_restore_view(self):
+        """搬家後重播選股/回測結果。沒跑過就維持空表。"""
+        kind_args = getattr(self, '_sc_last_render', None)
+        if not kind_args:
+            return
+        kind, args = kind_args
+        try:
+            if kind == 'screen':
+                self._sc_fill_tree(*args)
+            else:
+                self._sc_show_backtest(*args)
+        except Exception:
+            pass
+
+    def _clear_children(self, frame):
+        for ch in list(getattr(frame, 'winfo_children', lambda: [])()):
+            try:
+                ch.destroy()
+            except Exception:
+                pass
+
+    def open_panel_window(self, kind):
+        """把籌碼/選股面板搬到獨立視窗。已開著就帶到最前面。"""
+        wins = getattr(self, '_panel_wins', None)
+        if wins is None:
+            wins = self._panel_wins = {}
+        if not hasattr(self, '_panel_closers'):
+            self._panel_closers = {}
+        win = wins.get(kind)
+        if win is not None:
+            # 「還活著嗎」與「帶到最前面」要分開包 try:合在一起的話,只要
+            # deiconify/lift 任何一個失敗,就會掉進下面的「新建」分支而開出
+            # 第二個視窗 —— 兩個視窗各有一份 panel,self.* 只指向其中一個,
+            # 另一個變成永遠不會更新的孤兒 (ADR-057 提過的同一類問題)。
+            alive = False
+            try:
+                alive = bool(win.winfo_exists())
+            except Exception:
+                alive = False
+            if alive:
+                for _fn in ('deiconify', 'lift', 'focus_force'):
+                    try:
+                        getattr(win, _fn)()
+                    except Exception:
+                        pass
+                return win
+
+        spec = self.PANEL_WINDOWS[kind]
+        tab_frame, build, restore = self._panel_spec(kind)
+
+        win = tk.Toplevel(self)
+        wins[kind] = win
+        win.title(spec['title'])
+        win.configure(bg="#1A2026")
+        try:
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+            pw, ph = spec['size']
+            w, h = min(pw, sw - 80), min(ph, sh - 100)
+            win.geometry(f"{w}x{h}+{max(0,(sw-w)//2)}+{max(0,(sh-h)//2)}")
+        except Exception:
+            win.geometry("1400x800")
+
+        # 分頁那邊換成說明文字,讓使用者知道面板去哪了 (不是壞掉)
+        self._clear_children(tab_frame)
+        tk.Label(tab_frame,
+                 text=f"此面板已在獨立視窗開啟。\n關閉那個視窗就會搬回這裡。\n\n{spec['hint']}",
+                 bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 11),
+                 justify='center').pack(expand=True)
+
+        body = tk.Frame(win, bg="#1A2026")
+        body.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        build(body)
+        restore()
+
+        def _on_close():
+            # 搬回分頁:先拆視窗內容,再在分頁重建,最後重播內容。
+            try:
+                self._clear_children(tab_frame)
+                build(tab_frame)
+                restore()
+            except Exception as e:
+                self.log_message(f"【面板】搬回分頁時發生問題: {type(e).__name__}: {e}")
+            self._panel_wins.pop(kind, None)
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+        # 診斷腳本沒有真正的視窗管理員可以按「X」,留一個取得關閉函式的入口,
+        # 讓「搬出去→搬回來」這條路徑能被完整測到 (不是為了 production 用)。
+        self._panel_closers[kind] = _on_close
+        self.log_message(f"【面板】已開啟{'籌碼' if kind == 'chips' else '選股'}獨立視窗"
+                         f" (關閉後會自動搬回底部分頁)。")
+        return win
+
     def _gc_tick(self):
         """【ADR-057】主執行緒定期循環回收。
 
@@ -4045,6 +4190,10 @@ class StockTradingAppPro(tk.Tk):
             font=('微軟正黑體', 9, 'bold'), padx=10, pady=2,
             state=tk.DISABLED, command=self._chips_stop_update)
         self.btn_chips_stop.pack(side=tk.LEFT, padx=(4, 10))
+        # 【ADR-116】底部分頁只看得到兩三列,籌碼動輒數十列 —— 給一個開大視窗的入口。
+        tk.Button(bar, text="🗖 開啟完整視窗", bg="#455A64", fg="white", relief="flat",
+                  font=('微軟正黑體', 9), padx=8, pady=2,
+                  command=lambda: self.open_panel_window('chips')).pack(side=tk.LEFT, padx=(0, 10))
 
         for key, label in self.CHIPS_VIEWS:
             tk.Radiobutton(bar, text=label, variable=self._chips_view, value=key,
@@ -11741,6 +11890,10 @@ class StockTradingAppPro(tk.Tk):
             font=('微軟正黑體', 9, 'bold'), padx=8, pady=2,
             state=tk.DISABLED, command=self._sc_stop)
         self.btn_sc_stop.pack(side=tk.LEFT)
+        # 【ADR-116】選股結果常有數十列,底部分頁塞不下 —— 開大視窗看全貌。
+        tk.Button(bar, text="🗖 開啟完整視窗", bg="#455A64", fg="white", relief="flat",
+                  font=('微軟正黑體', 9), padx=8, pady=2,
+                  command=lambda: self.open_panel_window('screener')).pack(side=tk.LEFT, padx=(8, 10))
 
         tk.Label(bar, text="範本:", bg="#1A2026", fg="#8A99AD",
                  font=('微軟正黑體', 9)).pack(side=tk.LEFT, padx=(10, 2))
@@ -12116,6 +12269,10 @@ class StockTradingAppPro(tk.Tk):
 
     def _sc_fill_tree(self, res):
         """【P-31】先備妥再刪再插。"""
+        # 【ADR-116】記住「畫面上現在是什麼」就寫在畫它的地方,不寫在呼叫端——
+        # 寫在呼叫端的話,任何一條沒記的路徑都會讓面板搬家後結果消失,
+        # 而且不會有錯誤訊息 (實測踩過:直接呼叫這個函式的路徑就沒記到)。
+        self._sc_last_render = ('screen', (res,))
         def _f(v, nd=2):
             if v is None:
                 return '--'
@@ -12221,6 +12378,7 @@ class StockTradingAppPro(tk.Tk):
             self.safe_after(0, self._sc_set_idle)
 
     def _sc_show_backtest(self, res, reb, min_bars):
+        self._sc_last_render = ('backtest', (res, reb, min_bars))   # 【ADR-116】
         """把回測結果填進結果表,並把警告寫進系統日誌。"""
         for w in (res.get('warnings') or []):
             self.log_message(f"【選股回測】{w}")

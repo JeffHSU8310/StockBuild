@@ -2778,6 +2778,67 @@ def _shioaji_17_compat():
 run_case("ADR-114: shioaji 1.5.6/1.7 相容 (指數代碼/輕量合約/login參數)",
          _shioaji_17_compat)
 
+def _chips_screener_full_window():
+    """【ADR-116】籌碼/選股的「開啟完整視窗」:搬出去、搬回來、內容不遺失。
+
+    這兩個面板的 widget 直接掛在 self.*(單一實例設計),所以是用「搬家」而不是
+    「複製」。搬家最容易出的錯是**搬完之後 self.* 指向已被銷毀的舊 widget**——
+    畫面看起來還在,一按按鈕就炸,或是更新永遠不生效。
+    """
+    for kind, tab_attr, tree_attr in (('chips', 'chips_tab_frame', 'tree_chips'),
+                                      ('screener', 'screener_tab_frame', 'tree_sc')):
+        tab = getattr(app, tab_attr)
+        tree_before = getattr(app, tree_attr)
+        assert tree_before.winfo_exists(), f"{kind}:分頁的表格一開始應該是活的"
+
+        # --- 開啟獨立視窗 ---
+        win = app.open_panel_window(kind)
+        assert win is not None and win.winfo_exists(), f"{kind}:視窗沒開起來"
+        assert app.open_panel_window(kind) is win, \
+            f"{kind}:重複開啟不可新建第二個視窗 (兩份 panel 會有一份變孤兒)"
+
+        tree_in_win = getattr(app, tree_attr)
+        assert tree_in_win is not tree_before, f"{kind}:panel 沒有真的搬到視窗裡"
+        assert tree_in_win.winfo_exists(), f"{kind}:視窗裡的表格不是活的"
+        assert not tree_before.winfo_exists(), \
+            f"{kind}:分頁的舊表格應已銷毀 (留著會變成永遠不更新的孤兒)"
+
+        # --- 關閉視窗:應搬回分頁 ---
+        closer = win._bindings.get('WM_DELETE_WINDOW') if hasattr(win, '_bindings') else None
+        closer = closer or app._panel_close_for_test(kind)
+        closer()
+        tree_back = getattr(app, tree_attr)
+        assert tree_back.winfo_exists(), f"{kind}:搬回分頁後表格必須是活的"
+        assert tree_back is not tree_in_win, f"{kind}:panel 沒有真的搬回分頁"
+        assert not win.winfo_exists(), f"{kind}:視窗應已銷毀"
+        assert kind not in getattr(app, '_panel_wins', {}), f"{kind}:視窗參照沒清掉"
+
+        # --- 關掉之後還能再開一次 (第二輪不可壞) ---
+        win2 = app.open_panel_window(kind)
+        assert win2 is not win, f"{kind}:重開應該是新的視窗物件"
+        app._panel_close_for_test(kind)()
+        assert getattr(app, tree_attr).winfo_exists(), f"{kind}:第二輪搬回後表格要是活的"
+
+    # --- 選股結果要跟著搬 ---
+    res = {'rows': [{'code': '2330', 'name': '台積電', 'industry': '半導體業',
+                     'close': 600.0, 'pe': 15.0, 'pb': 3.0, 'yield': 2.0,
+                     'eps': 40.0, 'gross_margin': 55.0, 'revenue_yoy': 20.0,
+                     'roe': 30.0, 'matched': ['測試條件']}],
+           'warnings': [], 'scanned': 1, 'passed': 1}
+    app._sc_fill_tree(res)
+    n_before = len(app.tree_sc.get_children())
+    assert n_before == 1, f"前置:結果應有 1 列,實際 {n_before}"
+    app.open_panel_window('screener')
+    assert len(app.tree_sc.get_children()) == n_before, \
+        "搬到視窗後選股結果不見了 (使用者剛跑完的結果會白跑)"
+    app._panel_close_for_test('screener')()
+    assert len(app.tree_sc.get_children()) == n_before, \
+        "搬回分頁後選股結果不見了"
+
+
+run_case("ADR-116: 籌碼/選股 完整視窗 (搬出搬回/不重複開/結果不遺失)",
+         _chips_screener_full_window)
+
 print(f"{'案例':60s} 結果")
 print("-" * 76)
 for name, st, msg in results:

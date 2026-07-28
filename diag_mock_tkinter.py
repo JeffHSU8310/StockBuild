@@ -93,6 +93,15 @@ class _MockWidget:
     def update_idletasks(self): pass
     def update(self): pass
     def lift(self): pass
+    # 【ADR-116】真實 Toplevel 有這些視窗操作;mock 缺了它們,凡是「已開著就
+    # 帶到最前面」的程式碼都會拋 AttributeError 掉進 except,診斷環境測不到
+    # 正確行為 (同 P-57 的教訓:mock 缺方法 = 該路徑等於沒被測)。
+    def deiconify(self): pass
+    def iconify(self): pass
+    def withdraw(self): pass
+    def focus_force(self): pass
+    def attributes(self, *a, **k): pass
+    def resizable(self, *a, **k): pass
     def transient(self, *a): pass
     def grab_set(self): pass
     def title(self, *a): pass
