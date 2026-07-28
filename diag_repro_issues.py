@@ -2944,6 +2944,90 @@ def _chips_screener_full_window():
 run_case("ADR-116: 籌碼/選股 完整視窗 (搬出搬回/不重複開/結果不遺失)",
          _chips_screener_full_window)
 
+def _chips_units_and_history():
+    """【ADR-118】籌碼單位換算走 GUI 這條路,以及年數可設定。"""
+    from data import chips_store as _cs2
+    import tempfile as _tf2, os as _os2
+    from core import unit_format as _uf
+
+    old_base = app.CHIPS_BASE_DIR
+    tmp = _tf2.mkdtemp()
+    orig_view = app._chips_view.get()
+    try:
+        app.CHIPS_BASE_DIR = tmp
+
+        # --- 大盤法人:元 → 億 ---
+        mk = pd.DataFrame([{'Date': '2026-07-28', 'Foreign': -87484625299,
+                            'Trust': 1611819893, 'Dealer': -31729733512,
+                            'InstTotal': -117602538918}])
+        _cs2.upsert(_cs2.market_inst_path(tmp), mk)
+        app._chips_view.set('market')
+        app._chips_refresh_view()
+        heads = list(app.tree_chips['columns'])
+        assert all('(億)' in h for h in heads if h != '日期'), f"表頭沒標億:{heads}"
+        vals = app.tree_chips.item(app.tree_chips.get_children()[0], 'values')
+        assert vals[1] == '-874.85', f"外資應為 -874.85 億,實際 {vals[1]}"
+        assert vals[4] == '-1,176.03', f"三大法人合計換算錯誤:{vals[4]}"
+
+        # --- 融資融券:仟元 → 億,且要有「融資增減」 ---
+        mg = pd.DataFrame([
+            {'Date': '2026-07-27', 'MarginBalance': 9272006, 'MarginPrevBalance': 9354810,
+             'ShortBalance': 186233, 'ShortPrevBalance': 204754,
+             'MarginAmountBalance': 568663454},
+            {'Date': '2026-07-28', 'MarginBalance': 9096008, 'MarginPrevBalance': 9272006,
+             'ShortBalance': 219259, 'ShortPrevBalance': 186233,
+             'MarginAmountBalance': 545534811},
+        ])
+        _cs2.upsert(_cs2.margin_path(tmp), mg)
+        app._chips_view.set('margin')
+        app._chips_refresh_view()
+        heads = list(app.tree_chips['columns'])
+        assert '融資金額(億)' in heads, heads
+        assert '融資增減(億)' in heads, f"缺少融資增減欄位:{heads}"
+        # 最新一列在最上面 (日期新到舊)
+        v0 = app.tree_chips.item(app.tree_chips.get_children()[0], 'values')
+        assert v0[0] == '2026-07-28', v0
+        assert v0[5] == '5,455.35', f"融資金額應為 5455.35 億,實際 {v0[5]}"
+        # 545534811 - 568663454 = -23128643 仟元 = -231.29 億
+        assert v0[6] == '-231.29', f"融資增減算錯,實際 {v0[6]} (應為 -231.29)"
+        # 最舊那一列沒有前值 → 顯示 --
+        v_last = app.tree_chips.item(app.tree_chips.get_children()[-1], 'values')
+        assert v_last[6] == _uf.MISSING, f"最舊一期沒有前值,應顯示 --,實際 {v_last[6]}"
+
+        # --- 個股法人:股 → 張 ---
+        st = pd.DataFrame([{'Date': '2026-07-28', 'Code': '2610', 'Name': '華航',
+                            'Foreign': 52784372, 'Trust': 664000, 'Dealer': 990333,
+                            'InstTotal': 54438705}])
+        _cs2.upsert(_cs2.stock_inst_path(tmp, '2026-07'), st)
+        app._chips_view.set('stock')
+        app.entry_chips_code.delete(0, 'end')
+        app._chips_refresh_view()
+        heads = list(app.tree_chips['columns'])
+        assert any('(張)' in h for h in heads), f"表頭沒標張:{heads}"
+        kids = app.tree_chips.get_children()
+        if kids:
+            v = app.tree_chips.item(kids[0], 'values')
+            assert v[3] == '52,784', f"外資應為 52,784 張,實際 {v[3]}"
+            assert v[6] == '54,439', f"三大法人合計應為 54,439 張,實際 {v[6]}"
+
+        # --- 年數可設定 ---
+        assert app._chips_years() == 1, "預設應為 1 年"
+        app.cb_chips_years.current(3)          # '5 年'
+        assert app._chips_years() == 5, f"選 5 年時應回 5,實際 {app._chips_years()}"
+        app.cb_chips_years.current(0)
+
+        assert app._sc_history_days() == 365, "選股預設應為 1 年"
+        app.cb_sc_years.current(5)             # '10 年'
+        assert app._sc_history_days() == 3650, f"選 10 年應為 3650 天,實際 {app._sc_history_days()}"
+        app.cb_sc_years.current(1)
+    finally:
+        app.CHIPS_BASE_DIR = old_base
+        app._chips_view.set(orig_view)
+
+
+run_case("ADR-118: 籌碼單位(張/億)/融資增減/資料年數可設定",
+         _chips_units_and_history)
+
 print(f"{'案例':60s} 結果")
 print("-" * 76)
 for name, st, msg in results:

@@ -294,6 +294,14 @@ def _build_ttk():
         if i is None:
             return getattr(self, '_cur_index', 0)
         self._cur_index = int(i)
+        # 【ADR-118】真實的 ttk.Combobox 選了索引之後,get() 會回傳那一項的值。
+        # mock 若只記索引不連動 get(),所有「用 get() 讀使用者選擇」的程式碼
+        # (籌碼年數、選股歷史深度…) 在診斷環境都讀到空字串而落回預設值,
+        # 等於那條路徑沒被測到 (同 P-57)。
+        vals = list(self._kw.get('values') or [])
+        if 0 <= self._cur_index < len(vals):
+            self._text = str(vals[self._cur_index])
+            self._sync_to_var()
         return None
 
     ttk.Combobox = type("Combobox", (_Entry,), {
