@@ -35,6 +35,7 @@ from core import order_rules
 # 各家券商 adapter 再把它翻成自家 SDK 的委託物件。
 from core import order_intent
 from core import sj_compat
+from core import unit_format
 from core import strategy_engine
 from core import backtest
 from core import custom_strategy
@@ -4194,6 +4195,14 @@ class StockTradingAppPro(tk.Tk):
         tk.Button(bar, text="🗖 開啟完整視窗", bg="#455A64", fg="white", relief="flat",
                   font=('微軟正黑體', 9), padx=8, pady=2,
                   command=lambda: self.open_panel_window('chips')).pack(side=tk.LEFT, padx=(0, 10))
+        # 【ADR-118】抓多久的籌碼。下載是增量的,調大只會補以前沒抓過的那一段。
+        tk.Label(bar, text="年數", bg="#1A2026", fg="#8A99AD",
+                 font=('微軟正黑體', 9)).pack(side=tk.LEFT)
+        self.cb_chips_years = ttk.Combobox(bar, width=6, state='readonly',
+                                           style="BlackText.TCombobox",
+                                           values=list(self.CHIPS_YEAR_CHOICES))
+        self.cb_chips_years.current(0)
+        self.cb_chips_years.pack(side=tk.LEFT, padx=(4, 10))
 
         for key, label in self.CHIPS_VIEWS:
             tk.Radiobutton(bar, text=label, variable=self._chips_view, value=key,
@@ -4241,7 +4250,10 @@ class StockTradingAppPro(tk.Tk):
         if self._chips_running:
             return
         end_dt = datetime.now()
-        start_dt = end_dt - timedelta(days=365)
+        # 【ADR-118】年數可選:回測要有意義,一年的籌碼太短 (只有 ~240 個交易日,
+        # 扣掉暖身根本沒幾期)。下載本身是增量的 —— 已經有的日期不會重抓,
+        # 所以把年數調大只會多抓「以前沒抓過」的那一段。
+        start_dt = end_dt - timedelta(days=365 * self._chips_years())
         self._chips_running = True
         self._chips_cancel = False
         self.btn_chips_update.config(state=tk.DISABLED, text="更新中 ...")
@@ -4259,11 +4271,20 @@ class StockTradingAppPro(tk.Tk):
         self._chips_cancel = True
         self.lbl_chips_status.config(text="停止中 ...")
 
+    CHIPS_YEAR_CHOICES = ('1 年', '2 年', '3 年', '5 年', '10 年')
+
+    def _chips_years(self):
+        """使用者選的籌碼年數 (預設 1 年,讀不到就退回 1)。"""
+        try:
+            return max(1, int(str(self.cb_chips_years.get()).split()[0]))
+        except (AttributeError, ValueError, IndexError):
+            return 1
+
     def _chips_refresh_view(self):
         """依目前檢視模式從本地檔案載入並填表 (純讀檔,不觸發下載)。"""
         view = self._chips_view.get()
         end_iso = datetime.now().strftime('%Y-%m-%d')
-        start_iso = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+        start_iso = (datetime.now() - timedelta(days=365 * self._chips_years())).strftime('%Y-%m-%d')
         try:
             if view == 'stock':
                 cols, rows, note = self._chips_rows_stock(start_iso, end_iso)
@@ -4273,13 +4294,10 @@ class StockTradingAppPro(tk.Tk):
                 cols, rows, note = self._chips_rows_simple(
                     chips_store.market_inst_path(self.CHIPS_BASE_DIR),
                     ['Date', 'Foreign', 'Trust', 'Dealer', 'InstTotal'],
-                    ['日期', '外資', '投信', '自營商', '三大法人合計'], net_col='InstTotal')
+                    ['日期', '外資(億)', '投信(億)', '自營商(億)', '三大法人合計(億)'],
+                    net_col='InstTotal', money_unit='元')   # 【ADR-118】原始單位是元
             else:
-                cols, rows, note = self._chips_rows_simple(
-                    chips_store.margin_path(self.CHIPS_BASE_DIR),
-                    ['Date', 'MarginBalance', 'MarginPrevBalance', 'ShortBalance',
-                     'ShortPrevBalance', 'MarginAmountBalance'],
-                    ['日期', '融資餘額(張)', '前日融資', '融券餘額(張)', '前日融券', '融資金額(仟元)'])
+                cols, rows, note = self._chips_rows_margin()   # 【ADR-118】
         except Exception as e:
             cols, rows, note = ['訊息'], [(f"讀取籌碼資料失敗:{type(e).__name__}: {e}",)], ''
         self._chips_fill_tree(cols, rows)
@@ -4323,7 +4341,8 @@ class StockTradingAppPro(tk.Tk):
     def _chips_rows_stock(self, start_iso, end_iso):
         """個股法人:有填代號就看該股歷史,否則看最新一日的買超排行。"""
         df = chips_store.load_stock_inst_range(self.CHIPS_BASE_DIR, start_iso, end_iso)
-        heads = ['日期', '代號', '名稱', '外資', '投信', '自營商', '三大法人合計']
+        # 【ADR-118】買賣超原始單位是「股」,台股習慣講「張」(1張=1000股)。
+        heads = ['日期', '代號', '名稱', '外資(張)', '投信(張)', '自營商(張)', '三大法人合計(張)']
         if df is None or df.empty:
             return heads, [], "本地尚無個股籌碼,請按「更新籌碼」下載。"
         code = (self.entry_chips_code.get() or '').strip().upper()
@@ -4336,9 +4355,9 @@ class StockTradingAppPro(tk.Tk):
             latest = df['Date'].max()
             sub = df[df['Date'] == latest].sort_values('InstTotal', ascending=False).head(100)
             note = f"最新 {latest} 三大法人買超前 100 名 (輸入代號可查個股歷史)"
-        rows = [(r['Date'], r['Code'], r['Name'], self._chips_fmt_int(r['Foreign']),
-                 self._chips_fmt_int(r['Trust']), self._chips_fmt_int(r['Dealer']),
-                 self._chips_fmt_int(r['InstTotal'])) for _, r in sub.iterrows()]
+        rows = [(r['Date'], r['Code'], r['Name'], unit_format.fmt_lots(r['Foreign']),
+                 unit_format.fmt_lots(r['Trust']), unit_format.fmt_lots(r['Dealer']),
+                 unit_format.fmt_lots(r['InstTotal'])) for _, r in sub.iterrows()]
         return heads, rows, note
 
     def _chips_rows_futures(self, start_iso, end_iso):
@@ -4360,8 +4379,12 @@ class StockTradingAppPro(tk.Tk):
                 for _, r in sub.iterrows()]
         return heads, rows, note
 
-    def _chips_rows_simple(self, path, cols, heads, net_col=None):
-        """大盤法人 / 融資融券:單一 CSV,依日期新到舊列出。"""
+    def _chips_rows_simple(self, path, cols, heads, net_col=None, money_unit=None):
+        """大盤法人:單一 CSV,依日期新到舊列出。
+
+        【ADR-118】money_unit 帶入原始單位 ('元'/'仟元') 時,數值換算成「億」;
+        不帶就照原樣加千分位 (口數、張數這類單位本來就對的欄位)。
+        """
         df = chips_store.load(path)
         if df is None or df.empty:
             return heads, [], "本地尚無此類籌碼,請按「更新籌碼」下載。"
@@ -4371,9 +4394,42 @@ class StockTradingAppPro(tk.Tk):
             vals = []
             for c in cols:
                 v = r.get(c, '')
-                vals.append(v if c == 'Date' else self._chips_fmt_int(v))
+                if c == 'Date':
+                    vals.append(v)
+                elif money_unit:
+                    vals.append(unit_format.fmt_yi(v, money_unit))
+                else:
+                    vals.append(unit_format.fmt_int(v))
             rows.append(tuple(vals))
         note = f"共 {len(df)} 個交易日 (最新 {df['Date'].max()})"
+        return heads, rows, note
+
+    def _chips_rows_margin(self):
+        """融資融券:金額換成億,並算出「融資增減」。
+
+        【ADR-118】官方只給當日融資金額 (仟元),沒有前一日金額,所以增減要
+        自己用相鄰兩個交易日相減。算之前一定要先**由舊到新**排序 —— 順序
+        顛倒會讓增減的正負號整個相反,而使用者正是靠正負號判斷「融資在增加
+        還是減少」,方向錯了結論就跟著錯。
+        """
+        heads = ['日期', '融資餘額(張)', '前日融資(張)', '融券餘額(張)', '前日融券(張)',
+                 '融資金額(億)', '融資增減(億)']
+        df = chips_store.load(chips_store.margin_path(self.CHIPS_BASE_DIR))
+        if df is None or df.empty:
+            return heads, [], "本地尚無融資融券資料,請按「更新籌碼」下載。"
+        asc = df.sort_values('Date', ascending=True)
+        deltas = unit_format.diff_series(list(asc.get('MarginAmountBalance', [])))
+        asc = asc.assign(_MarginDelta=deltas)
+        sub = asc.sort_values('Date', ascending=False).head(300)
+        rows = [(r['Date'],
+                 unit_format.fmt_int(r.get('MarginBalance')),
+                 unit_format.fmt_int(r.get('MarginPrevBalance')),
+                 unit_format.fmt_int(r.get('ShortBalance')),
+                 unit_format.fmt_int(r.get('ShortPrevBalance')),
+                 unit_format.fmt_yi(r.get('MarginAmountBalance'), '仟元'),
+                 unit_format.fmt_signed_yi(r.get('_MarginDelta'), '仟元'))
+                for _, r in sub.iterrows()]
+        note = f"共 {len(df)} 個交易日 (最新 {df['Date'].max()});融資增減 = 當日金額 − 前一交易日"
         return heads, rows, note
 
     # 【ADR-028】期貨舊代號別名 (向下相容:MTX/FITX 是常見俗稱)
@@ -11842,7 +11898,23 @@ class StockTradingAppPro(tk.Tk):
     SC_TPEX_INC_TPL = 'https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap06_O_{v}'
     SC_TPEX_BAL_TPL = 'https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap07_O_{v}'
     SC_REQUEST_INTERVAL = 1.0      # 禮貌節流,同 ADR-100 的精神
-    SC_HISTORY_DAYS = 180          # 技術面需要的歷史深度 (約 120 個交易日)
+    SC_HISTORY_DAYS = 180          # 預設歷史深度 (約 120 個交易日);可由「年數」下拉調大
+    SC_YEAR_CHOICES = ('6 個月', '1 年', '2 年', '3 年', '5 年', '10 年')
+    SC_YEAR_DAYS = {'6 個月': 180, '1 年': 365, '2 年': 730,
+                    '3 年': 1095, '5 年': 1825, '10 年': 3650}
+
+    def _sc_history_days(self):
+        """使用者選的選股歷史深度 (天)。
+
+        【ADR-118】原本寫死 180 天 —— 扣掉技術指標暖身 (25 天) 之後只剩約
+        100 個交易日,以 20 天調倉一次來算才 4~5 期,回測結果的統計意義很薄弱。
+        年數調大之後,「更新全市場資料」會去補以前沒抓過的日期 (增量下載),
+        回測期數也跟著變多。
+        """
+        try:
+            return self.SC_YEAR_DAYS.get(str(self.cb_sc_years.get()), self.SC_HISTORY_DAYS)
+        except AttributeError:
+            return self.SC_HISTORY_DAYS
     SC_INDUSTRY_ALL = '全部產業'     # 【ADR-105】產業下拉的「不限」選項
 
     def _sc_http_json_retry(self, url, params=None, tries=3, timeout=45):
@@ -11918,7 +11990,7 @@ class StockTradingAppPro(tk.Tk):
         self.btn_sc_run.pack(side=tk.LEFT, padx=4)
         self.btn_sc_bt = tk.Button(
             bar, text="📊 回測條件", bg="#FB8C00", fg="black", relief="flat",
-            font=('微軟正黑體', 9, 'bold'), padx=8, pady=2, command=self._sc_start_backtest)
+            font=('微軟正黑體', 9, 'bold'), padx=8, pady=2, command=self._sc_open_backtest_dialog)
         self.btn_sc_bt.pack(side=tk.LEFT, padx=(0, 4))
         self.btn_sc_stop = tk.Button(
             bar, text="■ 停止", bg="#2A323D", fg="white", relief="flat",
@@ -11929,6 +12001,14 @@ class StockTradingAppPro(tk.Tk):
         tk.Button(bar, text="🗖 開啟完整視窗", bg="#455A64", fg="white", relief="flat",
                   font=('微軟正黑體', 9), padx=8, pady=2,
                   command=lambda: self.open_panel_window('screener')).pack(side=tk.LEFT, padx=(8, 10))
+        # 【ADR-118】歷史深度可選:回測期數直接取決於這個。
+        tk.Label(bar, text="歷史", bg="#1A2026", fg="#8A99AD",
+                 font=('微軟正黑體', 9)).pack(side=tk.LEFT)
+        self.cb_sc_years = ttk.Combobox(bar, width=7, state='readonly',
+                                        style="BlackText.TCombobox",
+                                        values=list(self.SC_YEAR_CHOICES))
+        self.cb_sc_years.current(1)          # 預設 1 年 (比原本的 180 天多一倍)
+        self.cb_sc_years.pack(side=tk.LEFT, padx=(4, 10))
 
         tk.Label(bar, text="範本:", bg="#1A2026", fg="#8A99AD",
                  font=('微軟正黑體', 9)).pack(side=tk.LEFT, padx=(10, 2))
@@ -12055,7 +12135,7 @@ class StockTradingAppPro(tk.Tk):
         """
         try:
             end_dt = datetime.now()
-            start_dt = end_dt - timedelta(days=self.SC_HISTORY_DAYS)
+            start_dt = end_dt - timedelta(days=self._sc_history_days())
             have = market_store.available_daily_dates(
                 self.SCREENER_BASE_DIR, start_dt.strftime('%Y-%m-%d'),
                 end_dt.strftime('%Y-%m-%d'))
@@ -12265,7 +12345,7 @@ class StockTradingAppPro(tk.Tk):
     def _sc_screen_worker(self, fund, conds, f_conds, industries=None):
         try:
             end_iso = datetime.now().strftime('%Y-%m-%d')
-            start_iso = (datetime.now() - timedelta(days=self.SC_HISTORY_DAYS)).strftime('%Y-%m-%d')
+            start_iso = (datetime.now() - timedelta(days=self._sc_history_days())).strftime('%Y-%m-%d')
             daily = None
             if conds:
                 self.safe_after(0, self._sc_set_status, "載入全市場日K ...")
@@ -12330,13 +12410,94 @@ class StockTradingAppPro(tk.Tk):
             self.log_message(f"【選股-提醒】{label}: {why}")
 
     # ---------------- 選股回測 (ADR-106) ----------------
+    def _sc_open_backtest_dialog(self):
+        """【ADR-118】回測設定視窗。
+
+        使用者回報「回測條件是什麼?不能自己設定嗎?期別是什麼?」——原本這個
+        按鈕按下去就直接用寫死的參數跑,畫面上沒有任何地方說明它在做什麼,
+        「期別」欄位也沒有解釋。與其加註解,不如把參數攤出來讓人設定,
+        順便在同一個視窗裡把「這到底在算什麼」講清楚。
+        """
+        cfg = dict(getattr(self, '_sc_bt_cfg', None) or {})
+        dlg = tk.Toplevel(self)
+        dlg.title("📊 回測條件 — 設定")
+        dlg.configure(bg="#1A2026")
+        self.center_window(dlg, 620, 430)
+        dlg.transient(self)
+        try:
+            dlg.lift(); dlg.focus_force()
+        except Exception:
+            pass
+
+        tk.Label(dlg, text=(
+            "這個功能在做什麼:\n"
+            "把你目前選的那組條件,拿回過去的每一天重跑一次,看照著選出來的股票\n"
+            "買進、持有一段時間再賣出,累積下來會賺還是賠。\n\n"
+            "「期別」= 第幾次換股。每隔一個「調倉週期」就重選一次股票,\n"
+            "每一次就是一期 —— 期別 1 是最早那一次,依序往後。\n"
+            "訊號日 = 條件成立那天;買進日 = 下一個交易日的開盤 (不能當天就買到,\n"
+            "那會變成偷看未來);賣出日 = 這一期結束、換股那天。"),
+            bg="#12181F", fg="#8A99AD", font=('微軟正黑體', 9), justify='left',
+            wraplength=580).pack(fill=tk.X, padx=10, pady=(10, 8))
+
+        top = tk.Frame(dlg, bg="#1A2026"); top.pack(fill=tk.X, padx=14)
+
+        def _row(r, label, key, default, hint):
+            tk.Label(top, text=label, bg="#1A2026", fg="white",
+                     font=('微軟正黑體', 9)).grid(row=r, column=0, sticky='w', pady=4)
+            e = tk.Entry(top, width=10, bg="#2A323D", fg="white")
+            e.insert(0, str(cfg.get(key, '') or ''))
+            e.grid(row=r, column=1, padx=6, pady=4, sticky='w')
+            tk.Label(top, text=hint, bg="#1A2026", fg="#8A99AD",
+                     font=('微軟正黑體', 8)).grid(row=r, column=2, sticky='w')
+            return e
+
+        e_reb = _row(0, "調倉週期 (交易日)", 'rebalance_days', '',
+                     "每隔幾天換一次股。留空=依資料長度自動 (約 5~20 天)")
+        e_top = _row(1, "每期最多幾檔", 'top_n', '',
+                     "符合條件的股票太多時只取前幾名。留空=10 檔")
+        e_min = _row(2, "暖身根數", 'min_bars', '',
+                     "技術指標要先有這麼多根K棒才算得準。留空=自動 (20~60)")
+
+        tk.Label(dlg, text=(
+            "※ 每期等權買進、含手續費與交易稅。\n"
+            "※ 基本面條件在回測中會被略過 —— 基本面只有「當前快照」沒有歷史,\n"
+            "   套用到過去等於偷看還沒公布的財報 (未來函數)。\n"
+            "※ 想要更多期別,把工具列的「歷史」年數調大再更新全市場資料。"),
+            bg="#1A2026", fg="#FFA726", font=('微軟正黑體', 8), justify='left',
+            wraplength=580).pack(fill=tk.X, padx=14, pady=(10, 4))
+
+        def _go():
+            def _int_or_none(e):
+                t = e.get().strip()
+                if not t:
+                    return None
+                try:
+                    v = int(t)
+                    return v if v > 0 else None
+                except ValueError:
+                    return None
+            self._sc_bt_cfg = {'rebalance_days': _int_or_none(e_reb),
+                               'top_n': _int_or_none(e_top),
+                               'min_bars': _int_or_none(e_min)}
+            dlg.destroy()
+            self._sc_start_backtest()
+
+        foot = tk.Frame(dlg, bg="#1A2026"); foot.pack(pady=12)
+        tk.Button(foot, text="▶ 開始回測", bg="#FB8C00", fg="black", relief="flat",
+                  font=('微軟正黑體', 10, 'bold'), padx=18, pady=4,
+                  command=_go).pack(side=tk.LEFT, padx=6)
+        tk.Button(foot, text="取消", bg="#2A323D", fg="white", relief="flat",
+                  font=('微軟正黑體', 10), padx=18, pady=4,
+                  command=dlg.destroy).pack(side=tk.LEFT, padx=6)
+
     def _sc_start_backtest(self):
         """回測目前這組選股條件在歷史上的表現。"""
         if self._sc_running:
             return
         daily = market_store.load_daily_range(
             self.SCREENER_BASE_DIR,
-            (datetime.now() - timedelta(days=self.SC_HISTORY_DAYS)).strftime('%Y-%m-%d'),
+            (datetime.now() - timedelta(days=self._sc_history_days())).strftime('%Y-%m-%d'),
             datetime.now().strftime('%Y-%m-%d'))
         if daily is None or daily.empty:
             messagebox.showwarning("選股回測", "本地沒有全市場日K。\n請先按「⬇ 更新全市場資料」。")
@@ -12382,9 +12543,17 @@ class StockTradingAppPro(tk.Tk):
         try:
             n_days = daily['Date'].nunique()
             # 資料只有 N 天時,暖身根數與調倉頻率要跟著縮,否則一期都跑不出來
-            min_bars = max(20, min(60, n_days // 3))
-            reb = max(5, min(20, n_days // 6))
-            start_iso = (datetime.now() - timedelta(days=self.SC_HISTORY_DAYS)).strftime('%Y-%m-%d')
+            # 【ADR-118】使用者沒指定就沿用原本的自動推導 (資料短時自動縮),
+            # 指定了就用指定的 —— 但仍夾在資料撐得住的範圍內,否則會一期都跑不出來。
+            cfg = getattr(self, '_sc_bt_cfg', None) or {}
+            auto_min = max(20, min(60, n_days // 3))
+            auto_reb = max(5, min(20, n_days // 6))
+            min_bars = int(cfg.get('min_bars') or auto_min)
+            reb = int(cfg.get('rebalance_days') or auto_reb)
+            top_n = int(cfg.get('top_n') or 10)
+            min_bars = max(5, min(min_bars, max(5, n_days - 10)))
+            reb = max(1, min(reb, max(1, n_days // 2)))
+            start_iso = (datetime.now() - timedelta(days=self._sc_history_days())).strftime('%Y-%m-%d')
             end_iso = datetime.now().strftime('%Y-%m-%d')
             stock_chips = chips_store.load_stock_inst_range(self.CHIPS_BASE_DIR, start_iso, end_iso)
             margin_chips = chips_store.load(chips_store.margin_path(self.CHIPS_BASE_DIR))
@@ -12395,7 +12564,7 @@ class StockTradingAppPro(tk.Tk):
             res = screener_backtest.run_screener_backtest(
                 daily, conditions=conds, fundamental_df=fund,
                 fundamental_conds=f_conds, industries=industries,
-                rebalance_days=reb, top_n=10, min_bars=min_bars,
+                rebalance_days=reb, top_n=top_n, min_bars=min_bars,
                 stock_chips=stock_chips, margin_chips=margin_chips,
                 to_ohlcv=market_store.to_ohlcv_frame,
                 progress_cb=_prog, should_stop=lambda: self._sc_cancel or self._closing)
@@ -12407,8 +12576,8 @@ class StockTradingAppPro(tk.Tk):
             self.safe_after(0, self._sc_set_idle)
 
     def _sc_show_backtest(self, res, reb, min_bars):
-        self._sc_last_render = ('backtest', (res, reb, min_bars))   # 【ADR-116】
         """把回測結果填進結果表,並把警告寫進系統日誌。"""
+        self._sc_last_render = ('backtest', (res, reb, min_bars))   # 【ADR-116】
         for w in (res.get('warnings') or []):
             self.log_message(f"【選股回測】{w}")
         m = res.get('metrics') or {}

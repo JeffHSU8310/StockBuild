@@ -31,6 +31,7 @@ from core import secure_store
 from core import order_rules
 from core import order_intent
 from core import sj_compat
+from core import unit_format
 from core import indicators
 from core import strategy_engine
 from core import backtest
@@ -5476,6 +5477,76 @@ class TestScreenerNaNText(unittest.TestCase):
         for r in res['rows']:
             for k, v in r.items():
                 self.assertNotEqual(str(v).lower(), 'nan', f"{k} 出現 nan")
+
+
+class TestUnitFormat(unittest.TestCase):
+    """【ADR-118】籌碼的單位換算。
+
+    這些數字錯了不會有任何錯誤訊息 —— 只會讓使用者看到錯的量能/金額,
+    然後據此判斷買賣。所以每一種換算都要有明確的期望值。
+    """
+
+    def test_shares_to_lots(self):
+        """買賣超原始單位是股,台股講的是張 (1張=1000股)。"""
+        self.assertEqual(unit_format.fmt_lots(102513033), '102,513')
+        self.assertEqual(unit_format.fmt_lots(-565000), '-565')
+        self.assertEqual(unit_format.fmt_lots(0), '0')
+        self.assertEqual(unit_format.fmt_lots(1500, nd=1), '1.5')
+
+    def test_yuan_to_yi(self):
+        """大盤法人金額原始單位是元。-87,484,625,299 元 ≈ -874.85 億。"""
+        self.assertEqual(unit_format.fmt_yi(-87484625299, '元'), '-874.85')
+        self.assertEqual(unit_format.fmt_yi(1611819893, '元'), '16.12')
+        self.assertEqual(unit_format.fmt_yi(0, '元'), '0.00')
+
+    def test_qian_yuan_to_yi(self):
+        """融資金額原始單位是仟元。545,534,811 仟元 = 5455.35 億。"""
+        self.assertEqual(unit_format.fmt_yi(545534811, '仟元'), '5,455.35')
+        self.assertEqual(unit_format.fmt_yi(100000, '仟元'), '1.00')
+
+    def test_unknown_unit_raises(self):
+        """不支援的單位要當場報錯,不可默默算出一個沒意義的數字。"""
+        with self.assertRaises(ValueError):
+            unit_format.fmt_yi(100, '美元')
+
+    def test_missing_shows_dashes_not_zero(self):
+        """「沒有資料」與「數值是 0」在籌碼上意義完全不同。"""
+        for v in (None, float('nan'), '', '--', 'abc'):
+            self.assertEqual(unit_format.fmt_lots(v), unit_format.MISSING, repr(v))
+            self.assertEqual(unit_format.fmt_yi(v, '元'), unit_format.MISSING, repr(v))
+            self.assertEqual(unit_format.fmt_int(v), unit_format.MISSING, repr(v))
+
+    def test_accepts_comma_strings(self):
+        """從 CSV 讀進來可能已經是帶千分位的字串。"""
+        self.assertEqual(unit_format.fmt_lots('1,000,000'), '1,000')
+
+    def test_signed_keeps_direction(self):
+        """增減欄位靠正負號分辨方向,也靠它決定紅漲綠跌 (鐵則1)。"""
+        self.assertEqual(unit_format.fmt_signed_yi(1000000, '仟元'), '+10.00')
+        self.assertEqual(unit_format.fmt_signed_yi(-1000000, '仟元'), '-10.00')
+        self.assertEqual(unit_format.fmt_signed_yi(None, '仟元'), unit_format.MISSING)
+
+    def test_diff_series_needs_oldest_first(self):
+        """相鄰兩期的差。第一期沒有前值 → None。"""
+        self.assertEqual(unit_format.diff_series([100, 130, 120]), [None, 30, -10])
+        self.assertEqual(unit_format.diff_series([]), [])
+        self.assertEqual(unit_format.diff_series([5]), [None])
+
+    def test_diff_series_handles_gaps(self):
+        """中間缺一天時,不可拿更早的值硬算出一個假的增減。"""
+        self.assertEqual(unit_format.diff_series([100, None, 120]), [None, None, None])
+
+    def test_diff_direction_is_today_minus_yesterday(self):
+        """方向寫反的話,融資增加會顯示成減少 —— 結論剛好相反。"""
+        d = unit_format.diff_series([500, 600])
+        self.assertEqual(d[1], 100, "應為 今日 − 前日")
+
+    def test_is_positive_for_coloring(self):
+        self.assertIs(unit_format.is_positive('+10.00'), True)
+        self.assertIs(unit_format.is_positive('-10.00'), False)
+        self.assertIs(unit_format.is_positive('1,234'), True)
+        self.assertIsNone(unit_format.is_positive(unit_format.MISSING))
+        self.assertIsNone(unit_format.is_positive(''))
 
 
 if __name__ == "__main__":
