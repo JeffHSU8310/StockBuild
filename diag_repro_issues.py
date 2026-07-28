@@ -2736,16 +2736,22 @@ def _shioaji_17_compat():
         # 升級指南明載舊寫法 Indexs.TSE["001"] → 新寫法 Indexs.TSE["IX0001"],
         # 也就是 1.7 仍然保留交易所群組,只是代碼變了。這個形狀一定要能解析。
         idx_grp17 = _Grp({'TSE': _Cat({'IX0001': _C('IX0001', name='加權指數')}),
-                          'OTC': _Cat({'IX0101': _C('IX0101', name='櫃買指數')})})
+                          'OTC': _Cat({'IX0043': _C('IX0043', name='櫃買指數')})})
         broker.api = _Api(idx_grp17, _Cat({}))
         assert broker.index_contract('TSE').code == 'IX0001', \
             "官方指南的 Indexs.TSE['IX0001'] 形狀解析失敗"
-        assert broker.index_contract('OTC').code == 'IX0101', \
-            "櫃買 IX0101 (依官方規則推得) 解析失敗"
+        assert broker.index_contract('OTC').code == 'IX0043', \
+            "櫃買 IX0043 解析失敗 —— 這是實際的櫃買指數代碼"
 
-        # 櫃買代碼是推論,IX0002 這個可能性也要能解析 (猜錯不會壞)
-        broker.api = _Api(_Grp({'OTC': _Cat({'IX0002': _C('IX0002')})}), _Cat({}))
-        assert broker.index_contract('OTC').code == 'IX0002', "櫃買備選代碼解析失敗"
+        # 先前推論過的代碼保留當保險 (沒中只是多試一次,不會壞)
+        for _alt in ('IX0101', 'IX0002', 'OTC101'):
+            broker.api = _Api(_Grp({'OTC': _Cat({_alt: _C(_alt)})}), _Cat({}))
+            assert broker.index_contract('OTC').code == _alt, f"櫃買備選代碼 {_alt} 解析失敗"
+
+        # 兩個代碼並存時要選對的那個 (IX0043),不可挑到舊的
+        broker.api = _Api(_Grp({'OTC': _Cat({'IX0043': _C('IX0043'),
+                                             'OTC101': _C('OTC101')})}), _Cat({}))
+        assert broker.index_contract('OTC').code == 'IX0043', "並存時應優先取 IX0043"
 
         # --- 1.7 期貨合約沒有 symbol,主圖查詢要改用 code ---
         fut17 = _C('TXFR1', name='臺股期貨')          # 刻意不給 symbol
@@ -2762,7 +2768,7 @@ def _shioaji_17_compat():
 
         # --- 策略層要認得新舊指數代碼 ---
         from core import strategy_engine as _se
-        for code in ('TSE001', 'OTC101', 'IX0001', 'IX0101', 'IX0002', '^TWII'):
+        for code in ('TSE001', 'OTC101', 'IX0001', 'IX0043', 'IX0101', '^TWII'):
             assert _se.looks_like_index_symbol(code), f"{code} 應被認成指數"
         assert not _se.looks_like_index_symbol('2330')
     finally:
