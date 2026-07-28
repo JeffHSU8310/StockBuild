@@ -6,7 +6,7 @@ diag_repro_issues.py — 重現使用者第五輪回報的三個問題 (修正�
    檢查 my_orders 與 tree_orders 的實際內容。
 3. 版面數值變更後重繪,面板位置有沒有真的改變。
 """
-import sys, os, time
+import sys, os, time, atexit, shutil, tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import diag_mock_tkinter
 diag_mock_tkinter.install_mock_tkinter()
@@ -15,6 +15,36 @@ import numpy as np
 import pandas as pd
 import stock_app_pro
 from stock_app_pro import StockTradingAppPro
+
+# ---------------------------------------------------------------------------
+# 【ADR-115】診斷腳本不可以動到使用者的真實資料檔
+#
+# 診斷案例會建策略、記模擬成交,而這些最後都會寫進 quant_strategies.json /
+# quant_state.json / paper_account.json —— 那是使用者**真正在用**的策略清單與
+# 模擬帳戶。跑一次診斷就把它們覆蓋成測試資料,是會實際造成損失的 (策略設定
+# 沒了、模擬帳戶的績效紀錄也沒了)。
+#
+# 這整段時間都是靠「跑完記得 git checkout 還原」在擋,但那只在這個 repo 裡
+# 有效:使用者在自己機器上跑診斷時沒有這層保護,而且忘記還原就會直接進版控。
+#
+# 解法是在建立 App 之前就把這三個檔案改指到暫存目錄。改的是類別屬性,所以
+# 之後所有實例都吃到暫存路徑,不必逐一修改診斷案例。
+# ---------------------------------------------------------------------------
+_diag_tmp = tempfile.mkdtemp(prefix='stockbuild_diag_')
+atexit.register(shutil.rmtree, _diag_tmp, True)
+for _attr, _fn in (('QT_STRATEGY_FILE', 'quant_strategies.json'),
+                   ('QT_STATE_FILE', 'quant_state.json'),
+                   ('QT_PAPER_FILE', 'paper_account.json')):
+    # 先把使用者真實檔案的內容複製進暫存區:有些診斷案例預期「載入得到既有
+    # 策略」,完全空白會讓它們的前提不成立。
+    _real = getattr(StockTradingAppPro, _attr)
+    _tmp = os.path.join(_diag_tmp, _fn)
+    try:
+        if os.path.exists(_real):
+            shutil.copyfile(_real, _tmp)
+    except Exception:
+        pass
+    setattr(StockTradingAppPro, _attr, _tmp)
 
 app = StockTradingAppPro()
 app.flush_after = getattr(app, "flush_after")  # 來自 _Tk mock
