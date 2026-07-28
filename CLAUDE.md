@@ -24,7 +24,9 @@
 ## 專案現況速覽
 
 - **介面**：tkinter + ttk；**繪圖**：matplotlib / mplfinance
-- **行情與下單**：永豐金證券 `shioaji` API (目前對接版本 **1.5.6**)
+- **行情與下單**：永豐金證券 `shioaji` API。**1.5.6 與 1.7 都支援**
+  (ADR-114 相容層:指數代碼、輕量合約型別、login 參數差異都收斂在
+  `core/sj_compat.py` + `brokers/sinopac.py`,不要在其他地方寫版本判斷)
 - **資料源政策 (ADR-011)**：台股一律 shioaji，未登入直接報錯；美股自動用
   yfinance。禁止 yfinance/FinMind 台股備援 (見鐵則 12)。
 - **分層** (完整說明見 `ARCHITECTURE.md`)：

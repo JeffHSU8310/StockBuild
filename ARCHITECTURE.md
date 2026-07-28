@@ -236,6 +236,7 @@ G:\StockBuild\
 │   ├─ telegram_control.py  遠端控制:授權/確認碼/指令解析 (ADR-108)
 │   ├─ order_intent.py      券商中立的委託意圖 (ADR-110)
 │   ├─ broker_ipc.py        券商子行程 IPC 協定 (ADR-112)
+│   ├─ sj_compat.py        shioaji 1.5.6/1.7 相容 (指數代碼/合約型別/簽名, ADR-114)
 │   └─ order_rules.py
 ├─ data/
 │   └─ config_store.py     設定 / 自選股 / 版面 I/O

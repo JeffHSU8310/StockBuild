@@ -2608,6 +2608,110 @@ def _strategy_level_account_routing():
 run_case("ADR-110階段2: 策略層級帳號路由/找不到帳號拒單/連線不分岔",
          _strategy_level_account_routing)
 
+def _shioaji_17_compat():
+    """【ADR-114】shioaji 1.5.6 / 1.7 相容:同一份 GUI 程式碼兩版都要能解析
+    指數與個股合約,而且 login 不會因為多傳參數而炸掉。
+
+    指數解析錯了不會報錯,只會讓加權/櫃買指數安靜地不動作 —— 那是主圖與
+    「看A做B」策略的核心,所以兩種版本形狀都要走一次真正的 GUI 路徑。
+    """
+    class _C:
+        def __init__(s, code, symbol=None, name=''):
+            s.code = code
+            if symbol is not None:
+                s.symbol = symbol
+            s.name = name
+            s.reference = 100.0
+
+    class _Grp:            # 1.5.6:群組容器
+        def __init__(s, items):
+            for k, v in items.items():
+                setattr(s, k, v)
+
+    class _Cat:            # 1.7:ContractCategory,直接用代碼查
+        def __init__(s, items): s._m = dict(items)
+        def get(s, k, default=None): return s._m.get(k, default)
+        def __getitem__(s, k): return s._m[k]
+        def __iter__(s): return iter(s._m.values())
+
+    broker = app.brokers['sinopac']
+    orig_api = broker.api
+
+    class _Api:
+        def __init__(s, indexs, stocks):
+            class _Cs: pass
+            s.Contracts = _Cs()
+            s.Contracts.Indexs = indexs
+            s.Contracts.Stocks = stocks
+
+    try:
+        # --- 1.5.6 形狀 ---
+        idx156 = _Grp({'TSE': _Grp({'TSE001': _C('TSE001', 'TSE001', '加權指數')}),
+                       'OTC': _Grp({'OTC101': _C('OTC101', 'OTC101', '櫃買指數')})})
+        stk156 = _Cat({'2330': _C('2330', '2330', '台積電')})
+        broker.api = _Api(idx156, stk156)
+        assert broker.index_contract('TSE').code == 'TSE001', "1.5.6 加權指數解析失敗"
+        assert broker.index_contract('OTC').code == 'OTC101', "1.5.6 櫃買指數解析失敗"
+        assert broker.stock_contract('2330').code == '2330', "1.5.6 個股解析失敗"
+
+        # --- 1.7 形狀:代碼改 IX0001/IX0002,列舉合約只有 code (無 symbol) ---
+        idx17 = _Cat({'IX0001': _C('IX0001', name='加權指數'),
+                      'IX0002': _C('IX0002', name='櫃買指數')})
+        stk17 = _Cat({'2330': _C('2330', name='台積電')})     # 刻意不給 symbol
+        broker.api = _Api(idx17, stk17)
+        assert broker.index_contract('TSE').code == 'IX0001', "1.7 加權指數解析失敗"
+        assert broker.index_contract('OTC').code == 'IX0002', "1.7 櫃買指數解析失敗"
+        assert broker.stock_contract('2330').code == '2330', "1.7 個股 .get 解析失敗"
+
+        # 1.7 只有 code 的輕量型別,掃描比對也要找得到 (.get 失效時的退路)
+        class _NoGet:
+            def __init__(s, items): s._m = list(items)
+            def __iter__(s): return iter(s._m)
+        broker.api = _Api(idx17, _NoGet([_C('2317', name='鴻海')]))
+        assert broker.stock_contract('2317').code == '2317', \
+            "1.7 輕量型別 (無 symbol) 掃描比對失敗 → 會變成「查無此代碼」"
+
+        # --- 找不到時回 None,不可拋例外 (未登入很常見) ---
+        broker.api = _Api(_Cat({}), _Cat({}))
+        assert broker.index_contract('TSE') is None
+        assert broker.stock_contract('2330') is None
+
+        # --- login:1.7 不吃 contracts_timeout,要自動略過而不是 TypeError ---
+        class _Api17(_Api):
+            def __init__(s):
+                super().__init__(_Cat({}), _Cat({}))
+                s.calls = []
+            def login(s, api_key, secret_key, subscribe_trade=True,
+                      receive_window=30000, force_refresh=False):
+                s.calls.append({'api_key': api_key, 'secret_key': secret_key})
+        a17 = _Api17(); broker.api = a17
+        dropped = broker.login(api_key='k', secret_key='s', contracts_timeout=10000)
+        assert a17.calls, "1.7 的 login 沒有被呼叫到"
+        assert dropped == ['contracts_timeout'], f"應回報被略過的參數,實際 {dropped}"
+
+        class _Api156(_Api):
+            def __init__(s):
+                super().__init__(_Cat({}), _Cat({}))
+                s.calls = []
+            def login(s, api_key, secret_key, contracts_timeout=10000):
+                s.calls.append(contracts_timeout)
+        a156 = _Api156(); broker.api = a156
+        dropped = broker.login(api_key='k', secret_key='s', contracts_timeout=10000)
+        assert a156.calls == [10000], "1.5.6 應照舊傳入 contracts_timeout"
+        assert dropped == [], f"1.5.6 不該略過任何參數,實際 {dropped}"
+
+        # --- 策略層要認得新舊指數代碼 ---
+        from core import strategy_engine as _se
+        for code in ('TSE001', 'OTC101', 'IX0001', 'IX0002', '^TWII'):
+            assert _se.looks_like_index_symbol(code), f"{code} 應被認成指數"
+        assert not _se.looks_like_index_symbol('2330')
+    finally:
+        broker.api = orig_api
+
+
+run_case("ADR-114: shioaji 1.5.6/1.7 相容 (指數代碼/輕量合約/login參數)",
+         _shioaji_17_compat)
+
 print(f"{'案例':60s} 結果")
 print("-" * 76)
 for name, st, msg in results:

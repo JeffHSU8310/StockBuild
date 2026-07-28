@@ -2020,7 +2020,16 @@ class StockTradingAppPro(tk.Tk):
 
         self.safe_after(0, self.log_message, "連線至券商伺服器並下載最新合約檔中...")
         try:
-            self.brokers['sinopac'].login(api_key=api_key, secret_key=secret_key, contracts_timeout=10000)
+            _bk = self.brokers['sinopac']
+            _dropped = _bk.login(api_key=api_key, secret_key=secret_key, contracts_timeout=10000)
+            # 【ADR-114】把實際生效的 SDK 版本與相容處理寫進日誌:升級 shioaji
+            # 之後排查問題時,第一個要確認的就是「現在到底跑在哪一版」。
+            if _dropped:
+                self.safe_after(0, self.log_message,
+                                f"【shioaji {_bk.sdk_version()}】此版 login() 不接受 "
+                                f"{'/'.join(_dropped)},已略過 (1.7 起合約改為查詢時自動載入)。")
+            else:
+                self.safe_after(0, self.log_message, f"【shioaji {_bk.sdk_version()}】登入參數沿用舊版行為。")
         except Exception as e:
             self.safe_after(0, self.log_message, f"【API 登入失敗】: {e}")
             self.safe_after(0, self.log_message,
@@ -2543,8 +2552,10 @@ class StockTradingAppPro(tk.Tk):
             try:
                 if self.api_logged_in and HAS_SJ:
                     try:
-                        c_twii = self.sj_api.Contracts.Indexs.TSE.TSE001
-                        c_twoii = self.sj_api.Contracts.Indexs.OTC.OTC101 
+                        # 【ADR-114】1.7 指數代碼改成 IX0001/IX0002,存取形狀也不同,
+                        # 統一走 adapter 的候選解析,1.5.6 與 1.7 都能拿到。
+                        c_twii = self.brokers['sinopac'].index_contract('TSE')
+                        c_twoii = self.brokers['sinopac'].index_contract('OTC')
                         
                         if c_twii and c_twoii:
                             snaps = self.sj_api.snapshots([c_twii, c_twoii])
@@ -2679,9 +2690,9 @@ class StockTradingAppPro(tk.Tk):
         c = None
         try:
             if sym == "^TWII":
-                c = self.sj_api.Contracts.Indexs.TSE.TSE001
+                c = self.brokers['sinopac'].index_contract('TSE')   # 【ADR-114】
             elif sym == "^TWOII":
-                c = getattr(self.sj_api.Contracts.Indexs.OTC, 'OTC101', None) or getattr(self.sj_api.Contracts.Indexs.OTC, 'OTC001', None)
+                c = self.brokers['sinopac'].index_contract('OTC')   # 【ADR-114】
             elif self._looks_like_futures_symbol(sym):
                 # 【第十一輪修正】期貨完整代號含數字,要先於「含數字=股票」判斷
                 c = self._resolve_futures_contract(sym)
@@ -4558,11 +4569,10 @@ class StockTradingAppPro(tk.Tk):
                         contract = self._resolve_futures_contract(raw_sym)
                         if contract: search_sym = contract.symbol; stock_name = fut_catalog.display_name(contract.symbol, contract.name); self.asset_type = "future"
                     elif raw_sym == "^TWII":
-                        contract = self.sj_api.Contracts.Indexs.TSE.TSE001
+                        contract = self.brokers['sinopac'].index_contract('TSE')   # 【ADR-114】
                         if contract: search_sym = raw_sym; stock_name = "加權指數"; self.asset_type = "index_tw"
                     elif raw_sym == "^TWOII":
-                        contract = getattr(self.sj_api.Contracts.Indexs.OTC, 'OTC101', None)
-                        if not contract: contract = getattr(self.sj_api.Contracts.Indexs.OTC, 'OTC001', None)
+                        contract = self.brokers['sinopac'].index_contract('OTC')   # 【ADR-114】
                         if contract: search_sym = raw_sym; stock_name = "櫃買指數"; self.asset_type = "index_tw"
                     elif raw_sym in ['TXF', 'MTX', 'FITX', 'MXF'] or self._looks_like_futures_symbol(raw_sym):
                         # 【第十一輪修正】台股模式下輸入/點選期貨完整代號 (TXFR2 等)
@@ -4570,8 +4580,7 @@ class StockTradingAppPro(tk.Tk):
                         contract = self._resolve_futures_contract(raw_sym)
                         if contract: search_sym = contract.symbol; stock_name = fut_catalog.display_name(contract.symbol, contract.name); self.asset_type = "future"
                     else:
-                        contract = self.sj_api.Contracts.Stocks.get(raw_sym)
-                        if not contract: contract = next((c for c in self.sj_api.Contracts.Stocks if c.symbol == raw_sym), None)
+                        contract = self.brokers['sinopac'].stock_contract(raw_sym)  # 【ADR-114】
                         if contract: search_sym = raw_sym; stock_name = contract.name; self.asset_type = "stock"
                 except Exception:
                     pass
@@ -5547,8 +5556,9 @@ class StockTradingAppPro(tk.Tk):
                 if contract is None:
                     contract = self._resolve_futures_contract(raw_sym)
             else:
-                contract = self.sj_api.Contracts.Stocks.get(raw_sym)
-                if not contract: contract = next((c for c in self.sj_api.Contracts.Stocks if c.symbol == raw_sym), None)
+                # 【ADR-114】1.7 列舉合約可能回傳只有 code 的輕量型別,
+                # 只比 symbol 會變成「查無此代碼」;adapter 兩個欄位都比。
+                contract = self.brokers['sinopac'].stock_contract(raw_sym)
                             
             if not contract:
                 self.log_message(f"【錯誤】找不到 {raw_sym} 的合約資訊，請確認代碼是否正確！")
@@ -7290,10 +7300,10 @@ class StockTradingAppPro(tk.Tk):
         try:
             if wtt == '指數' or strategy_engine.looks_like_index_symbol(sym):
                 s = sym.upper()
-                if s in ('^TWOII', 'TWOII', 'OTC101', 'OTC001', 'OTC'):
-                    c = getattr(self.sj_api.Contracts.Indexs.OTC, 'OTC101', None) or getattr(self.sj_api.Contracts.Indexs.OTC, 'OTC001', None)
+                if s in ('^TWOII', 'TWOII', 'OTC101', 'OTC001', 'IX0002', 'OTC'):
+                    c = self.brokers['sinopac'].index_contract('OTC')   # 【ADR-114】
                 else:  # 預設加權
-                    c = self.sj_api.Contracts.Indexs.TSE.TSE001
+                    c = self.brokers['sinopac'].index_contract('TSE')   # 【ADR-114】
                 return (c, 'index_tw', sym, '台股') if c is not None else (None, None, sym, '台股')
             if wtt == '期貨':
                 c = self._resolve_futures_contract(sym)
