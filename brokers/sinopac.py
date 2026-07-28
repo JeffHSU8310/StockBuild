@@ -12,6 +12,7 @@ try/except 與日誌訊息一律保留在呼叫端，確保這次搬動是「零
 shioaji 呼叫暫不搬動，見 brokers/base.py 開頭的說明與 DECISIONS_ADR097.md。
 """
 from brokers.base import BrokerClient
+from core import sj_compat
 
 try:
     import shioaji as sj
@@ -36,7 +37,44 @@ class SinopacBroker(BrokerClient):
         return self.api
 
     def login(self, api_key, secret_key, contracts_timeout=10000):
-        self.api.login(api_key=api_key, secret_key=secret_key, contracts_timeout=contracts_timeout)
+        """【ADR-114】1.7 移除了 `contracts_timeout` (改成查詢時自動載入合約)。
+
+        不偵測版本號,直接問 `login` 這個函式收不收這個參數 —— 版本號與實際
+        行為不一定同步 (1.7 的升級指南就與它自己的型別定義有出入),而簽名
+        不會騙人。丟掉的參數會回報給呼叫端記進系統日誌,不靜悄悄地忽略。
+        """
+        kw, dropped = sj_compat.supported_kwargs(
+            self.api.login, {'contracts_timeout': contracts_timeout})
+        self.api.login(api_key=api_key, secret_key=secret_key, **kw)
+        self.dropped_login_kwargs = dropped
+        return dropped
+
+    # ---- 【ADR-114】合約查詢:1.5.6 與 1.7 的形狀不同,收斂在這裡 ----
+    def index_contract(self, market):
+        """加權(TSE)/櫃買(OTC)指數合約。找不到回 None。"""
+        return sj_compat.resolve_index(
+            getattr(getattr(self.api, 'Contracts', None), 'Indexs', None), market)
+
+    def stock_contract(self, code):
+        """個股合約。先用 .get() 直接查,查不到才整批掃描比對代碼。
+
+        掃描時 symbol 與 code 都比對:1.7 列舉合約可能回傳只有 code 的輕量
+        型別,只比 symbol 會變成「查無此代碼」。
+        """
+        stocks = getattr(getattr(self.api, 'Contracts', None), 'Stocks', None)
+        if stocks is None:
+            return None
+        c = sj_compat._try_get(stocks, str(code))
+        if c is not None:
+            return c
+        try:
+            return next((x for x in stocks
+                         if sj_compat.match_contract_code(x, code)), None)
+        except Exception:
+            return None
+
+    def sdk_version(self):
+        return getattr(sj, '__version__', '?') if HAS_SJ else '(未安裝)'
 
     def activate_ca(self, ca_path, ca_pw, pid):
         self.api.activate_ca(ca_path=ca_path, ca_passwd=ca_pw, person_id=pid)

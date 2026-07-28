@@ -30,6 +30,7 @@ from core import market_session
 from core import secure_store
 from core import order_rules
 from core import order_intent
+from core import sj_compat
 from core import indicators
 from core import strategy_engine
 from core import backtest
@@ -5296,6 +5297,146 @@ class TestOrderIntentBrokerRouting(unittest.TestCase):
         # 呼叫端可以覆寫成人看得懂的名稱 (券商中文名/帳號暱稱)
         t2 = order_intent.describe_target({'broker': 'sinopac'}, '永豐金', '證券戶')
         self.assertEqual(t2, '永豐金 / 證券戶')
+
+
+class _C:
+    """假合約:有 code 就算合約 (真 shioaji 的合約一定有 code 字串)。"""
+    def __init__(self, code, symbol=None, name=''):
+        self.code = code
+        if symbol is not None:
+            self.symbol = symbol
+        self.name = name
+
+
+class _Group156:
+    """1.5.6 形狀:Indexs.TSE 是群組,用屬性取代碼 (Indexs.TSE.TSE001)。"""
+    def __init__(self, items):
+        for k, v in items.items():
+            setattr(self, k, v)
+
+
+class _Indexs156:
+    def __init__(self):
+        self.TSE = _Group156({'TSE001': _C('TSE001', 'TSE001', '加權指數')})
+        self.OTC = _Group156({'OTC101': _C('OTC101', 'OTC101', '櫃買指數')})
+
+
+class _Cat17:
+    """1.7 形狀:ContractCategory 直接用代碼查 (Indexs.get('IX0001'))。"""
+    def __init__(self, items):
+        self._m = dict(items)
+    def get(self, key, default=None):
+        return self._m.get(key, default)
+    def __getitem__(self, key):
+        return self._m[key]
+    def __iter__(self):
+        return iter(self._m.values())
+
+
+class TestSjCompatIndex(unittest.TestCase):
+    """【ADR-114】shioaji 1.5.6 / 1.7 的指數合約解析。
+
+    加權與櫃買指數是主圖與「看A做B」策略的核心;解析錯了不是報錯,而是
+    整個指數功能安靜地不動作,所以兩種版本形狀都要有測試。
+    """
+
+    def test_resolves_on_1_7_shape(self):
+        idx = _Cat17({'IX0001': _C('IX0001', name='加權指數'),
+                      'IX0002': _C('IX0002', name='櫃買指數')})
+        self.assertEqual(sj_compat.resolve_index(idx, 'TSE').code, 'IX0001')
+        self.assertEqual(sj_compat.resolve_index(idx, 'OTC').code, 'IX0002')
+
+    def test_resolves_on_1_5_6_shape(self):
+        idx = _Indexs156()
+        self.assertEqual(sj_compat.resolve_index(idx, 'TSE').code, 'TSE001')
+        self.assertEqual(sj_compat.resolve_index(idx, 'OTC').code, 'OTC101')
+
+    def test_prefers_new_code_when_both_exist(self):
+        """過渡期若兩種代碼都在,要用新的 —— 舊代碼可能是即將淘汰的別名。"""
+        idx = _Cat17({'IX0001': _C('IX0001'), 'TSE001': _C('TSE001')})
+        self.assertEqual(sj_compat.resolve_index(idx, 'TSE').code, 'IX0001')
+
+    def test_otc_falls_back_through_all_candidates(self):
+        """櫃買在不同版本有 OTC101 / OTC001 兩種代碼,都要試。"""
+        idx = _Cat17({'OTC001': _C('OTC001')})
+        self.assertEqual(sj_compat.resolve_index(idx, 'OTC').code, 'OTC001')
+
+    def test_returns_none_when_absent(self):
+        """找不到要回 None 讓呼叫端處理,不可拋例外 (未登入時很常見)。"""
+        self.assertIsNone(sj_compat.resolve_index(_Cat17({}), 'TSE'))
+        self.assertIsNone(sj_compat.resolve_index(None, 'TSE'))
+        self.assertIsNone(sj_compat.resolve_index(_Indexs156(), 'BAD'))
+
+    def test_never_returns_a_group_as_contract(self):
+        """1.5.6 的 Indexs.TSE 是群組;誤當成合約回傳,拿去訂閱/下單會出現
+        非常難懂的錯誤。用「有沒有 code 字串」區分。"""
+        class _Weird:
+            def get(self, k, default=None):
+                return _Group156({})      # 任何 key 都回一個群組
+        self.assertIsNone(sj_compat.resolve_index(_Weird(), 'TSE'))
+
+    def test_survives_container_that_raises(self):
+        """真實 SDK 的 __getattr__ 查無時可能拋任何例外。"""
+        class _Angry:
+            def get(self, k, default=None):
+                raise RuntimeError('boom')
+            def __getitem__(self, k):
+                raise KeyError(k)
+            def __getattr__(self, k):
+                raise AttributeError(k)
+        self.assertIsNone(sj_compat.resolve_index(_Angry(), 'TSE'))
+
+
+class TestSjCompatContractFields(unittest.TestCase):
+    """【ADR-114】1.7 列舉合約可能拿到只有 code 的輕量型別 (StockInfo)。"""
+
+    def test_symbol_falls_back_to_code(self):
+        self.assertEqual(sj_compat.contract_symbol(_C('2330', '2330')), '2330')
+        self.assertEqual(sj_compat.contract_symbol(_C('2330')), '2330')  # 無 symbol
+        self.assertEqual(sj_compat.contract_symbol(None, 'x'), 'x')
+
+    def test_match_compares_both_symbol_and_code(self):
+        """只比 symbol 的話,1.7 的輕量型別會全部比不中 → 「查無此代碼」。"""
+        self.assertTrue(sj_compat.match_contract_code(_C('2330', '2330'), '2330'))
+        self.assertTrue(sj_compat.match_contract_code(_C('2330'), '2330'))
+        self.assertTrue(sj_compat.match_contract_code(_C('2330'), ' 2330 '))
+        self.assertFalse(sj_compat.match_contract_code(_C('2330'), '2317'))
+        self.assertFalse(sj_compat.match_contract_code(_C('2330'), ''))
+
+
+class TestSjCompatLoginKwargs(unittest.TestCase):
+    """【ADR-114】1.7 的 login() 不再吃 contracts_timeout。"""
+
+    def test_drops_unsupported_kwarg(self):
+        def login_17(api_key, secret_key, subscribe_trade=True,
+                     receive_window=30000, force_refresh=False): pass
+        kw, dropped = sj_compat.supported_kwargs(login_17, {'contracts_timeout': 10000})
+        self.assertEqual(kw, {})
+        self.assertEqual(dropped, ['contracts_timeout'])
+
+    def test_keeps_supported_kwarg(self):
+        def login_156(api_key, secret_key, contracts_timeout=10000): pass
+        kw, dropped = sj_compat.supported_kwargs(login_156, {'contracts_timeout': 10000})
+        self.assertEqual(kw, {'contracts_timeout': 10000})
+        self.assertEqual(dropped, [])
+
+    def test_kwargs_signature_keeps_everything(self):
+        def anything(api_key, **kw): pass
+        kw, dropped = sj_compat.supported_kwargs(anything, {'contracts_timeout': 1})
+        self.assertEqual(kw, {'contracts_timeout': 1})
+
+    def test_unknown_signature_passes_through(self):
+        """取不到簽名時 (C 擴充常見,shioaji 的 login 就是 Rust 編出來的)
+        寧可原樣送出讓它報 TypeError,也不要靜悄悄丟掉使用者指定的參數。
+
+        用 `max` 當樣本:它是 inspect.signature 會拋 ValueError 的內建函式。
+        """
+        import inspect
+        with self.assertRaises(ValueError):
+            inspect.signature(max)          # 確認這個樣本真的取不到簽名
+        kw, dropped = sj_compat.supported_kwargs(max, {'contracts_timeout': 1})
+        self.assertEqual(kw, {'contracts_timeout': 1})
+        self.assertEqual(dropped, [])
 
 
 if __name__ == "__main__":

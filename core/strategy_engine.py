@@ -20,6 +20,8 @@ import re
 import uuid
 import pandas as pd
 
+from core import sj_compat as _sjc
+
 # 【ADR-101】籌碼條件:籌碼在資料準備階段被併成 df 的 Chip* 欄位,
 # 條件函式簽名維持 func(df, params) 不變,實盤與回測因此自動共用同一條路。
 from core import chips_features as _cf
@@ -733,7 +735,10 @@ def looks_like_index_symbol(sym):
         return False
     if s.startswith('^'):
         return True
-    return s in ('TWII', 'TWOII', 'TSE001', 'OTC101', 'OTC001', 'TSE', 'OTC')
+    # 【ADR-114】1.7 起指數改用交易所代碼 (加權 IX0001/櫃買 IX0002),
+    # 清單集中在 core/sj_compat.py,新舊代碼都要認得——只認舊代碼的話,
+    # 升級後策略會判斷「這不是指數」而走錯解析路徑。
+    return s in _sjc.INDEX_SYMBOLS
 
 
 def watch_enabled(strategy):

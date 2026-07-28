@@ -633,3 +633,30 @@
   略過 (否則主程式會永遠等一個不會來的回應);子行程的三條管線在收行程時
   都要 close (長時間執行會累積 fd,實測 ResourceWarning 抓到)。
 - **出處**:ADR-112。
+
+### P-62　升級 SDK 時,「版本號」不能拿來當「行為」的代理
+- **症狀**:寫 `if sj.__version__ >= '1.7': 用新寫法`,結果某個版本部分支援、
+  或官方指南與實作不一致,判斷就整個歪掉。
+- **根因**:版本號是宣告,不是事實。shioaji 1.7 的升級指南就聲稱
+  `fetch_contracts()`、`Contracts.status` 已移除、`SecurityType.Future` 更名為
+  `Futures`,但實際讀 1.7.0 的型別定義,**這三者都還在原樣**。照指南寫版本
+  分支就會錯。
+- **正確做法**:(1) 參數支援與否 → 直接問簽名 (`inspect.signature`),不要問
+  版本號 (`core/sj_compat.supported_kwargs`);(2) 資料形狀變更 → 用「候選清單
+  依序嘗試」,哪個拿得到就用哪個 (`resolve_index`),過渡期兩種代碼並存也能
+  自動處理;(3) 升級前先把 wheel 抓下來讀 `.pyi`/原始碼,不要只信升級指南
+  (同 P-59 的教訓:官方文件與套件實際內容經常不同步)。
+- **出處**:ADR-114。
+
+### P-63　合約列舉回傳的型別可能跟「用代碼查」拿到的不是同一種
+- **症狀**:升級 shioaji 1.7 後,`Contracts.Stocks.get('2330')` 正常,但
+  `next(c for c in Contracts.Stocks if c.symbol == '2330')` 全部比不中,
+  使用者看到「找不到合約資訊」。
+- **根因**:1.7 新增了輕量型別 `StockInfo`/`IndexInfo`/`FuturesInfo` (只有
+  security_type/region/exchange/code/target_code/base)。完整的 `Contract`
+  仍然有 `symbol`,但**列舉容器時拿到的是輕量型別**,沒有 `symbol` 這個屬性。
+- **正確做法**:比對代碼時 `symbol` 與 `code` **兩個都比**
+  (`sj_compat.match_contract_code`);取顯示用代號時 symbol 取不到就退回 code
+  (`contract_symbol`)。更一般的教訓:同一個容器的「查詢」與「列舉」不保證
+  回傳同一種型別,凡是遍歷 SDK 容器再讀屬性的地方都要用 getattr 防守。
+- **出處**:ADR-114。
