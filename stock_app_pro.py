@@ -50,6 +50,8 @@ from core import chukuangren_band
 from core import telegram_notify
 from core import telegram_control
 from core import market_pattern
+# 【ADR-120】主圖【盤勢判斷】面板的純邏輯 (設定正規化 + 通知去重)。
+from core import regime_panel
 # 【ADR-100】籌碼資料:解析純邏輯在 core/,本地 CSV 存取在 data/。
 from core import chips_parser
 # 【ADR-101】籌碼併進策略 df (含未來函數防護)。
@@ -183,7 +185,9 @@ class StockTradingAppPro(tk.Tk):
         self._gc_interval_ms = 20000
 
         # ================= 系統與 API 變數 =================
-        self.current_symbol = "0050" 
+        # 【ADR-120】使用者要求:打開程式預設主圖就是加權指數日K
+        # (週期預設值見 self.timeframe_var,本來就是「日K」)。
+        self.current_symbol = regime_panel.DEFAULT_INDEX_SYMBOL
         self.current_stock_name = "" 
         self.asset_type = "stock" 
         self.data_source = ""
@@ -257,6 +261,11 @@ class StockTradingAppPro(tk.Tk):
         self.app_settings = config_store.load_app_settings(self.app_settings_file)
         # 套用盤中零股開盤時刻到 market_session (預設 09:10,可設定)。
         market_session.set_odd_lot_open_hhmm(self.app_settings.get('odd_lot_open', '09:10'))
+        # 【ADR-120】主圖【盤勢判斷】的設定。正規化在 core/regime_panel,
+        # 設定檔缺欄位/被改壞一律回一份能用的設定,不會讓主圖畫不出來。
+        self.regime_settings = regime_panel.normalize(self.app_settings.get('regime_panel'))
+        # 盤勢型態通知的去重狀態:symbol -> {'date','oneshot','persistent'}
+        self._regime_notify_state = {}
 
         # 【ADR-111/112】(註冊時機要在 app_settings 載入之後:子行程模式
         # 需要讀使用者設定的 3.13 直譯器路徑)
@@ -420,6 +429,14 @@ class StockTradingAppPro(tk.Tk):
         # 稍等 1.5 秒 (等視窗/元件都就緒) 再背景自動登入,達成「開一次不用管」。
         self.safe_after(1500, self._try_auto_login_on_start)
 
+    # 【ADR-119】按下 X 之後最多等這麼久,時間到一律強制結束 (見 on_app_close)。
+    CLOSE_HARD_DEADLINE = 8.0
+    # 診斷腳本要呼叫 on_app_close() 驗證關閉流程,但它自己還要繼續跑完其餘
+    # 案例 —— 看門狗會在時限到達時把診斷行程一起殺掉 (實測踩到:診斷輸出
+    # 整個空白、結束碼卻是 0)。留一個明確的開關讓診斷關掉它;production
+    # 一律是 True,不會有人去改。
+    CLOSE_FORCE_EXIT = True
+
     def on_app_close(self):
         """
         【ADR-012/ADR-014】視窗關閉時的收尾處理。
@@ -447,6 +464,22 @@ class StockTradingAppPro(tk.Tk):
         """
         self._closing = True
         self._qt_running = False  # 【ADR-035】關閉程式前先停自動交易,絕不在關閉過程下單
+        # 【ADR-119】關閉保底看門狗:使用者回報「執行一陣子後按 X 沒反應」。
+        # 這條路徑上每一步都已經有時限,但只要有任何一個第三方呼叫 (shioaji
+        # logout、子行程 wait) 卡在不會回來的地方,整個關閉就停在那裡,而使用者
+        # 只能去工作管理員砍。
+        #
+        # 這個執行緒不管主流程走到哪裡,時間到就強制結束行程。它是**保底**,
+        # 不是正常路徑 —— 正常情況下面的 os._exit(0) 會先執行到,看門狗根本
+        # 不會醒來 (daemon thread 隨行程一起消滅)。
+        def _force_exit():
+            time.sleep(self.CLOSE_HARD_DEADLINE)
+            os._exit(0)
+        if self.CLOSE_FORCE_EXIT:
+            try:
+                threading.Thread(target=_force_exit, daemon=True).start()
+            except Exception:
+                pass
         if HAS_SJ and self.api_logged_in:
             # 【第十輪修正 問題4】logout 原本在主執行緒同步呼叫:session 卡死/
             # 網路異常時 logout 會永遠不回來,視窗直接「沒有回應」、連關都關
@@ -1027,7 +1060,7 @@ class StockTradingAppPro(tk.Tk):
         top_panel.pack(fill=tk.X, side=tk.TOP, padx=5, pady=5)
         tk.Label(top_panel, text="股票代碼:", bg="#1A2026", fg="white", font=('微軟正黑體', 10)).pack(side=tk.LEFT, padx=5)
         self.entry_symbol = tk.Entry(top_panel, bg="#2A323D", fg="#FFFFFF", insertbackground="white", width=12)
-        self.entry_symbol.insert(0, "0050")
+        self.entry_symbol.insert(0, regime_panel.DEFAULT_INDEX_SYMBOL)  # 【ADR-120】預設加權指數
         self.entry_symbol.pack(side=tk.LEFT, padx=5)
         self.entry_symbol.bind("<Return>", lambda e: self.start_fetch_thread())
         ttk.Button(top_panel, text="查尋 / 載入", command=self.start_fetch_thread).pack(side=tk.LEFT, padx=10)
@@ -1319,23 +1352,19 @@ class StockTradingAppPro(tk.Tk):
             if name in ["MACD", "RSI", "KDJ", "DMI"]:
                 tk.Button(row_frame, text="⚙", bg="#2A323D", fg="white", relief="flat", padx=2, pady=0, command=cmd).pack(side=tk.LEFT)
 
-        # 【ADR-102】量價支撐壓力:勾選後在主圖畫出 POC/價值區/高量節點等水平線。
-        # 壓力紅、支撐綠 (鐵則1 的延伸),線的粗細與透明度對應強度。
-        self.sr_enabled_var = tk.BooleanVar(value=False)
-        self._sr_range_mode = self.SR_RANGE_VISIBLE
-        self._sr_fixed_bars = 120
-        self._sr_max_levels = 6
+        # 【ADR-120】主圖【盤勢判斷】:把原本分散兩處的「盤勢/型態偵測」
+        # (原本在終極波段策略編輯器裡) 與「量價支撐壓力」(ADR-102) 合成
+        # 主圖上同一顆勾選鈕,底下兩個子項各自可勾選,細部參數在 ⚙ 對話框。
+        # 勾選後:支撐壓力畫在主圖 (壓力紅、支撐綠,鐵則1 的延伸);盤勢/型態
+        # 在加權指數日K 出現型態時自動寫進系統日誌通知。
+        self.regime_enabled_var = tk.BooleanVar(value=bool(self.regime_settings['enabled']))
+        self.sr_enabled_var = tk.BooleanVar(value=bool(self.regime_settings['sr_enabled']))
         self._sr_last_result = None
-        tk.Checkbutton(row_frame, text="支撐壓力", variable=self.sr_enabled_var,
+        tk.Checkbutton(row_frame, text="盤勢判斷", variable=self.regime_enabled_var,
                        bg="#12161A", fg="#FFCA28", selectcolor="#2A323D",
-                       command=self._sr_toggle).pack(side=tk.LEFT, padx=(10, 0))
-        self.cb_sr_range = ttk.Combobox(row_frame, values=list(self.SR_RANGE_MODES),
-                                        width=8, state="readonly",
-                                        style='BlackText.TCombobox')
-        self.cb_sr_range.set(self.SR_RANGE_VISIBLE)
-        self.cb_sr_range.pack(side=tk.LEFT, padx=(2, 0))
-        self.cb_sr_range.bind("<<ComboboxSelected>>",
-                              lambda e: self._sr_set_range_mode(self.cb_sr_range.get()))
+                       command=self._regime_toggle).pack(side=tk.LEFT, padx=(10, 0))
+        tk.Button(row_frame, text="⚙", bg="#2A323D", fg="white", relief="flat",
+                  padx=2, pady=0, command=self.open_regime_settings).pack(side=tk.LEFT)
 
         # 【使用者調整#1】圖表邊界前兩次都是 Claude 猜測數值，使用者要求改成
         # 可以自己調整、調好就鎖定保存。這顆按鈕開一個對話框，用滑桿即時
@@ -4050,8 +4079,34 @@ class StockTradingAppPro(tk.Tk):
                             f"{total * self.CHIPS_REQUEST_INTERVAL * 4 / 60:.0f} 分鐘)。")
             ok_days = 0
             fails = {'market': 0, 'stock': 0, 'margin': 0, 'tpex': 0}
+            # 【ADR-119】累積緩衝:見下方寫檔次數的說明
+            pend_market, pend_margin, pend_stock = [], [], {}
+            no_tpex_days = 0        # 【ADR-119】櫃買沒資料的天數,最後彙總一次
+
+            def _flush_simple():
+                """把累積的市場法人/融資融券一次寫檔。"""
+                if pend_market:
+                    chips_store.upsert(chips_store.market_inst_path(self.CHIPS_BASE_DIR),
+                                       pd.concat(pend_market, ignore_index=True))
+                    pend_market.clear()
+                if pend_margin:
+                    chips_store.upsert(chips_store.margin_path(self.CHIPS_BASE_DIR),
+                                       pd.concat(pend_margin, ignore_index=True))
+                    pend_margin.clear()
+
+            def _flush_stock(ym=None):
+                """把累積的個股法人寫檔 (ym=None 代表全部)。"""
+                keys = [ym] if ym else list(pend_stock.keys())
+                for k in keys:
+                    frames = pend_stock.pop(k, None)
+                    if frames:
+                        chips_store.upsert(
+                            chips_store.stock_inst_path(self.CHIPS_BASE_DIR, k + '-01'),
+                            pd.concat(frames, ignore_index=True))
+
             for i, day in enumerate(days, 1):
                 if self._closing or self._chips_cancel:
+                    _flush_simple(); _flush_stock()      # 中止前先把抓到的存起來
                     self.safe_after(0, self.log_message, f"【籌碼】已中止 (完成 {i - 1}/{total} 日)。")
                     self.safe_after(0, set_status, f"已中止 ({i - 1}/{total})")
                     return
@@ -4066,7 +4121,7 @@ class StockTradingAppPro(tk.Tk):
                                                     {'dayDate': ymd, 'type': 'day', 'response': 'json'})
                     df = chips_parser.parse_twse_market_inst(payload, date_iso=iso)
                     if not df.empty:
-                        chips_store.upsert(chips_store.market_inst_path(self.CHIPS_BASE_DIR), df)
+                        pend_market.append(df)      # 【ADR-119】累積,不逐日寫檔
                         got_any = True
                 except Exception:
                     fails['market'] += 1
@@ -4078,7 +4133,7 @@ class StockTradingAppPro(tk.Tk):
                                                     {'date': ymd, 'selectType': 'MS', 'response': 'json'})
                     df = chips_parser.parse_twse_margin(payload, date_iso=iso)
                     if not df.empty:
-                        chips_store.upsert(chips_store.margin_path(self.CHIPS_BASE_DIR), df)
+                        pend_margin.append(df)      # 【ADR-119】累積,不逐日寫檔
                         got_any = True
                 except Exception:
                     fails['margin'] += 1
@@ -4104,8 +4159,13 @@ class StockTradingAppPro(tk.Tk):
                                                      'date': day.strftime('%Y/%m/%d'),
                                                      'id': '', 'response': 'json'})
                     # 櫃買欄位分組沒有官方名稱,是靠恆等式反推的;改版時要看得見
-                    ok_layout, why = chips_parser.verify_tpex_layout(payload)
-                    if not ok_layout:
+                    status, why = chips_parser.verify_tpex_layout(payload)
+                    if status == chips_parser.NO_DATA:
+                        # 【ADR-119】沒有資料是預期中的 (日期太早/當日無交易),
+                        # 靜靜跳過就好 —— 對每個沒資料的日子印一次紅字警告,
+                        # 只會讓真正的版面問題被淹沒在洗版裡。
+                        no_tpex_days += 1
+                    elif status != chips_parser.LAYOUT_OK:
                         self.safe_after(0, self.log_message,
                                         f"【籌碼-警告】{iso} 櫃買欄位版面驗證失敗 ({why}),"
                                         f"該日上櫃資料已略過,不寫入可能錯誤的籌碼。")
@@ -4119,10 +4179,23 @@ class StockTradingAppPro(tk.Tk):
                 time.sleep(self.CHIPS_REQUEST_INTERVAL)
 
                 if stock_frames:
-                    merged = pd.concat(stock_frames, ignore_index=True)
-                    chips_store.upsert(chips_store.stock_inst_path(self.CHIPS_BASE_DIR, iso), merged)
+                    # 【ADR-119】依「年月」分桶累積。原本每天都對月檔做一次
+                    # read → concat → 去重 → write;月檔會長到數 MB,10 年就是
+                    # 2364 次整檔重寫,而 pandas 這些運算是握著 GIL 做的 ——
+                    # 背景執行緒把 UI 執行緒餓死,使用者按 X 都沒反應 (P-48)。
+                    # 改成一個月只寫一次,寫檔次數從 2364 降到約 120。
+                    pend_stock.setdefault(iso[:7], []).append(
+                        pd.concat(stock_frames, ignore_index=True))
                 if got_any:
                     ok_days += 1
+                # 累積夠一個月就落地一次:全部堆到最後才寫的話,中途按停止或
+                # 關程式,這一整批就白抓了 (下載本身很貴,不能有這種風險)。
+                if len(pend_stock.get(iso[:7], [])) >= self.CHIPS_FLUSH_EVERY:
+                    _flush_stock(iso[:7])
+                if len(pend_market) >= self.CHIPS_FLUSH_EVERY:
+                    _flush_simple()
+
+            _flush_simple(); _flush_stock()      # 【ADR-119】日線段結束,把剩下的寫檔
 
             # (5) 期貨三大法人:支援日期區間,按月批次抓 (240 次 → 約 12 次)
             self.safe_after(0, set_status, "下載期貨籌碼 ...")
@@ -4146,6 +4219,12 @@ class StockTradingAppPro(tk.Tk):
             if bad:
                 msg += f";失敗 {', '.join(bad)} (可再按一次更新,已成功的不會重抓)"
             self.safe_after(0, self.log_message, msg)
+            if no_tpex_days:
+                # 彙總成一行,而不是每天印一次 —— 使用者要知道「有幾天沒上櫃資料」,
+                # 但不需要看 2000 行一模一樣的訊息。
+                self.safe_after(0, self.log_message,
+                                f"【籌碼】其中 {no_tpex_days} 個交易日櫃買端沒有資料 "
+                                f"(多為較早的日期,屬正常;上市資料不受影響)。")
             self.safe_after(0, set_status, f"完成:{ok_days}/{total} 日")
             self.safe_after(0, self._chips_refresh_view)
         except Exception as e:
@@ -4244,6 +4323,10 @@ class StockTradingAppPro(tk.Tk):
             self.btn_chips_stop.config(state=tk.DISABLED)
         except (tk.TclError, AttributeError):
             pass
+
+    # 【ADR-119】累積幾天才寫一次檔。太大→中途停止會白抓;太小→退回逐日
+    # read-modify-write 把 UI 餓死。一個月左右是兩者的平衡點。
+    CHIPS_FLUSH_EVERY = 20
 
     def _chips_start_update(self):
         """使用者按「更新籌碼」:抓近一年缺的日期。下載一律在背景執行緒。"""
@@ -4363,7 +4446,8 @@ class StockTradingAppPro(tk.Tk):
     def _chips_rows_futures(self, start_iso, end_iso):
         """期貨法人:預設看臺股期貨,可用代號欄過濾商品名稱關鍵字。"""
         df = chips_store.load_futures_inst_range(self.CHIPS_BASE_DIR, start_iso, end_iso)
-        heads = ['日期', '商品', '身份別', '未平倉淨額(口)', '未平倉淨額(千元)', '交易淨額(口)']
+        # 【ADR-119】未平倉金額原始單位是千元,換成台灣慣用的億 (同 ADR-118)。
+        heads = ['日期', '商品', '身份別', '未平倉淨額(口)', '未平倉淨額(億)', '交易淨額(口)']
         if df is None or df.empty:
             return heads, [], "本地尚無期貨籌碼,請按「更新籌碼」下載。"
         kw = (self.entry_chips_code.get() or '').strip()
@@ -4374,8 +4458,8 @@ class StockTradingAppPro(tk.Tk):
         sub = sub.sort_values(['Date', 'Investor'], ascending=[False, True]).head(300)
         note = (f"{'含「' + kw + '」' if kw else '臺股期貨'} 共 {len(sub)} 列"
                 f" (資料 {df['Date'].min()} ~ {df['Date'].max()};留空預設臺股期貨)")
-        rows = [(r['Date'], r['Product'], r['Investor'], self._chips_fmt_int(r['NetOI']),
-                 self._chips_fmt_int(r['NetOIAmount']), self._chips_fmt_int(r['NetTrade']))
+        rows = [(r['Date'], r['Product'], r['Investor'], unit_format.fmt_int(r['NetOI']),
+                 unit_format.fmt_yi(r['NetOIAmount'], '仟元'), unit_format.fmt_int(r['NetTrade']))
                 for _, r in sub.iterrows()]
         return heads, rows, note
 
@@ -5441,6 +5525,9 @@ class StockTradingAppPro(tk.Tk):
             # 【ADR-102】量價支撐壓力:在主圖畫水平線。放在這裡是因為 axlist 剛
             # 建好、還沒交給 canvas,與其他 overlay (vlines/hline) 同一階段。
             self._draw_sr_levels(axlist[0], raw_df)
+            # 【ADR-120】盤勢/型態偵測:不畫在圖上,只把「新出現的」寫進系統
+            # 日誌。放在畫圖之後、用同一份 raw_df,不用多打一次 API。
+            self._regime_check(raw_df)
 
             self.current_fig = fig
             self.current_canvas = FigureCanvasTkAgg(fig, master=self.chart_frame)
@@ -6186,20 +6273,32 @@ class StockTradingAppPro(tk.Tk):
         # 作用中的欄位」——做B (執行商品) 或看A (訊號來源),由最後點過的欄位決定
         # (見 _qt_editor_symbol_target 的設定)。種類也一併自動判斷:做B→股票/期貨,
         # 看A→指數/期貨/股票 (看A可為指數)。
+        self._feed_symbol_to_editor(sym)
+
+    def _feed_symbol_to_editor(self, sym):
+        """把代碼帶進策略編輯器目前作用中的欄位 (做B 或 看A)。
+
+        【ADR-119】原本這段直接寫在「點自選股」裡,所以只有自選股能帶入;
+        使用者回報「看A做B 選指數時,也希望能直接點上方的指數帶入」——
+        上方指數走的是 load_index_chart(),完全沒有經過這段。抽成共用函式後
+        兩個入口行為一致,日後多一個入口也只要呼叫這一個函式。
+        """
         target = getattr(self, '_qt_editor_symbol_target', None)
-        if target is not None:
-            try:
-                dlg_ref, e_sym_ref, cb_tt_ref, lookup_cb, kind = target
-                if dlg_ref.winfo_exists():
-                    e_sym_ref.delete(0, tk.END)
-                    e_sym_ref.insert(0, sym)
-                    tt = (self._watch_trade_type_for_symbol(sym) if kind == 'A'
-                          else self._trade_type_for_symbol(sym))
-                    cb_tt_ref.set(tt)
-                    if lookup_cb:
-                        lookup_cb()
-            except Exception:
-                pass
+        if target is None:
+            return
+        try:
+            dlg_ref, e_sym_ref, cb_tt_ref, lookup_cb, kind = target
+            if not dlg_ref.winfo_exists():
+                return
+            e_sym_ref.delete(0, tk.END)
+            e_sym_ref.insert(0, sym)
+            tt = (self._watch_trade_type_for_symbol(sym) if kind == 'A'
+                  else self._trade_type_for_symbol(sym))
+            cb_tt_ref.set(tt)
+            if lookup_cb:
+                lookup_cb()
+        except Exception:
+            pass
 
     def add_to_wl(self):
         group = self.current_wl_name.get()
@@ -6221,6 +6320,9 @@ class StockTradingAppPro(tk.Tk):
         self.entry_symbol.delete(0, tk.END)
         self.entry_symbol.insert(0, symbol)
         self.start_fetch_thread()
+        # 【ADR-119】點上方的加權/櫃買指數時,也要能帶進策略編輯器 ——
+        # 「看A做B」的 A 常常就是指數,原本只有自選股能帶入,指數得手動打。
+        self._feed_symbol_to_editor(symbol)
 
     def set_timeframe(self, tf, fetch=True):
         self.timeframe_var.set(tf)
@@ -6870,17 +6972,9 @@ class StockTradingAppPro(tk.Tk):
     QT_TF_DAYS = {"1分K": 4, "5分K": 7, "15分K": 14, "30分K": 21, "60分K": 35, "日K": 300,
                   "周K": 700, "月K": 1500}  # 【新增】週期擴充:周K/月K 要夠長的原始資料才湊得出夠多根
 
-    # 【新ADR 盤勢型態提醒】這幾種訊號代表「目前的持續狀態」(盤勢分類/是否
-    # 接近邊界/三角形楔形),不是一次性事件——同一個狀態沒變之前,每天重新
-    # 評估都會再算出同一個結果,若照一般型態一樣照樣通知會每天洗一次頻道。
-    # 只有這幾種才需要「內容有變才通知」的額外去重;其餘型態 (M頭/W底/
-    # 頭肩頂底/破底翻/假突破/島型反轉/區間突破跌破/N字形) 本身的判斷邏輯
-    # 就只在型態confirm的那一天觸發一次,不需要額外去重。
-    QT_PATTERN_PERSISTENT_IDS = frozenset({
-        'regime', 'near_range_high', 'near_range_low',
-        'triangle_symmetrical', 'triangle_ascending', 'triangle_descending',
-        'wedge_rising', 'wedge_falling',
-    })
+    # 【ADR-120】原本這裡有 QT_PATTERN_PERSISTENT_IDS (盤勢型態通知去重用)。
+    # 盤勢/型態偵測已從終極波段策略搬到主圖【盤勢判斷】,去重清單一併搬進
+    # core/regime_panel.PERSISTENT_PATTERN_IDS。
 
     def _qt_load(self):
         """載入策略與持倉狀態。總開關 _qt_running 絕不持久化——每次啟動一律關閉。"""
@@ -7865,10 +7959,9 @@ class StockTradingAppPro(tk.Tk):
                                                           cache_sym=w_sym, cache_market=w_mkt)
                     if daily_df is None or daily_df.empty:
                         continue  # 沒資料不算錯誤 (可能休市/剛登入還沒建立快取)
-                    # 【新ADR 盤勢型態提醒】跟進出場邏輯完全獨立,共用同一份剛抓到
-                    # 的日K,不用多打一次 API;只提醒不影響下面的進出場判斷。
-                    self._qt_pattern_check(s, rt, daily_df)
-                    self._qt_pattern_intraday_preview(s, rt, daily_df, w_contract, w_asset, w_sym, w_mkt)
+                    # 【ADR-120】原本這裡會順便跑盤勢/型態提醒。該功能已搬到
+                    # 主圖【盤勢判斷】(看盤時就看得到,不用開著策略),這裡回到
+                    # 只做進出場判斷。
                     params = chukuangren_band.params_of(s)
                     chukuangren_band.on_daily_close(params, rt, daily_df,
                                                     chukuangren_band.direction_of(s))
@@ -8105,91 +8198,6 @@ class StockTradingAppPro(tk.Tk):
             except Exception as e:
                 self.safe_after(0, self.log_message,
                                 f"【自動交易-即時停損異常】策略「{s.get('name')}」: {type(e).__name__}: {e}")
-
-    def _qt_pattern_check(self, s, rt, daily_df):
-        """【新ADR 盤勢型態提醒】終極波段策略專屬,一天只跑一次 (跟 daily_df
-        最後一根的日期綁定,不受5分K邊界節奏影響——這個評估跟進出場邏輯
-        完全independent)。用 core/market_pattern.py 的純函式判斷,新出現的
-        訊號用 log_message('【自動交易-盤勢】...') 通知——這個前綴會被
-        telegram_notify.is_quant_message() 抓到,總開關開著時自動額外推播
-        Telegram,不用另外接線。只提醒,不影響任何進出場邏輯/委託。"""
-        if not s.get('pattern_enabled'):
-            return
-        try:
-            today_date = str(daily_df.index[-1]).split(' ')[0]
-        except Exception:
-            return
-        if rt.get('pattern_last_eval_date') == today_date:
-            return
-        rt['pattern_last_eval_date'] = today_date
-        params = {
-            'lookback': int(s.get('pattern_lookback', 60) or 60),
-            'near_pct': float(s.get('pattern_near_pct', 3.0) or 3.0),
-            'enabled_patterns': s.get('pattern_list') or list(market_pattern.DEFAULT_PARAMS['enabled_patterns']),
-        }
-        try:
-            signals = market_pattern.evaluate_all(daily_df, params)
-        except Exception as e:
-            self.safe_after(0, self.log_message,
-                            f"【自動交易-盤勢異常】策略「{s.get('name')}」型態偵測失敗: {type(e).__name__}: {e}")
-            return
-        if not signals:
-            return
-        prev = rt.get('pattern_last_notified') or {}
-        new_notified = {}
-        msgs = []
-        for sig in signals:
-            pid = sig.get('pattern', '')
-            label = sig.get('label', pid)
-            bias = f"[{sig['bias']}]" if sig.get('bias') else ''
-            if pid in self.QT_PATTERN_PERSISTENT_IDS:
-                new_notified[pid] = label
-                if prev.get(pid) == label:
-                    continue  # 持續狀態沒有變化,不重複通知
-            msgs.append(f"{label}{bias}")
-        rt['pattern_last_notified'] = new_notified
-        if msgs:
-            self.safe_after(0, self.log_message,
-                            f"【自動交易-盤勢】策略「{s.get('name')}」"
-                            f"({strategy_engine.watch_symbol_of(s)}) {today_date} 日K偵測到:"
-                            + "；".join(msgs))
-
-    def _qt_pattern_intraday_preview(self, s, rt, daily_df, w_contract, w_asset, w_sym, w_mkt):
-        """【使用者需求:60分K為輔】日K還沒收盤前,先用最新60分K收盤看一眼是否
-        已經接近日K算出來的區間邊界,給一個『留意』等級的盤中預告——正式的
-        盤勢/型態判定永遠只看日K收盤 (_qt_pattern_check),這裡只是提早提醒,
-        不是正式結論,每天每個方向最多提醒一次。"""
-        if not s.get('pattern_enabled'):
-            return
-        try:
-            lookback = int(s.get('pattern_lookback', 60) or 60)
-            near_pct = float(s.get('pattern_near_pct', 3.0) or 3.0)
-            regime = market_pattern.classify_regime(daily_df, lookback=lookback, near_pct=near_pct)
-            if not regime:
-                return
-            intraday_df = self._qt_fetch_closed_bars(s, w_contract, w_asset, tf='60分K',
-                                                      cache_sym=w_sym, cache_market=w_mkt)
-            if intraday_df is None or intraday_df.empty:
-                return
-            live_close = float(intraday_df['Close'].iloc[-1])
-            span = regime['range_high'] - regime['range_low']
-            if span <= 0:
-                return
-            today_date = str(daily_df.index[-1]).split(' ')[0]
-            near_high = (regime['range_high'] - live_close) / span * 100.0 <= near_pct
-            near_low = (live_close - regime['range_low']) / span * 100.0 <= near_pct
-            if near_high and not regime['near_high'] and rt.get('pattern_intraday_high_date') != today_date:
-                rt['pattern_intraday_high_date'] = today_date
-                self.safe_after(0, self.log_message,
-                                f"【自動交易-盤勢】策略「{s.get('name')}」60分K盤中已接近{lookback}天區間高點"
-                                f" (現價{live_close:g},高點{regime['range_high']:g}),留意日K是否收在附近。")
-            if near_low and not regime['near_low'] and rt.get('pattern_intraday_low_date') != today_date:
-                rt['pattern_intraday_low_date'] = today_date
-                self.safe_after(0, self.log_message,
-                                f"【自動交易-盤勢】策略「{s.get('name')}」60分K盤中已接近{lookback}天區間低點"
-                                f" (現價{live_close:g},低點{regime['range_low']:g}),留意日K是否收在附近。")
-        except Exception:
-            pass
 
     def _qt_chukuangren_execute_pass(self):
         """【新ADR 確認/下單分兩個時間點】終極波段策略12:00確認成立後不會立刻
@@ -9130,59 +9138,10 @@ class StockTradingAppPro(tk.Tk):
         cb_dir.bind('<<ComboboxSelected>>', _refresh_dir)
         _refresh_dir()
 
-        # 【新ADR 盤勢型態提醒】獨立於進出場邏輯之外的提醒功能:抓看盤(A,加權
-        # 指數) 的日K,判斷盤勢 (區間整理/上升/下降) 跟常見技術型態,只通知
-        # 不下單。預設關閉,使用者要自己勾選啟用。
-        pattern_fr = tk.Frame(body, bg="#12181F"); pattern_fr.pack(fill=tk.X, padx=12, pady=(8, 4))
-        tk.Label(pattern_fr, text="📈 盤勢/型態提醒 (選用,只通知不下單;以日K為主,60分K為輔做盤中預告)",
-                 bg="#12181F", fg="#29B6F6", font=('微軟正黑體', 9, 'bold')).grid(
-                 row=0, column=0, columnspan=6, sticky='w', pady=(4, 2))
-        var_pattern = tk.BooleanVar(value=bool(s.get('pattern_enabled', False)))
-        tk.Checkbutton(pattern_fr, text="啟用", variable=var_pattern, bg="#12181F", fg="#29B6F6",
-                       selectcolor="#2A323D", activebackground="#12181F",
-                       font=('微軟正黑體', 9)).grid(row=1, column=0, sticky='w', padx=(4, 0))
-        tk.Label(pattern_fr, text="區間天數", bg="#12181F", fg="white", font=('微軟正黑體', 9)).grid(
-                 row=1, column=1, sticky='e', padx=(8, 0))
-        e_pat_lookback = tk.Entry(pattern_fr, width=6, bg="#2A323D", fg="white", justify="center")
-        e_pat_lookback.insert(0, str(s.get('pattern_lookback', market_pattern.DEFAULT_PARAMS['lookback'])))
-        e_pat_lookback.grid(row=1, column=2, padx=4)
-        tk.Label(pattern_fr, text="接近邊界%", bg="#12181F", fg="white", font=('微軟正黑體', 9)).grid(
-                 row=1, column=3, sticky='e', padx=(8, 0))
-        e_pat_near = tk.Entry(pattern_fr, width=6, bg="#2A323D", fg="white", justify="center")
-        e_pat_near.insert(0, str(s.get('pattern_near_pct', market_pattern.DEFAULT_PARAMS['near_pct'])))
-        e_pat_near.grid(row=1, column=4, padx=4)
-
-        def _show_pattern_catalog():
-            info = tk.Toplevel(dlg)
-            info.title("盤勢/型態判斷清單 (共{}種)".format(len(market_pattern.PATTERN_CATALOG)))
-            info.configure(bg="#1A2026")
-            self.center_window(info, 640, 480)
-            info.transient(dlg)
-            try:
-                info.lift(); info.focus_force()
-            except Exception:
-                pass
-            txt = tk.Text(info, bg="#12161A", fg="white", font=('微軟正黑體', 9), wrap='word', relief='flat')
-            txt.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-            for item in market_pattern.PATTERN_CATALOG:
-                txt.insert(tk.END, f"【{item['category']}】{item['label']}\n{item['desc']}\n\n")
-            txt.config(state='disabled')
-            tk.Button(info, text="關閉", bg="#2A323D", fg="white", relief="flat",
-                      command=info.destroy).pack(pady=(0, 10))
-
-        tk.Button(pattern_fr, text="查看型態說明", bg="#5A6472", fg="white", relief="flat",
-                  font=('微軟正黑體', 8), command=_show_pattern_catalog).grid(row=1, column=5, padx=(10, 4))
-
-        pat_vars = {}
-        grid_fr = tk.Frame(pattern_fr, bg="#12181F")
-        grid_fr.grid(row=2, column=0, columnspan=6, sticky='w', pady=(4, 6))
-        enabled_now = set(s.get('pattern_list') or market_pattern.DEFAULT_PARAMS['enabled_patterns'])
-        for i, item in enumerate(market_pattern.PATTERN_CATALOG):
-            v = tk.BooleanVar(value=item['id'] in enabled_now)
-            pat_vars[item['id']] = v
-            tk.Checkbutton(grid_fr, text=item['label'], variable=v, bg="#12181F", fg="white",
-                           selectcolor="#2A323D", activebackground="#12181F",
-                           font=('微軟正黑體', 8)).grid(row=i // 3, column=i % 3, sticky='w', padx=6, pady=1)
+        # 【ADR-120】原本這裡有一整區「📈 盤勢/型態提醒」。使用者要求把盤勢
+        # 判斷放到主圖 (看盤時就看得到,不必開著策略),因此整區移到主圖的
+        # 【盤勢判斷】⚙ 設定 (見 open_regime_settings)。這個策略回到只做
+        # 進出場邏輯。
 
         def _collect():
             s['kind'] = chukuangren_band.KIND
@@ -9211,16 +9170,9 @@ class StockTradingAppPro(tk.Tk):
                     s[f'ck_{k}'] = 0.0
             s['entry'] = s.get('entry') or []
             s['exit_signals'] = s.get('exit_signals') or []
-            s['pattern_enabled'] = bool(var_pattern.get())
-            try:
-                s['pattern_lookback'] = max(10, int(e_pat_lookback.get().strip()))
-            except (TypeError, ValueError):
-                s['pattern_lookback'] = market_pattern.DEFAULT_PARAMS['lookback']
-            try:
-                s['pattern_near_pct'] = max(0.1, float(e_pat_near.get().strip()))
-            except (TypeError, ValueError):
-                s['pattern_near_pct'] = market_pattern.DEFAULT_PARAMS['near_pct']
-            s['pattern_list'] = [pid for pid, v in pat_vars.items() if v.get()]
+            # 【ADR-120】pattern_* 幾個欄位已移除 (盤勢/型態搬到主圖【盤勢判斷】)。
+            # 舊策略檔裡殘留的 pattern_* 不再被讀取,留著也無害,不主動清掉——
+            # 萬一使用者想降版回舊程式,資料還在。
             return s
 
         def _save():
@@ -11771,15 +11723,18 @@ class StockTradingAppPro(tk.Tk):
             lb['dirty'] = True
 
     # ==================================================================
-    # 【ADR-102】量價支撐壓力 (Volume Profile)
+    # 【ADR-102 / ADR-120】主圖【盤勢判斷】
     #
-    # 計算在 core/volume_profile.py (純邏輯、可離線測試);這裡只負責
-    # 「決定用哪一段資料」與「畫到主圖上」。三種商品共用同一條路,
-    # 差別只在傳入的 asset_type/raw_symbol (價格箱寬度與 tick 對齊靠它們)。
+    # 兩個子項共用主圖上同一顆勾選鈕:
+    #   ① 量價支撐壓力 (Volume Profile,ADR-102) —— 畫水平線
+    #   ② 盤勢/型態偵測 (ADR-120,原本在終極波段策略裡) —— 寫日誌通知
+    # 計算分別在 core/volume_profile.py 與 core/market_pattern.py
+    # (純邏輯、可離線測試);設定正規化與通知去重在 core/regime_panel.py。
+    # 這裡只負責「決定用哪一段資料」「畫到主圖上」「把通知寫進日誌」。
     # ==================================================================
-    SR_RANGE_VISIBLE = '可見範圍'
-    SR_RANGE_FIXED = '固定N根'
-    SR_RANGE_MODES = (SR_RANGE_VISIBLE, SR_RANGE_FIXED)
+    SR_RANGE_VISIBLE = volume_profile.RANGE_VISIBLE
+    SR_RANGE_FIXED = volume_profile.RANGE_FIXED
+    SR_RANGE_MODES = volume_profile.RANGE_MODES
 
     def _sr_source_df(self, raw_df):
         """依目前模式決定要拿哪一段資料算支撐壓力。
@@ -11789,8 +11744,8 @@ class StockTradingAppPro(tk.Tk):
         """
         if raw_df is None or len(raw_df) == 0:
             return None
-        mode = getattr(self, '_sr_range_mode', self.SR_RANGE_VISIBLE)
-        n = int(getattr(self, '_sr_fixed_bars', 120) or 120)
+        mode = self.regime_settings.get('sr_range_mode', self.SR_RANGE_VISIBLE)
+        n = int(self.regime_settings.get('sr_fixed_bars', 120) or 120)
         if mode == self.SR_RANGE_FIXED:
             return raw_df.tail(max(20, n))
         # 可見範圍:draw_chart 畫的是 self.plot_df (已依縮放裁切);取不到就退回全量
@@ -11799,10 +11754,18 @@ class StockTradingAppPro(tk.Tk):
             return vis
         return raw_df.tail(max(20, n))
 
+    def _sr_active(self):
+        """支撐壓力現在該不該畫:【盤勢判斷】總開關 + 支撐壓力子項都要開。"""
+        if not getattr(self, 'regime_enabled_var', None) or not self.regime_enabled_var.get():
+            return False
+        if not getattr(self, 'sr_enabled_var', None) or not self.sr_enabled_var.get():
+            return False
+        return True
+
     def _draw_sr_levels(self, ax, raw_df):
         """在主圖畫支撐壓力水平線。任何例外都不可影響 K 線圖本身。"""
         self._sr_last_result = None
-        if not getattr(self, 'sr_enabled_var', None) or not self.sr_enabled_var.get():
+        if not self._sr_active():
             return
         try:
             src = self._sr_source_df(raw_df)
@@ -11811,7 +11774,7 @@ class StockTradingAppPro(tk.Tk):
             result = volume_profile.find_levels(
                 src, asset_type=self.asset_type,
                 raw_symbol=str(self.current_symbol or '').upper(),
-                max_levels=int(getattr(self, '_sr_max_levels', 6) or 6))
+                max_levels=int(self.regime_settings.get('sr_max_levels', 6) or 6))
             if not result or not result['levels']:
                 return
             self._sr_last_result = result
@@ -11842,12 +11805,6 @@ class StockTradingAppPro(tk.Tk):
             # 支撐壓力只是輔助資訊,絕不能因為它出錯就讓整張 K 線圖畫不出來
             self.log_message(f"【支撐壓力】計算失敗 ({type(e).__name__}: {e}),本次略過繪製。")
 
-    def _sr_toggle(self):
-        """切換顯示/隱藏後重畫 (需要重畫才能加上或移除水平線)。"""
-        if self.current_df is not None:
-            self.draw_chart(self.current_df)
-        self._sr_log_summary()
-
     def _sr_log_summary(self):
         """把這次算出的點位摘要寫進系統日誌,方便拿數字去掛單或設停損。"""
         r = getattr(self, '_sr_last_result', None)
@@ -11858,10 +11815,198 @@ class StockTradingAppPro(tk.Tk):
             self.log_message(f"　　{lv['role']} {lv['price_str']}"
                              f" (強度 {lv['strength']:.2f}) {lv['label']}")
 
-    def _sr_set_range_mode(self, mode):
-        self._sr_range_mode = mode
+    # ------------------------------------------------------------------
+    # 【ADR-120】盤勢判斷:總開關 / 設定 / 型態通知
+    # ------------------------------------------------------------------
+    def _regime_toggle(self):
+        """主圖那顆【盤勢判斷】勾選鈕:存檔 → 重畫 → 立刻評估一次。
+
+        重畫是必要的:支撐壓力的水平線要靠重畫才會加上或移除。
+        """
+        self.regime_settings['enabled'] = bool(self.regime_enabled_var.get())
+        self._save_regime_settings()
+        # 關掉再打開時,使用者會期待「再通知一次現在的狀態」,所以清掉去重狀態。
+        self._regime_notify_state = {}
         if self.current_df is not None:
             self.draw_chart(self.current_df)
+        self._sr_log_summary()
+        if not self.regime_settings['enabled']:
+            self.log_message("【盤勢判斷】已關閉。")
+
+    def _save_regime_settings(self):
+        """把面板設定寫回 app_settings.json (整份存,讀回來再正規化)。"""
+        try:
+            self.app_settings['regime_panel'] = regime_panel.normalize(self.regime_settings)
+            config_store.save_app_settings(self.app_settings_file, self.app_settings)
+        except Exception as e:
+            self.log_message(f"【盤勢判斷】設定儲存失敗 ({type(e).__name__}: {e}),本次僅套用於記憶體。")
+
+    def _regime_check(self, raw_df):
+        """主圖畫完後評估盤勢/型態,只把「新出現的」寫進系統日誌。
+
+        【為什麼一定要去重】主圖每縮放/平移一次就重畫一次;若照
+        evaluate_all() 的結果直接通知,同一個型態會在同一根 K 棒上被通知
+        幾十次。去重規則是純函式 (core/regime_panel.plan_notifications),
+        離線可測。
+
+        通知前綴用「【盤勢判斷】」——會被 telegram_notify.is_quant_message()
+        以外的一般路徑處理,只寫系統日誌,不影響任何委託。
+        任何例外都不可影響 K 線圖本身 (跟支撐壓力同樣的理由)。
+        """
+        try:
+            sym = str(self.current_symbol or '').upper()
+            tf = self.timeframe_var.get()
+            if not regime_panel.should_evaluate(self.regime_settings, sym, tf):
+                return
+            if raw_df is None or len(raw_df) < 10:
+                return
+            signals = market_pattern.evaluate_all(
+                raw_df, regime_panel.pattern_params(self.regime_settings))
+            if not signals:
+                return
+            bar_date = str(raw_df.index[-1]).split(' ')[0]
+            prev = (self._regime_notify_state or {}).get(sym)
+            msgs, new_state = regime_panel.plan_notifications(signals, prev, bar_date)
+            self._regime_notify_state[sym] = new_state
+            if msgs:
+                name = self.current_stock_name or sym
+                self.log_message(f"【盤勢判斷】{name} {bar_date} {tf}偵測到:" + "；".join(msgs))
+        except Exception as e:
+            self.log_message(f"【盤勢判斷】型態偵測失敗 ({type(e).__name__}: {e}),本次略過。")
+
+    def open_regime_settings(self):
+        """【盤勢判斷】設定:支撐壓力與盤勢/型態兩個子項各自可勾選。"""
+        dlg = tk.Toplevel(self)
+        dlg.title("盤勢判斷 設定")
+        dlg.configure(bg="#1A2026")
+        self.center_window(dlg, 720, 620)
+        dlg.transient(self)
+        try:
+            dlg.lift(); dlg.focus_force()
+        except Exception:
+            pass
+
+        s = regime_panel.normalize(self.regime_settings)
+
+        tk.Label(dlg, text="【盤勢判斷】主圖上的兩項判斷,各自可勾選",
+                 bg="#1A2026", fg="#FFCA28", font=('微軟正黑體', 11, 'bold')).pack(
+                 anchor='w', padx=12, pady=(10, 4))
+
+        # ---- 子項①:量價支撐壓力 ----
+        sr_fr = tk.LabelFrame(dlg, text=" ① 量價支撐壓力 (畫在主圖) ", bg="#12181F",
+                              fg="#00E676", font=('微軟正黑體', 10, 'bold'))
+        sr_fr.pack(fill=tk.X, padx=12, pady=(4, 6))
+        v_sr = tk.BooleanVar(value=s['sr_enabled'])
+        tk.Checkbutton(sr_fr, text="啟用", variable=v_sr, bg="#12181F", fg="#00E676",
+                       selectcolor="#2A323D", activebackground="#12181F",
+                       font=('微軟正黑體', 9)).grid(row=0, column=0, sticky='w', padx=6, pady=4)
+        tk.Label(sr_fr, text="計算範圍", bg="#12181F", fg="white",
+                 font=('微軟正黑體', 9)).grid(row=0, column=1, sticky='e', padx=(10, 2))
+        cb_range = ttk.Combobox(sr_fr, values=list(volume_profile.RANGE_MODES), width=9,
+                                state="readonly", style='BlackText.TCombobox')
+        cb_range.set(s['sr_range_mode'])
+        cb_range.grid(row=0, column=2, padx=2)
+        tk.Label(sr_fr, text="固定N根", bg="#12181F", fg="white",
+                 font=('微軟正黑體', 9)).grid(row=0, column=3, sticky='e', padx=(10, 2))
+        e_bars = tk.Entry(sr_fr, width=6, bg="#2A323D", fg="white", justify="center")
+        e_bars.insert(0, str(s['sr_fixed_bars'])); e_bars.grid(row=0, column=4, padx=2)
+        tk.Label(sr_fr, text="最多幾條", bg="#12181F", fg="white",
+                 font=('微軟正黑體', 9)).grid(row=0, column=5, sticky='e', padx=(10, 2))
+        e_lv = tk.Entry(sr_fr, width=6, bg="#2A323D", fg="white", justify="center")
+        e_lv.insert(0, str(s['sr_max_levels'])); e_lv.grid(row=0, column=6, padx=(2, 6))
+
+        # ---- 子項②:盤勢/型態偵測 ----
+        pat_fr = tk.LabelFrame(dlg, text=" ② 盤勢/型態偵測 (只通知,不下單) ", bg="#12181F",
+                               fg="#29B6F6", font=('微軟正黑體', 10, 'bold'))
+        pat_fr.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 6))
+        v_pat = tk.BooleanVar(value=s['pattern_enabled'])
+        tk.Checkbutton(pat_fr, text="啟用", variable=v_pat, bg="#12181F", fg="#29B6F6",
+                       selectcolor="#2A323D", activebackground="#12181F",
+                       font=('微軟正黑體', 9)).grid(row=0, column=0, sticky='w', padx=6, pady=4)
+        tk.Label(pat_fr, text="區間天數", bg="#12181F", fg="white",
+                 font=('微軟正黑體', 9)).grid(row=0, column=1, sticky='e', padx=(10, 2))
+        e_lb = tk.Entry(pat_fr, width=6, bg="#2A323D", fg="white", justify="center")
+        e_lb.insert(0, str(s['pattern_lookback'])); e_lb.grid(row=0, column=2, padx=2)
+        tk.Label(pat_fr, text="接近邊界%", bg="#12181F", fg="white",
+                 font=('微軟正黑體', 9)).grid(row=0, column=3, sticky='e', padx=(10, 2))
+        e_near = tk.Entry(pat_fr, width=6, bg="#2A323D", fg="white", justify="center")
+        e_near.insert(0, str(s['pattern_near_pct'])); e_near.grid(row=0, column=4, padx=2)
+        tk.Button(pat_fr, text="查看型態說明", bg="#5A6472", fg="white", relief="flat",
+                  font=('微軟正黑體', 8),
+                  command=lambda: self._show_pattern_catalog(dlg)).grid(row=0, column=5, padx=(10, 6))
+
+        v_idx = tk.BooleanVar(value=s['index_only'])
+        tk.Checkbutton(pat_fr, text="只在加權指數判斷 (取消勾選則主圖任何商品的日K都會判斷)",
+                       variable=v_idx, bg="#12181F", fg="white", selectcolor="#2A323D",
+                       activebackground="#12181F", font=('微軟正黑體', 9)).grid(
+                       row=1, column=0, columnspan=6, sticky='w', padx=6)
+        tk.Label(pat_fr, text="※ 型態的定義以「一天一根」為前提,因此只在日K評估;"
+                             "偵測到新型態會寫進下方系統日誌。",
+                 bg="#12181F", fg="#8A99AD", font=('微軟正黑體', 8)).grid(
+                 row=2, column=0, columnspan=6, sticky='w', padx=6, pady=(2, 4))
+
+        pat_vars = {}
+        grid_fr = tk.Frame(pat_fr, bg="#12181F")
+        grid_fr.grid(row=3, column=0, columnspan=6, sticky='w', padx=6, pady=(2, 8))
+        on_now = set(s['pattern_list'])
+        for i, item in enumerate(market_pattern.PATTERN_CATALOG):
+            v = tk.BooleanVar(value=item['id'] in on_now)
+            pat_vars[item['id']] = v
+            tk.Checkbutton(grid_fr, text=item['label'], variable=v, bg="#12181F", fg="white",
+                           selectcolor="#2A323D", activebackground="#12181F",
+                           font=('微軟正黑體', 8)).grid(row=i // 2, column=i % 2,
+                                                        sticky='w', padx=6, pady=1)
+
+        status = tk.Label(dlg, text="", bg="#1A2026", fg="#FFCA28", font=('微軟正黑體', 9))
+        status.pack(anchor='w', padx=12)
+
+        def _apply():
+            self.regime_settings = regime_panel.normalize({
+                'enabled': bool(self.regime_enabled_var.get()),
+                'sr_enabled': bool(v_sr.get()),
+                'sr_range_mode': cb_range.get(),
+                'sr_fixed_bars': e_bars.get().strip(),
+                'sr_max_levels': e_lv.get().strip(),
+                'pattern_enabled': bool(v_pat.get()),
+                'pattern_lookback': e_lb.get().strip(),
+                'pattern_near_pct': e_near.get().strip(),
+                'pattern_list': [pid for pid, v in pat_vars.items() if v.get()],
+                'index_only': bool(v_idx.get()),
+            })
+            self.sr_enabled_var.set(self.regime_settings['sr_enabled'])
+            self._save_regime_settings()
+            # 參數變了,舊的去重狀態不再代表「已經通知過現在這組設定的結果」。
+            self._regime_notify_state = {}
+            if self.current_df is not None:
+                self.draw_chart(self.current_df)
+            self._sr_log_summary()
+            status.config(text="✓ 已套用並儲存", fg="#00E676")
+
+        btns = tk.Frame(dlg, bg="#1A2026"); btns.pack(fill=tk.X, padx=12, pady=(4, 10))
+        tk.Button(btns, text="套用並儲存", bg="#29B6F6", fg="black", relief="flat",
+                  font=('微軟正黑體', 10, 'bold'), padx=14, pady=3, command=_apply).pack(side=tk.LEFT)
+        tk.Button(btns, text="關閉", bg="#2A323D", fg="white", relief="flat",
+                  font=('微軟正黑體', 10), padx=16, pady=3, command=dlg.destroy).pack(side=tk.RIGHT)
+
+    def _show_pattern_catalog(self, parent=None):
+        """型態說明清單 (唯讀)。原本在終極波段策略編輯器裡,ADR-120 搬到主圖。"""
+        info = tk.Toplevel(parent or self)
+        info.title("盤勢/型態判斷清單 (共{}種)".format(len(market_pattern.PATTERN_CATALOG)))
+        info.configure(bg="#1A2026")
+        self.center_window(info, 640, 480)
+        info.transient(parent or self)
+        try:
+            info.lift(); info.focus_force()
+        except Exception:
+            pass
+        txt = tk.Text(info, bg="#12161A", fg="white", font=('微軟正黑體', 9),
+                      wrap='word', relief='flat')
+        txt.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        for item in market_pattern.PATTERN_CATALOG:
+            txt.insert(tk.END, f"【{item['category']}】{item['label']}\n{item['desc']}\n\n")
+        txt.config(state='disabled')
+        tk.Button(info, text="關閉", bg="#2A323D", fg="white", relief="flat",
+                  command=info.destroy).pack(pady=(0, 10))
 
     # ======================================================================
     # 【ADR-103】全方位選股

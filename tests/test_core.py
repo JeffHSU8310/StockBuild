@@ -46,6 +46,7 @@ from core import chukuangren_band
 from core import telegram_notify
 from core import telegram_control
 from core import market_pattern
+from core import regime_panel
 from core import chips_parser
 from core import chips_features
 from core import volume_profile
@@ -4122,6 +4123,7 @@ class TestChipsParser(unittest.TestCase):
 
     def test_verify_tpex_layout_passes_on_consistent_data(self):
         ok, msg = chips_parser.verify_tpex_layout(self._tpex_payload())
+        ok = (ok == chips_parser.LAYOUT_OK)
         self.assertTrue(ok, msg)
 
     def test_verify_tpex_layout_detects_column_reshuffle(self):
@@ -4129,6 +4131,7 @@ class TestChipsParser(unittest.TestCase):
         bad = self._tpex_payload()
         bad['tables'][0]['data'][0][10] = '99999'    # 破壞「外資合計=外資+外資自營商」
         ok, msg = chips_parser.verify_tpex_layout(bad)
+        ok = (ok == chips_parser.LAYOUT_OK)
         self.assertFalse(ok)
         self.assertIn('不符恆等式', msg)
 
@@ -5547,6 +5550,167 @@ class TestUnitFormat(unittest.TestCase):
         self.assertIs(unit_format.is_positive('1,234'), True)
         self.assertIsNone(unit_format.is_positive(unit_format.MISSING))
         self.assertIsNone(unit_format.is_positive(''))
+
+
+
+class TestRegimePanel(unittest.TestCase):
+    """【ADR-120】主圖【盤勢判斷】面板的純邏輯:設定正規化 + 通知去重。
+
+    去重規則是這次改動裡最容易出錯、又最難在 GUI 上發現的地方 —— 主圖每
+    縮放/平移一次就重畫一次,少了去重就會被同一個型態通知洗版,而畫面上
+    只會看到日誌一直捲,不會有任何錯誤訊息。
+    """
+
+    # ---------- normalize ----------
+    def test_normalize_empty_gives_working_defaults(self):
+        """第一次啟動 (設定檔沒有這一段) 也要拿得到一份能用的設定。"""
+        for raw in (None, {}, [], 'x', 0):
+            s = regime_panel.normalize(raw)
+            self.assertEqual(set(s), set(regime_panel.PANEL_DEFAULTS), repr(raw))
+            self.assertIn(s['sr_range_mode'], volume_profile.RANGE_MODES)
+            self.assertTrue(s['pattern_list'])
+
+    def test_normalize_clamps_absurd_values(self):
+        """設定檔被手動改壞時,不可以讓離譜的數值傳進計算層。"""
+        s = regime_panel.normalize({'sr_fixed_bars': 0, 'sr_max_levels': 999,
+                                    'pattern_lookback': 1, 'pattern_near_pct': -5})
+        self.assertEqual(s['sr_fixed_bars'], 20)
+        self.assertEqual(s['sr_max_levels'], 20)
+        self.assertEqual(s['pattern_lookback'], 10)
+        self.assertEqual(s['pattern_near_pct'], 0.1)
+
+    def test_normalize_rejects_unknown_range_mode(self):
+        s = regime_panel.normalize({'sr_range_mode': '亂打的'})
+        self.assertEqual(s['sr_range_mode'], regime_panel.PANEL_DEFAULTS['sr_range_mode'])
+
+    def test_normalize_bad_types_fall_back(self):
+        s = regime_panel.normalize({'sr_fixed_bars': 'abc', 'pattern_near_pct': None,
+                                    'pattern_lookback': float('nan')})
+        self.assertEqual(s['sr_fixed_bars'], regime_panel.PANEL_DEFAULTS['sr_fixed_bars'])
+        self.assertEqual(s['pattern_near_pct'], regime_panel.PANEL_DEFAULTS['pattern_near_pct'])
+        self.assertEqual(s['pattern_lookback'], regime_panel.PANEL_DEFAULTS['pattern_lookback'])
+
+    def test_normalize_empty_pattern_list_is_respected(self):
+        """「全部取消勾選」跟「舊設定檔沒存這個欄位」是不同的意思:
+        前者要尊重使用者的選擇,後者才給預設全開。"""
+        self.assertEqual(regime_panel.normalize({'pattern_list': []})['pattern_list'], [])
+        self.assertTrue(regime_panel.normalize({})['pattern_list'])
+
+    def test_normalize_drops_unknown_pattern_ids(self):
+        s = regime_panel.normalize({'pattern_list': ['regime', '不存在的型態']})
+        self.assertEqual(s['pattern_list'], ['regime'])
+
+    def test_normalize_does_not_mutate_input_or_defaults(self):
+        raw = {'pattern_list': ['regime']}
+        regime_panel.normalize(raw)
+        self.assertEqual(raw, {'pattern_list': ['regime']})
+        regime_panel.normalize({})['pattern_list'].append('汙染')
+        self.assertNotIn('汙染', regime_panel.PANEL_DEFAULTS['pattern_list'])
+
+    def test_pattern_params_feeds_evaluate_all(self):
+        """正規化後的設定要能直接餵給 market_pattern.evaluate_all。"""
+        p = regime_panel.pattern_params({'pattern_lookback': 30, 'pattern_near_pct': 1.5,
+                                         'pattern_list': ['regime']})
+        self.assertEqual(p['lookback'], 30)
+        self.assertEqual(p['near_pct'], 1.5)
+        self.assertEqual(p['enabled_patterns'], ('regime',))
+        df = pd.DataFrame({'Open': range(100, 160), 'High': range(101, 161),
+                           'Low': range(99, 159), 'Close': range(100, 160)},
+                          index=pd.date_range('2026-01-01', periods=60, freq='B'))
+        sigs = market_pattern.evaluate_all(df, p)
+        self.assertTrue(all(s['pattern'].startswith(('regime', 'near_range')) for s in sigs), sigs)
+
+    # ---------- should_evaluate ----------
+    def test_should_evaluate_requires_both_switches(self):
+        base = {'enabled': True, 'pattern_enabled': True}
+        self.assertTrue(regime_panel.should_evaluate(base, '^TWII', '日K'))
+        self.assertFalse(regime_panel.should_evaluate({**base, 'enabled': False}, '^TWII', '日K'))
+        self.assertFalse(regime_panel.should_evaluate({**base, 'pattern_enabled': False},
+                                                      '^TWII', '日K'))
+
+    def test_should_evaluate_only_on_daily(self):
+        """型態的定義以「一天一根」為前提,分K上算出來的沒有意義。"""
+        base = {'enabled': True, 'pattern_enabled': True}
+        for tf in ('5分K', '60分K', '周K', '月K', '', None):
+            self.assertFalse(regime_panel.should_evaluate(base, '^TWII', tf), repr(tf))
+
+    def test_should_evaluate_index_only_switch(self):
+        base = {'enabled': True, 'pattern_enabled': True, 'index_only': True}
+        self.assertTrue(regime_panel.should_evaluate(base, '^twii', '日K'))
+        self.assertFalse(regime_panel.should_evaluate(base, '2330', '日K'))
+        self.assertTrue(regime_panel.should_evaluate({**base, 'index_only': False},
+                                                     '2330', '日K'))
+
+    def test_is_index_symbol_covers_both_naming(self):
+        """^TWII 是本程式內部代碼,IX0001/TSE 是 shioaji 側的寫法 (ADR-114)。"""
+        for sym in ('^TWII', '^twii', 'TWII', 'TSE', 'TSE001', 'IX0001'):
+            self.assertTrue(regime_panel.is_index_symbol(sym), sym)
+        for sym in ('^TWOII', 'IX0043', '2330', '', None):
+            self.assertFalse(regime_panel.is_index_symbol(sym), sym)
+
+    # ---------- plan_notifications ----------
+    ONESHOT = {'pattern': 'double_top', 'label': 'M頭', 'bias': '偏空'}
+    REGIME_RANGE = {'pattern': 'regime', 'label': '目前盤勢:區間整理', 'bias': ''}
+    REGIME_UP = {'pattern': 'regime', 'label': '目前盤勢:上升趨勢', 'bias': ''}
+
+    def test_first_evaluation_notifies_everything(self):
+        msgs, st = regime_panel.plan_notifications([self.ONESHOT, self.REGIME_RANGE],
+                                                   None, '2026-07-28')
+        self.assertEqual(msgs, ['M頭[偏空]', '目前盤勢:區間整理'])
+        self.assertEqual(st['date'], '2026-07-28')
+
+    def test_redraw_same_bar_does_not_repeat(self):
+        """主圖縮放/平移會重畫,重畫不可以再通知一次同一個型態。"""
+        sigs = [self.ONESHOT, self.REGIME_RANGE]
+        msgs, st = regime_panel.plan_notifications(sigs, None, '2026-07-28')
+        self.assertTrue(msgs)
+        for _ in range(5):
+            msgs, st = regime_panel.plan_notifications(sigs, st, '2026-07-28')
+            self.assertEqual(msgs, [], "同一根K棒重畫不可重複通知")
+
+    def test_oneshot_notifies_again_on_a_new_bar(self):
+        """換到新的一根K棒,型態重新確認就是新的事件,要再通知。"""
+        _, st = regime_panel.plan_notifications([self.ONESHOT], None, '2026-07-28')
+        msgs, _ = regime_panel.plan_notifications([self.ONESHOT], st, '2026-07-29')
+        self.assertEqual(msgs, ['M頭[偏空]'])
+
+    def test_persistent_state_silent_until_it_changes(self):
+        """盤勢連續 20 天都是「區間整理」不該連發 20 則通知;變了才通知。"""
+        _, st = regime_panel.plan_notifications([self.REGIME_RANGE], None, '2026-07-28')
+        msgs, st = regime_panel.plan_notifications([self.REGIME_RANGE], st, '2026-07-29')
+        self.assertEqual(msgs, [], "持續狀態沒變不可重複通知")
+        msgs, st = regime_panel.plan_notifications([self.REGIME_UP], st, '2026-07-30')
+        self.assertEqual(msgs, ['目前盤勢:上升趨勢'])
+
+    def test_persistent_disappearing_then_returning_notifies_again(self):
+        _, st = regime_panel.plan_notifications([self.REGIME_RANGE], None, '2026-07-28')
+        msgs, st = regime_panel.plan_notifications([], st, '2026-07-29')
+        self.assertEqual(msgs, [])
+        msgs, st = regime_panel.plan_notifications([self.REGIME_RANGE], st, '2026-07-30')
+        self.assertEqual(msgs, ['目前盤勢:區間整理'])
+
+    def test_plan_does_not_mutate_previous_state(self):
+        """呼叫端要靠「舊 state」判斷,函式偷改它會讓下一次判斷失準。"""
+        _, st = regime_panel.plan_notifications([self.ONESHOT], None, '2026-07-28')
+        snapshot = json.loads(json.dumps(st))
+        regime_panel.plan_notifications([self.ONESHOT, self.REGIME_RANGE], st, '2026-07-28')
+        self.assertEqual(st, snapshot)
+
+    def test_plan_survives_garbage_signals(self):
+        msgs, st = regime_panel.plan_notifications(
+            [None, 'x', {}, {'pattern': ''}, self.ONESHOT], None, '2026-07-28')
+        self.assertEqual(msgs, ['M頭[偏空]'])
+        self.assertIsInstance(st, dict)
+
+    def test_persistent_ids_cover_the_stateful_signals(self):
+        """evaluate_all 會吐出的「持續狀態」訊號都必須列進去 —— 漏一個就會
+        變成每天/每次重畫都通知一次。"""
+        for pid in ('regime', 'near_range_high', 'near_range_low',
+                    'triangle_symmetrical', 'triangle_ascending',
+                    'triangle_descending', 'wedge_rising', 'wedge_falling'):
+            self.assertIn(pid, regime_panel.PERSISTENT_PATTERN_IDS, pid)
+        self.assertNotIn('double_top', regime_panel.PERSISTENT_PATTERN_IDS)
+
 
 
 if __name__ == "__main__":
