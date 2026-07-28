@@ -4122,6 +4122,7 @@ class TestChipsParser(unittest.TestCase):
 
     def test_verify_tpex_layout_passes_on_consistent_data(self):
         ok, msg = chips_parser.verify_tpex_layout(self._tpex_payload())
+        ok = (ok == chips_parser.LAYOUT_OK)
         self.assertTrue(ok, msg)
 
     def test_verify_tpex_layout_detects_column_reshuffle(self):
@@ -4129,6 +4130,7 @@ class TestChipsParser(unittest.TestCase):
         bad = self._tpex_payload()
         bad['tables'][0]['data'][0][10] = '99999'    # 破壞「外資合計=外資+外資自營商」
         ok, msg = chips_parser.verify_tpex_layout(bad)
+        ok = (ok == chips_parser.LAYOUT_OK)
         self.assertFalse(ok)
         self.assertIn('不符恆等式', msg)
 

@@ -184,8 +184,18 @@ def _tpex_table(payload):
     return tabs[0] if tabs and isinstance(tabs[0], dict) else None
 
 
+# verify_tpex_layout 的三種結果。刻意用字串而不是 True/False:
+# 「沒有資料」與「版面壞了」的處理方式完全不同 (前者靜靜跳過,後者要大聲警告),
+# 用 bool 只能表達兩種狀態,呼叫端就被迫把它們當成同一件事。
+LAYOUT_OK = 'ok'
+NO_DATA = 'no_data'
+BAD_LAYOUT = 'bad'
+
+
 def verify_tpex_layout(payload):
-    """驗證櫃買欄位分組的三條恆等式是否仍成立。回傳 (ok, 說明)。
+    """驗證櫃買欄位分組的三條恆等式是否仍成立。
+
+    回傳 (狀態, 說明);狀態為 LAYOUT_OK / NO_DATA / BAD_LAYOUT。
 
     櫃買改版時欄位順序若變動,靠人眼很難發現 (數字照樣填得滿滿的,只是
     對應錯欄位)。這個檢查讓改版變成「看得見的失敗」而不是無聲的錯誤資料。
@@ -193,11 +203,16 @@ def verify_tpex_layout(payload):
     tb = _tpex_table(payload)
     rows = (tb or {}).get('data') or []
     if not rows:
-        return False, "沒有資料列可驗證"
+        # 【ADR-119】「沒有資料」不等於「版面壞了」。回溯很久以前的日期時,
+        # 櫃買端經常就是沒有那一天的資料 (端點涵蓋範圍有限、或該日無交易),
+        # 這是預期中的情況。原本跟版面驗證失敗共用同一個 False,呼叫端就會
+        # 對著每一個沒資料的日子印一次紅字警告 —— 使用者看到滿螢幕的
+        # 「版面驗證失敗」,反而會忽略真正的版面問題 (實機回報)。
+        return NO_DATA, "該日櫃買沒有資料 (通常是日期太早或當日無交易)"
     bad = []
     for r in rows:
         if len(r) <= _TPEX_TOTAL:
-            return False, f"欄位數不足 (應 >{_TPEX_TOTAL},實際 {len(r)})"
+            return BAD_LAYOUT, f"欄位數不足 (應 >{_TPEX_TOTAL},實際 {len(r)})"
         g = [to_num(r[i]) for i in _TPEX_NET]
         if g[2] != g[0] + g[1]:
             bad.append((r[0], '外資合計≠外資及陸資+外資自營商'))
@@ -206,8 +221,8 @@ def verify_tpex_layout(payload):
         elif to_num(r[_TPEX_TOTAL]) != g[2] + g[3] + g[6]:
             bad.append((r[0], '三大法人合計≠外資+投信+自營'))
     if bad:
-        return False, f"{len(bad)}/{len(rows)} 列不符恆等式,首例: {bad[0]}"
-    return True, f"{len(rows)} 列全部符合"
+        return BAD_LAYOUT, f"{len(bad)}/{len(rows)} 列不符恆等式,首例: {bad[0]}"
+    return LAYOUT_OK, f"{len(rows)} 列全部符合"
 
 
 def parse_tpex_stock_inst(payload, date_iso=None, drop_warrants=True):

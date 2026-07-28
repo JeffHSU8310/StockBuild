@@ -420,6 +420,14 @@ class StockTradingAppPro(tk.Tk):
         # 稍等 1.5 秒 (等視窗/元件都就緒) 再背景自動登入,達成「開一次不用管」。
         self.safe_after(1500, self._try_auto_login_on_start)
 
+    # 【ADR-119】按下 X 之後最多等這麼久,時間到一律強制結束 (見 on_app_close)。
+    CLOSE_HARD_DEADLINE = 8.0
+    # 診斷腳本要呼叫 on_app_close() 驗證關閉流程,但它自己還要繼續跑完其餘
+    # 案例 —— 看門狗會在時限到達時把診斷行程一起殺掉 (實測踩到:診斷輸出
+    # 整個空白、結束碼卻是 0)。留一個明確的開關讓診斷關掉它;production
+    # 一律是 True,不會有人去改。
+    CLOSE_FORCE_EXIT = True
+
     def on_app_close(self):
         """
         【ADR-012/ADR-014】視窗關閉時的收尾處理。
@@ -447,6 +455,22 @@ class StockTradingAppPro(tk.Tk):
         """
         self._closing = True
         self._qt_running = False  # 【ADR-035】關閉程式前先停自動交易,絕不在關閉過程下單
+        # 【ADR-119】關閉保底看門狗:使用者回報「執行一陣子後按 X 沒反應」。
+        # 這條路徑上每一步都已經有時限,但只要有任何一個第三方呼叫 (shioaji
+        # logout、子行程 wait) 卡在不會回來的地方,整個關閉就停在那裡,而使用者
+        # 只能去工作管理員砍。
+        #
+        # 這個執行緒不管主流程走到哪裡,時間到就強制結束行程。它是**保底**,
+        # 不是正常路徑 —— 正常情況下面的 os._exit(0) 會先執行到,看門狗根本
+        # 不會醒來 (daemon thread 隨行程一起消滅)。
+        def _force_exit():
+            time.sleep(self.CLOSE_HARD_DEADLINE)
+            os._exit(0)
+        if self.CLOSE_FORCE_EXIT:
+            try:
+                threading.Thread(target=_force_exit, daemon=True).start()
+            except Exception:
+                pass
         if HAS_SJ and self.api_logged_in:
             # 【第十輪修正 問題4】logout 原本在主執行緒同步呼叫:session 卡死/
             # 網路異常時 logout 會永遠不回來,視窗直接「沒有回應」、連關都關
@@ -4050,8 +4074,34 @@ class StockTradingAppPro(tk.Tk):
                             f"{total * self.CHIPS_REQUEST_INTERVAL * 4 / 60:.0f} 分鐘)。")
             ok_days = 0
             fails = {'market': 0, 'stock': 0, 'margin': 0, 'tpex': 0}
+            # 【ADR-119】累積緩衝:見下方寫檔次數的說明
+            pend_market, pend_margin, pend_stock = [], [], {}
+            no_tpex_days = 0        # 【ADR-119】櫃買沒資料的天數,最後彙總一次
+
+            def _flush_simple():
+                """把累積的市場法人/融資融券一次寫檔。"""
+                if pend_market:
+                    chips_store.upsert(chips_store.market_inst_path(self.CHIPS_BASE_DIR),
+                                       pd.concat(pend_market, ignore_index=True))
+                    pend_market.clear()
+                if pend_margin:
+                    chips_store.upsert(chips_store.margin_path(self.CHIPS_BASE_DIR),
+                                       pd.concat(pend_margin, ignore_index=True))
+                    pend_margin.clear()
+
+            def _flush_stock(ym=None):
+                """把累積的個股法人寫檔 (ym=None 代表全部)。"""
+                keys = [ym] if ym else list(pend_stock.keys())
+                for k in keys:
+                    frames = pend_stock.pop(k, None)
+                    if frames:
+                        chips_store.upsert(
+                            chips_store.stock_inst_path(self.CHIPS_BASE_DIR, k + '-01'),
+                            pd.concat(frames, ignore_index=True))
+
             for i, day in enumerate(days, 1):
                 if self._closing or self._chips_cancel:
+                    _flush_simple(); _flush_stock()      # 中止前先把抓到的存起來
                     self.safe_after(0, self.log_message, f"【籌碼】已中止 (完成 {i - 1}/{total} 日)。")
                     self.safe_after(0, set_status, f"已中止 ({i - 1}/{total})")
                     return
@@ -4066,7 +4116,7 @@ class StockTradingAppPro(tk.Tk):
                                                     {'dayDate': ymd, 'type': 'day', 'response': 'json'})
                     df = chips_parser.parse_twse_market_inst(payload, date_iso=iso)
                     if not df.empty:
-                        chips_store.upsert(chips_store.market_inst_path(self.CHIPS_BASE_DIR), df)
+                        pend_market.append(df)      # 【ADR-119】累積,不逐日寫檔
                         got_any = True
                 except Exception:
                     fails['market'] += 1
@@ -4078,7 +4128,7 @@ class StockTradingAppPro(tk.Tk):
                                                     {'date': ymd, 'selectType': 'MS', 'response': 'json'})
                     df = chips_parser.parse_twse_margin(payload, date_iso=iso)
                     if not df.empty:
-                        chips_store.upsert(chips_store.margin_path(self.CHIPS_BASE_DIR), df)
+                        pend_margin.append(df)      # 【ADR-119】累積,不逐日寫檔
                         got_any = True
                 except Exception:
                     fails['margin'] += 1
@@ -4104,8 +4154,13 @@ class StockTradingAppPro(tk.Tk):
                                                      'date': day.strftime('%Y/%m/%d'),
                                                      'id': '', 'response': 'json'})
                     # 櫃買欄位分組沒有官方名稱,是靠恆等式反推的;改版時要看得見
-                    ok_layout, why = chips_parser.verify_tpex_layout(payload)
-                    if not ok_layout:
+                    status, why = chips_parser.verify_tpex_layout(payload)
+                    if status == chips_parser.NO_DATA:
+                        # 【ADR-119】沒有資料是預期中的 (日期太早/當日無交易),
+                        # 靜靜跳過就好 —— 對每個沒資料的日子印一次紅字警告,
+                        # 只會讓真正的版面問題被淹沒在洗版裡。
+                        no_tpex_days += 1
+                    elif status != chips_parser.LAYOUT_OK:
                         self.safe_after(0, self.log_message,
                                         f"【籌碼-警告】{iso} 櫃買欄位版面驗證失敗 ({why}),"
                                         f"該日上櫃資料已略過,不寫入可能錯誤的籌碼。")
@@ -4119,10 +4174,23 @@ class StockTradingAppPro(tk.Tk):
                 time.sleep(self.CHIPS_REQUEST_INTERVAL)
 
                 if stock_frames:
-                    merged = pd.concat(stock_frames, ignore_index=True)
-                    chips_store.upsert(chips_store.stock_inst_path(self.CHIPS_BASE_DIR, iso), merged)
+                    # 【ADR-119】依「年月」分桶累積。原本每天都對月檔做一次
+                    # read → concat → 去重 → write;月檔會長到數 MB,10 年就是
+                    # 2364 次整檔重寫,而 pandas 這些運算是握著 GIL 做的 ——
+                    # 背景執行緒把 UI 執行緒餓死,使用者按 X 都沒反應 (P-48)。
+                    # 改成一個月只寫一次,寫檔次數從 2364 降到約 120。
+                    pend_stock.setdefault(iso[:7], []).append(
+                        pd.concat(stock_frames, ignore_index=True))
                 if got_any:
                     ok_days += 1
+                # 累積夠一個月就落地一次:全部堆到最後才寫的話,中途按停止或
+                # 關程式,這一整批就白抓了 (下載本身很貴,不能有這種風險)。
+                if len(pend_stock.get(iso[:7], [])) >= self.CHIPS_FLUSH_EVERY:
+                    _flush_stock(iso[:7])
+                if len(pend_market) >= self.CHIPS_FLUSH_EVERY:
+                    _flush_simple()
+
+            _flush_simple(); _flush_stock()      # 【ADR-119】日線段結束,把剩下的寫檔
 
             # (5) 期貨三大法人:支援日期區間,按月批次抓 (240 次 → 約 12 次)
             self.safe_after(0, set_status, "下載期貨籌碼 ...")
@@ -4146,6 +4214,12 @@ class StockTradingAppPro(tk.Tk):
             if bad:
                 msg += f";失敗 {', '.join(bad)} (可再按一次更新,已成功的不會重抓)"
             self.safe_after(0, self.log_message, msg)
+            if no_tpex_days:
+                # 彙總成一行,而不是每天印一次 —— 使用者要知道「有幾天沒上櫃資料」,
+                # 但不需要看 2000 行一模一樣的訊息。
+                self.safe_after(0, self.log_message,
+                                f"【籌碼】其中 {no_tpex_days} 個交易日櫃買端沒有資料 "
+                                f"(多為較早的日期,屬正常;上市資料不受影響)。")
             self.safe_after(0, set_status, f"完成:{ok_days}/{total} 日")
             self.safe_after(0, self._chips_refresh_view)
         except Exception as e:
@@ -4244,6 +4318,10 @@ class StockTradingAppPro(tk.Tk):
             self.btn_chips_stop.config(state=tk.DISABLED)
         except (tk.TclError, AttributeError):
             pass
+
+    # 【ADR-119】累積幾天才寫一次檔。太大→中途停止會白抓;太小→退回逐日
+    # read-modify-write 把 UI 餓死。一個月左右是兩者的平衡點。
+    CHIPS_FLUSH_EVERY = 20
 
     def _chips_start_update(self):
         """使用者按「更新籌碼」:抓近一年缺的日期。下載一律在背景執行緒。"""
@@ -4363,7 +4441,8 @@ class StockTradingAppPro(tk.Tk):
     def _chips_rows_futures(self, start_iso, end_iso):
         """期貨法人:預設看臺股期貨,可用代號欄過濾商品名稱關鍵字。"""
         df = chips_store.load_futures_inst_range(self.CHIPS_BASE_DIR, start_iso, end_iso)
-        heads = ['日期', '商品', '身份別', '未平倉淨額(口)', '未平倉淨額(千元)', '交易淨額(口)']
+        # 【ADR-119】未平倉金額原始單位是千元,換成台灣慣用的億 (同 ADR-118)。
+        heads = ['日期', '商品', '身份別', '未平倉淨額(口)', '未平倉淨額(億)', '交易淨額(口)']
         if df is None or df.empty:
             return heads, [], "本地尚無期貨籌碼,請按「更新籌碼」下載。"
         kw = (self.entry_chips_code.get() or '').strip()
@@ -4374,8 +4453,8 @@ class StockTradingAppPro(tk.Tk):
         sub = sub.sort_values(['Date', 'Investor'], ascending=[False, True]).head(300)
         note = (f"{'含「' + kw + '」' if kw else '臺股期貨'} 共 {len(sub)} 列"
                 f" (資料 {df['Date'].min()} ~ {df['Date'].max()};留空預設臺股期貨)")
-        rows = [(r['Date'], r['Product'], r['Investor'], self._chips_fmt_int(r['NetOI']),
-                 self._chips_fmt_int(r['NetOIAmount']), self._chips_fmt_int(r['NetTrade']))
+        rows = [(r['Date'], r['Product'], r['Investor'], unit_format.fmt_int(r['NetOI']),
+                 unit_format.fmt_yi(r['NetOIAmount'], '仟元'), unit_format.fmt_int(r['NetTrade']))
                 for _, r in sub.iterrows()]
         return heads, rows, note
 
@@ -6186,20 +6265,32 @@ class StockTradingAppPro(tk.Tk):
         # 作用中的欄位」——做B (執行商品) 或看A (訊號來源),由最後點過的欄位決定
         # (見 _qt_editor_symbol_target 的設定)。種類也一併自動判斷:做B→股票/期貨,
         # 看A→指數/期貨/股票 (看A可為指數)。
+        self._feed_symbol_to_editor(sym)
+
+    def _feed_symbol_to_editor(self, sym):
+        """把代碼帶進策略編輯器目前作用中的欄位 (做B 或 看A)。
+
+        【ADR-119】原本這段直接寫在「點自選股」裡,所以只有自選股能帶入;
+        使用者回報「看A做B 選指數時,也希望能直接點上方的指數帶入」——
+        上方指數走的是 load_index_chart(),完全沒有經過這段。抽成共用函式後
+        兩個入口行為一致,日後多一個入口也只要呼叫這一個函式。
+        """
         target = getattr(self, '_qt_editor_symbol_target', None)
-        if target is not None:
-            try:
-                dlg_ref, e_sym_ref, cb_tt_ref, lookup_cb, kind = target
-                if dlg_ref.winfo_exists():
-                    e_sym_ref.delete(0, tk.END)
-                    e_sym_ref.insert(0, sym)
-                    tt = (self._watch_trade_type_for_symbol(sym) if kind == 'A'
-                          else self._trade_type_for_symbol(sym))
-                    cb_tt_ref.set(tt)
-                    if lookup_cb:
-                        lookup_cb()
-            except Exception:
-                pass
+        if target is None:
+            return
+        try:
+            dlg_ref, e_sym_ref, cb_tt_ref, lookup_cb, kind = target
+            if not dlg_ref.winfo_exists():
+                return
+            e_sym_ref.delete(0, tk.END)
+            e_sym_ref.insert(0, sym)
+            tt = (self._watch_trade_type_for_symbol(sym) if kind == 'A'
+                  else self._trade_type_for_symbol(sym))
+            cb_tt_ref.set(tt)
+            if lookup_cb:
+                lookup_cb()
+        except Exception:
+            pass
 
     def add_to_wl(self):
         group = self.current_wl_name.get()
@@ -6221,6 +6312,9 @@ class StockTradingAppPro(tk.Tk):
         self.entry_symbol.delete(0, tk.END)
         self.entry_symbol.insert(0, symbol)
         self.start_fetch_thread()
+        # 【ADR-119】點上方的加權/櫃買指數時,也要能帶進策略編輯器 ——
+        # 「看A做B」的 A 常常就是指數,原本只有自選股能帶入,指數得手動打。
+        self._feed_symbol_to_editor(symbol)
 
     def set_timeframe(self, tf, fetch=True):
         self.timeframe_var.set(tf)

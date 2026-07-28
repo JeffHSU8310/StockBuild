@@ -46,6 +46,9 @@ for _attr, _fn in (('QT_STRATEGY_FILE', 'quant_strategies.json'),
         pass
     setattr(StockTradingAppPro, _attr, _tmp)
 
+# 【ADR-119】關掉「按 X 之後強制結束行程」的保底看門狗:診斷腳本會呼叫
+# on_app_close() 驗證關閉流程,但它自己還要繼續跑完其餘案例。
+StockTradingAppPro.CLOSE_FORCE_EXIT = False
 app = StockTradingAppPro()
 app.flush_after = getattr(app, "flush_after")  # 來自 _Tk mock
 
@@ -3027,6 +3030,86 @@ def _chips_units_and_history():
 
 run_case("ADR-118: 籌碼單位(張/億)/融資增減/資料年數可設定",
          _chips_units_and_history)
+
+def _stability_and_units_119():
+    """【ADR-119】使用者實機回報的四項。"""
+    from core import chips_parser as _cp
+    from core import unit_format as _uf
+    from data import chips_store as _cs3
+    import tempfile as _tf3
+
+    # --- 2. 「沒有資料」與「版面壞了」要分得開 ---
+    assert _cp.verify_tpex_layout({})[0] == _cp.NO_DATA, \
+        "空 payload 應回 NO_DATA 而不是版面失敗 (否則每個沒資料的日子都洗一次紅字)"
+    assert _cp.verify_tpex_layout({'tables': [{'data': []}]})[0] == _cp.NO_DATA
+    # 欄位數不足 = 真的版面問題
+    bad = {'tables': [{'data': [['1101', '台泥', 1, 2]]}]}
+    assert _cp.verify_tpex_layout(bad)[0] == _cp.BAD_LAYOUT, "欄位數不足應報版面問題"
+
+    # --- 3. 期貨未平倉金額:千元 → 億 ---
+    old_base = app.CHIPS_BASE_DIR
+    tmp = _tf3.mkdtemp()
+    orig_view = app._chips_view.get()
+    try:
+        app.CHIPS_BASE_DIR = tmp
+        fut = pd.DataFrame([{'Date': '2026-07-28', 'Product': '臺股期貨',
+                             'Investor': '外資及陸資', 'NetOI': -82255,
+                             'NetOIAmount': -684077301, 'NetTrade': -2544}])
+        _cs3.upsert(_cs3.futures_inst_path(tmp, '2026'), fut)
+        app._chips_view.set('futures')
+        app.entry_chips_code.delete(0, 'end')
+        app._chips_refresh_view()
+        heads = list(app.tree_chips['columns'])
+        assert '未平倉淨額(億)' in heads, f"期貨金額欄位沒換成億:{heads}"
+        assert '未平倉淨額(千元)' not in heads, heads
+        kids = app.tree_chips.get_children()
+        assert kids, "期貨籌碼沒有資料列"
+        v = app.tree_chips.item(kids[0], 'values')
+        # -684,077,301 仟元 = -6840.77 億
+        assert v[4] == '-6,840.77', f"未平倉金額換算錯誤:{v[4]}"
+        assert v[3] == '-82,255', f"口數不該被換算:{v[3]}"
+    finally:
+        app.CHIPS_BASE_DIR = old_base
+        app._chips_view.set(orig_view)
+
+    # --- 1. 點上方指數也要能帶進策略編輯器 ---
+    captured = {}
+    class _FakeDlg:
+        def winfo_exists(self): return True
+    class _FakeEntry:
+        def delete(self, *a): captured['cleared'] = True
+        def insert(self, i, v): captured['sym'] = v
+    class _FakeCb:
+        def set(self, v): captured['tt'] = v
+    orig_target = getattr(app, '_qt_editor_symbol_target', None)
+    orig_fetch = app.start_fetch_thread
+    try:
+        app.start_fetch_thread = lambda *a, **k: None
+        app._qt_editor_symbol_target = (_FakeDlg(), _FakeEntry(), _FakeCb(),
+                                        lambda: captured.setdefault('looked_up', True), 'A')
+        app.load_index_chart('^TWII')
+        assert captured.get('sym') == '^TWII', \
+            f"點上方指數沒有帶進編輯器 (實際 {captured.get('sym')!r})"
+        assert captured.get('tt') == '指數', f"種類應自動判斷成指數,實際 {captured.get('tt')!r}"
+        assert captured.get('looked_up'), "帶入後應觸發商品查詢"
+    finally:
+        app.start_fetch_thread = orig_fetch
+        app._qt_editor_symbol_target = orig_target
+
+    # --- 4. 關閉保底:看門狗常數存在且合理 ---
+    assert 0 < app.CLOSE_HARD_DEADLINE <= 30, \
+        f"關閉保底時限要有且合理,實際 {app.CLOSE_HARD_DEADLINE}"
+    src = open(stock_app_pro.__file__, encoding='utf-8').read()
+    assert 'CHIPS_FLUSH_EVERY' in src, "籌碼下載應改成批次寫檔 (逐日 read-modify-write 會餓死 UI)"
+    # 逐日寫檔的舊寫法不可再出現
+    assert 'chips_store.upsert(chips_store.market_inst_path(self.CHIPS_BASE_DIR), df)' not in src, \
+        "市場法人仍在逐日寫檔"
+    assert 'chips_store.upsert(chips_store.stock_inst_path(self.CHIPS_BASE_DIR, iso), merged)' not in src, \
+        "個股法人仍在逐日寫檔 (10年=2364次整檔重寫,GIL 會把 UI 餓死)"
+
+
+run_case("ADR-119: 櫃買無資料/期貨金額(億)/指數帶入編輯器/關閉保底",
+         _stability_and_units_119)
 
 print(f"{'案例':60s} 結果")
 print("-" * 76)
