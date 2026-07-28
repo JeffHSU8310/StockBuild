@@ -50,6 +50,26 @@ FUNDAMENTAL_FIELDS = {
 }
 
 
+def _text(v, default=''):
+    """把可能是 NaN / None 的欄位轉成乾淨字串。
+
+    【ADR-117】原本寫成 `str(v or '')` —— 這在 pandas 資料上是錯的:
+    **NaN 在 Python 是 truthy**,所以 `nan or ''` 得到的是 nan,再 `str()`
+    就變成字面上的 `'nan'` 顯示在畫面上 (使用者實機回報「還有 nan???」)。
+    合併全市場資料時,只要某檔股票在某一份來源缺漏就會產生 NaN,這不是罕見
+    情況。凡是「欄位可能來自 DataFrame」的地方都要用這個函式,不要用 `or`。
+    """
+    if v is None:
+        return default
+    try:
+        if pd.isna(v):
+            return default
+    except (TypeError, ValueError):
+        pass          # 不是純量 (list/dict 等) 就照原樣轉字串
+    s = str(v).strip()
+    return s if s and s.lower() != 'nan' else default
+
+
 def fundamental_label(cond):
     """把基本面條件轉成可讀文字,例如「本益比 <= 15 倍」。"""
     meta = FUNDAMENTAL_FIELDS.get(cond.get('field'))
@@ -223,13 +243,10 @@ def _pack_row(row, details, f_conds, ohlcv=None):
     last_close = _g(fp.COL_CLOSE)
     if last_close is None and ohlcv is not None and len(ohlcv):
         last_close = float(ohlcv['Close'].iloc[-1])
-    industry = row.get(fp.COL_INDUSTRY)
-    if industry is None or (isinstance(industry, float) and pd.isna(industry)):
-        industry = ''
     return {
-        'code': str(row.get(fp.COL_CODE)),
-        'name': str(row.get(fp.COL_NAME) or ''),
-        'industry': str(industry),
+        'code': _text(row.get(fp.COL_CODE)),
+        'name': _text(row.get(fp.COL_NAME)),
+        'industry': _text(row.get(fp.COL_INDUSTRY)),
         'close': last_close,
         'pe': _g(fp.COL_PE), 'pb': _g(fp.COL_PB), 'yield': _g(fp.COL_YIELD),
         'eps': _g(fp.COL_EPS), 'gross_margin': _g(fp.COL_GROSS_MARGIN),

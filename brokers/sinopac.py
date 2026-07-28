@@ -118,11 +118,16 @@ class SinopacBroker(BrokerClient):
             return []
 
     def list_accounts(self):
+        """[(account_id, 顯示文字)]。
+
+        【ADR-117】顯示文字的組法搬到 core/sj_compat.account_label():
+        1.7 把所有帳戶統一成同一個 Account 類別 (改用 account_type 欄位),
+        原本靠類別名稱判斷種類的寫法會讓三個帳戶顯示成完全一樣的字。
+        """
         out = []
         for a in self._accounts():
-            kind = type(a).__name__.replace('Account', '') or ''
-            name = getattr(a, 'username', '') or getattr(a, 'account_id', '')
-            out.append((self.account_id(a), f"{name} ({kind})".strip()))
+            aid = self.account_id(a)
+            out.append((aid, sj_compat.account_label(a, getattr(a, 'account_id', ''))))
         return out
 
     def account_object(self, account_id):

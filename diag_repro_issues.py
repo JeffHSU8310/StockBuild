@@ -2778,6 +2778,112 @@ def _shioaji_17_compat():
 run_case("ADR-114: shioaji 1.5.6/1.7 相容 (指數代碼/輕量合約/login參數)",
          _shioaji_17_compat)
 
+def _screener_columns_and_accounts():
+    """【ADR-117】使用者實機回報的三個問題。
+
+    1. 跑過回測之後再選股,表頭還是回測的 → 12 個值塞進 7 欄,完全對不起來
+    2. 結果出現字面上的 'nan'
+    3. 實單帳戶下拉三個帳號長得一模一樣,無從選起
+    """
+    def heads():
+        return [app.tree_sc.heading(c).get('text') if isinstance(app.tree_sc.heading(c), dict)
+                else app.tree_sc.heading(c) for c in app.tree_sc['columns']]
+
+    screen_res = {'rows': [{'code': '2330', 'name': '台積電', 'industry': '半導體業',
+                            'close': 600.0, 'pe': 15.0, 'pb': 3.0, 'yield': 2.0,
+                            'eps': 40.0, 'gross_margin': 55.0, 'revenue_yoy': 20.0,
+                            'roe': 30.0, 'matched': ['測試']}],
+                  'warnings': [], 'scanned': 1, 'passed': 1}
+    bt_res = {'metrics': {'periods': 2, 'total_return_pct': 7.07, 'buy_hold_pct': 7.25,
+                          'excess_pct': -0.18, 'max_drawdown_pct': 2.21,
+                          'win_rate': 0.5, 'period_win_rate': 0.5, 'total_pnl': 66843,
+                          'trades': 20, 'avg_picks': 10.0},
+              'periods': [{'signal_date': '2026-04-07', 'entry_date': '2026-04-08',
+                           'exit_date': '2026-05-06', 'picks': 10, 'pnl': -22123.0,
+                           'return_pct': -2.21}],
+              'holdings': [], 'warnings': [], 'fundamental_skipped': True,
+              'has_lookahead': False}
+
+    # --- 1. 選股 → 回測 → 再選股:表頭必須跟著切回來 ---
+    app._sc_fill_tree(screen_res)
+    h_screen = list(app.tree_sc['columns'])
+    assert len(h_screen) == 12, f"選股應有 12 欄,實際 {len(h_screen)}"
+
+    app._sc_show_backtest(bt_res, 20, 25)
+    assert len(app.tree_sc['columns']) == 7, "回測應切成 7 欄"
+
+    app._sc_fill_tree(screen_res)
+    assert len(app.tree_sc['columns']) == 12, \
+        "跑過回測後再選股,表頭沒有切回選股的 12 欄 —— 資料會塞錯欄位"
+    assert list(app.tree_sc['columns']) == h_screen, "選股欄位不一致"
+
+    # 資料列的欄位數要跟表頭一致 (對不起來的直接證據)
+    for iid in app.tree_sc.get_children():
+        vals = app.tree_sc.item(iid, 'values')
+        assert len(vals) == len(app.tree_sc['columns']), \
+            f"資料 {len(vals)} 欄 vs 表頭 {len(app.tree_sc['columns'])} 欄,對不起來"
+
+    # 反向:回測後資料列也要對齊
+    app._sc_show_backtest(bt_res, 20, 25)
+    for iid in app.tree_sc.get_children():
+        vals = app.tree_sc.item(iid, 'values')
+        assert len(vals) == len(app.tree_sc['columns']), "回測的資料與表頭欄位數不符"
+
+    # --- 2. 畫面上不可出現字面 'nan' ---
+    from core import market_screener as _ms
+    import numpy as _np
+    fund = _pd_for_nan()
+    r = _ms.screen(fund, None, conditions=[], fundamental_conds=[])
+    app._sc_fill_tree(r)
+    for iid in app.tree_sc.get_children():
+        for v in app.tree_sc.item(iid, 'values'):
+            assert str(v).strip().lower() != 'nan', f"表格出現 nan:{app.tree_sc.item(iid,'values')}"
+
+    # --- 3. 三個帳戶必須看得出差別 ---
+    class _AT:
+        def __init__(s, n): s.name = n
+    class _Acc:
+        def __init__(s, t, aid, user='許super', signed=True):
+            s.account_type = _AT(t); s.account_id = aid; s.username = user
+            s.signed = signed; s.broker_id = '9A95'
+    broker = app.brokers['sinopac']
+    orig = broker.api
+    class _Api:
+        def list_accounts(s):
+            return [_Acc('Stock', '1234567'), _Acc('Future', '7654321'),
+                    _Acc('Intl', '9999999', signed=False)]
+    try:
+        broker.api = _Api()
+        labels = [lab for _id, lab in broker.list_accounts()]
+        assert len(set(labels)) == 3, f"三個帳戶顯示成一樣的字,無從選起:{labels}"
+        assert any('證券' in l for l in labels), labels
+        assert any('期貨' in l for l in labels), labels
+        assert any('複委託' in l for l in labels), labels
+        assert all(any(ch.isdigit() for ch in l) for l in labels), \
+            "顯示文字一定要帶帳號 —— 種類與戶名都可能重複,只有帳號是唯一的"
+        assert any('未簽署' in l for l in labels), "未簽署的帳戶要標示出來 (送單會被退)"
+        ids = [i for i, _l in broker.list_accounts()]
+        assert len(set(ids)) == 3, f"account_id 必須唯一:{ids}"
+    finally:
+        broker.api = orig
+
+
+def _pd_for_nan():
+    return pd.DataFrame([
+        {'Code': '1591', 'Name': float('nan'), 'Industry': float('nan'),
+         'Close': 41.6, 'PE': None, 'PB': None, 'YieldPct': None, 'EPS': None,
+         'GrossMarginPct': None, 'RevenueYoYPct': None, 'MonthRevenue': None,
+         'Equity': None, 'ROEPct': None},
+        {'Code': '2072', 'Name': '世紀風電', 'Industry': '綠能環保', 'Close': 153.0,
+         'PE': 11.71, 'PB': 1.26, 'YieldPct': 4.63, 'EPS': 13.0,
+         'GrossMarginPct': 20.0, 'RevenueYoYPct': 5.0, 'MonthRevenue': 1.0,
+         'Equity': 1.0, 'ROEPct': 10.0},
+    ])
+
+
+run_case("ADR-117: 選股欄位切換/nan/帳戶可辨識 (實機回報)",
+         _screener_columns_and_accounts)
+
 print(f"{'案例':60s} 結果")
 print("-" * 76)
 for name, st, msg in results:

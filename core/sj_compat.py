@@ -191,3 +191,48 @@ def supported_kwargs(func, desired):
         else:
             dropped.append(k)
     return ok, dropped
+
+
+# ---------------------------------------------------------------------------
+# 帳戶顯示 (ADR-117)
+# ---------------------------------------------------------------------------
+# 【1.7 的變更】1.5.6 用不同的類別區分帳戶 (StockAccount / FutureAccount),
+# 1.7 把它們統一成同一個 `Account` 類別,改用 `account_type` 欄位區分
+# (Stock / Future / Intl)。原本靠 `type(a).__name__` 判斷的寫法在 1.7 會對
+# 每一個帳戶都得到空字串 —— 於是三個不同的帳戶在下拉選單裡長得一模一樣,
+# 使用者根本無從選起 (實機回報的問題)。
+ACCOUNT_KIND_ZH = {'Stock': '證券', 'Future': '期貨', 'Intl': '複委託'}
+
+
+def account_kind(acc):
+    """帳戶種類的英文代號 ('Stock'/'Future'/'Intl');判斷不出來回 ''。
+
+    先讀 1.7 的 `account_type`,再退回 1.5.6 的類別名稱。
+    """
+    at = getattr(acc, 'account_type', None)
+    name = getattr(at, 'name', None) or (str(at) if at is not None else '')
+    name = str(name or '').strip()
+    if name and name.lower() not in ('none', ''):
+        # 1.7 的 enum 字串可能是 'AccountType.Stock' 這種形式,取最後一段
+        return name.split('.')[-1]
+    cls = type(acc).__name__.replace('Account', '').strip()
+    return cls
+
+
+def account_label(acc, acc_id=''):
+    """下拉選單顯示的文字。
+
+    **一定要帶帳號**:種類與戶名都可能重複 (同一個人有兩個證券戶就長一樣),
+    只有帳號是唯一的。使用者要能一眼看出「這三個是不同的東西」。
+    未簽署的帳戶標出來 —— 那種帳戶送單會被券商退,先看到比較好。
+    """
+    kind = account_kind(acc)
+    kind_zh = ACCOUNT_KIND_ZH.get(kind, kind or '未知類別')
+    aid = str(acc_id or getattr(acc, 'account_id', '') or '').strip()
+    user = str(getattr(acc, 'username', '') or '').strip()
+    parts = [f'{kind_zh} {aid}'.strip()]
+    if user:
+        parts.append(user)
+    if getattr(acc, 'signed', None) is False:
+        parts.append('⚠未簽署')
+    return '｜'.join(parts)

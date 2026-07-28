@@ -11717,6 +11717,41 @@ class StockTradingAppPro(tk.Tk):
                     time.sleep(self.SC_REQUEST_INTERVAL * attempt * 2)
         return None, last
 
+    # 【ADR-117】選股結果表有兩種欄位配置:選股結果 12 欄、回測結果 7 欄。
+    #
+    # 原本「選股」的欄位寫在建構函式裡、「回測」的欄位寫在 _sc_show_backtest
+    # 裡,而且**只有回測那邊會重設欄位**。結果是:跑過一次回測之後,再按
+    # 「開始選股」,資料是選股的、表頭卻還是回測的 (期別/訊號日/買進日…),
+    # 12 個值被塞進 7 個欄位,完全對不起來 —— 這正是使用者回報的問題。
+    #
+    # 修法是把兩種配置都放這裡,兩個顯示函式各自呼叫 _sc_apply_columns()。
+    # 「畫資料前先把欄位設成自己要的」變成兩邊都必須做的同一件事,不可能
+    # 只有一邊記得。
+    SC_COLUMNS = {
+        'screen': (
+            ('code', '代號', 60), ('name', '名稱', 90), ('industry', '產業', 90),
+            ('close', '收盤', 70), ('pe', '本益比', 60), ('pb', '淨值比', 60),
+            ('yield', '殖利率%', 65), ('eps', 'EPS', 60), ('gm', '毛利%', 60),
+            ('yoy', '營收年增%', 80), ('roe', 'ROE%', 60), ('why', '符合條件', 260),
+        ),
+        'backtest': (
+            ('period', '期別', 60), ('signal', '訊號日', 110), ('entry', '買進日', 110),
+            ('exit', '賣出日', 110), ('picks', '選中檔數', 90),
+            ('pnl', '本期損益', 110), ('ret', '本期報酬%', 110),
+        ),
+    }
+
+    def _sc_apply_columns(self, mode):
+        """把結果表切換成指定模式的欄位配置 (畫資料前一定要先呼叫)。"""
+        spec = self.SC_COLUMNS[mode]
+        try:
+            self.tree_sc['columns'] = tuple(c for c, _h, _w in spec)
+            for cid, head, width in spec:
+                self.tree_sc.heading(cid, text=head)
+                self.tree_sc.column(cid, width=width, anchor="center")
+        except Exception as e:
+            self.log_message(f"【選股】切換欄位配置失敗: {type(e).__name__}: {e}")
+
     def _build_screener_panel(self, parent):
         self._sc_running = False
         self._sc_cancel = False
@@ -11792,19 +11827,10 @@ class StockTradingAppPro(tk.Tk):
 
         table = tk.Frame(parent, bg="#1A2026")
         table.pack(fill=tk.BOTH, expand=True, padx=4, pady=(2, 2))
-        cols = ('code', 'name', 'industry', 'close', 'pe', 'pb', 'yield', 'eps',
-                'gm', 'yoy', 'roe', 'why')
-        heads = {'code': '代號', 'name': '名稱', 'industry': '產業', 'close': '收盤',
-                 'pe': '本益比', 'pb': '淨值比', 'yield': '殖利率%', 'eps': 'EPS',
-                 'gm': '毛利%', 'yoy': '營收年增%', 'roe': 'ROE%', 'why': '符合條件'}
-        widths = {'code': 60, 'name': 90, 'industry': 90, 'close': 70, 'pe': 60,
-                  'pb': 60, 'yield': 65, 'eps': 60, 'gm': 60, 'yoy': 80,
-                  'roe': 60, 'why': 260}
+        cols = tuple(c for c, _h, _w in self.SC_COLUMNS['screen'])
         self.tree_sc = ttk.Treeview(table, columns=cols, show="headings", height=5,
                                     style='Trades.Treeview')
-        for c in cols:
-            self.tree_sc.heading(c, text=heads[c])
-            self.tree_sc.column(c, width=widths[c], anchor="center")
+        self._sc_apply_columns('screen')
         self.tree_sc.tag_configure('visible_row', foreground='#FFFFFF', background='#12161A')
         # 【鐵則1】回測結果的本期損益:賺紅、賠綠
         self.tree_sc.tag_configure('buy', foreground='#FF1744', background='#12161A')
@@ -12116,6 +12142,9 @@ class StockTradingAppPro(tk.Tk):
 
     def _sc_fill_tree(self, res):
         """【P-31】先備妥再刪再插。"""
+        # 【ADR-117】回測跑過之後表頭會停在回測那組,這裡一定要切回選股的
+        # 欄位,否則 12 個值會被塞進 7 個欄位,資料與表頭完全對不起來。
+        self._sc_apply_columns('screen')
         def _f(v, nd=2):
             if v is None:
                 return '--'
@@ -12233,15 +12262,11 @@ class StockTradingAppPro(tk.Tk):
         self.log_message(f"【選股回測】設定:每 {reb} 個交易日調倉一次、"
                          f"前 {min_bars} 天暖身、每期最多 10 檔等權、含手續費與交易稅。")
         # 用結果表顯示每一期
-        heads = ('期別', '訊號日', '買進日', '賣出日', '選中檔數', '本期損益', '本期報酬%')
         rows = [(str(i), p['signal_date'], p['entry_date'], p['exit_date'],
                  str(p['picks']), f"{p['pnl']:,.0f}", f"{p['return_pct']:+.2f}")
                 for i, p in enumerate(res['periods'], 1)]
         try:
-            self.tree_sc['columns'] = heads
-            for h in heads:
-                self.tree_sc.heading(h, text=h)
-                self.tree_sc.column(h, width=110, anchor="center")
+            self._sc_apply_columns('backtest')   # 【ADR-117】
             for i in self.tree_sc.get_children():
                 self.tree_sc.delete(i)
             for vals in rows:
