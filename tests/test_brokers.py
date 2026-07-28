@@ -7,8 +7,12 @@ tests/test_brokers.py — 券商 adapter 離線測試 (ADR-111)
 各家券商 SDK 的差異,一定會依賴 SDK。這裡用「照真實 SDK 原始碼複刻的假
 模組」來測,讓 adapter 在沒有帳號、沒有連線、甚至沒裝套件的環境也能驗證。
 
-【假 SDK 的簽名來源】不是憑印象寫的。是把 PyPI 上的 `kgisuperpy` 2.0.8
-wheel 解開後,逐一對照下列檔案抄出來的:
+【假 SDK 的簽名來源】不是憑印象寫的。是把 PyPI 上的 `kgisuperpy` wheel
+解開後,逐一對照下列檔案抄出來的:
+
+**已核對的版本:2.0.8 與 2.1.0 (2026-07-28 發布)。** 下列每一個簽名與列舉
+值在兩版之間**完全相同**,所以這份假 SDK 對最新版仍然有效。2.1.0 的改動
+集中在報價 (新增 Quote_sw / quote_starwave) 與選擇權欄位,與下單路徑無關。
   kgisuperpy/trading/_trade_base.py   Action/TimeInForce/PriceType/OddLot/OrderCond 的值
   kgisuperpy/trading/Order.py         create_order(action, symbol, qty, price,
                                       time_in_force, order_cond, odd_lot, name)

@@ -139,3 +139,49 @@ adapter 只能**明確拒單**，不像永豐可以沿用 SDK 預設。
 **最重要的一條**
 8. 同時啟用「一個走永豐、一個走凱基」的兩個策略，確認各自的單真的分別
    進到對應券商的帳戶——這是整個多券商功能的驗收點。
+
+---
+
+## 追記（2026-07-28）：對 kgisuperpy 2.1.0 重新核對
+
+使用者指出 PyPI 上的 `kgisuperpy`。查證後發現當天（2026-07-28）剛發布
+**2.1.0**，比本 ADR 當初分析的 2.0.8 新，因此重新核對一次。
+
+### 結論：adapter 與假 SDK 對 2.1.0 仍然有效
+
+用 AST 逐項比對（不看行號，避免行號位移造成誤判），本 adapter 依賴的每一項
+在兩版之間**完全相同**：
+
+| 項目 | 2.0.8 | 2.1.0 |
+|---|---|---|
+| `Action.Buy` / `.Sell` | `'B'` / `'S'` | 相同 |
+| `TimeInForce.ROD` | `0` | 相同 |
+| `PriceType.MKT` / `RangeMarket` / `LMT` | `'1'` / `'4'` / `0` | 相同 |
+| `OddLot.Common` / `Odd` / `Odd_AfterMarket` | `0` / `4` / `1` | 相同 |
+| `OrderCond.CASH` | `0` | 相同 |
+| 證券 `create_order(action, symbol, qty, price, time_in_force, order_cond, odd_lot, name)` | — | 相同 |
+| 期貨 `create_order(action, symbol, qty, price, time_in_force)` | — | 相同 |
+| `_set_Account(account)` / `_set_FutAccount(account)` | — | 相同 |
+| `_show_account()`、`_acc[account] = broker_id`、`account_flag` 的 F/O/S → 期貨/複委託/證券 | — | 相同 |
+| `login(person_id, person_pwd, simulation)` | — | 相同 |
+
+沒有新增或消失的列舉類別。
+
+### 2.1.0 改了什麼
+
+改動集中在**報價**與**選擇權**，與下單路徑無關：
+- 新增 `Quote_sw.py` 與 `marketdata/quote_starwave.*`（新的報價來源）
+- 某個 dataclass 增加 `cp` / `com_ym` / `strike_price` 欄位（選擇權相關）
+- 一個 `__repr__` 從註解狀態改為啟用
+
+順帶一提，`quote_starwave` 只提供 `win_amd64` 的 `.pyd`，沒有 Linux 版 ——
+不過本專案的報價一律走永豐（ADR-011），用不到這部分。
+
+### Python 3.14 的阻擋點**沒有**解除
+
+這是最重要的一項：2.1.0 仍然
+- 自帶的 C 擴充只編到 **cp39～cp313**（`msmp/*.so`、`*.pyd`），**沒有 cp314**
+- METADATA 仍**沒有** `Requires-Python`（所以 pip 照樣不會擋）
+- 仍 `Requires-Dist: numba`，且 `backtest/_BT_helper.py:1` 仍在載入時 `import numba`
+
+因此 **ADR-112 的獨立 3.13 子行程方案仍然必要**，不是可以省掉的一層。
