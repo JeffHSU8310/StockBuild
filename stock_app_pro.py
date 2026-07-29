@@ -8165,19 +8165,26 @@ class StockTradingAppPro(tk.Tk):
             # 才略過此檢查。期貨可依 futures_session ('day'/'day_night') 決定夜盤要
             # 不要做。收盤→開盤是自然銜接:runner 每 2 秒醒著,時鐘一進盤中,這裡
             # 就會放行,不需要任何人工重開;總開關 _qt_running 全程維持不動。
-            if (not _forced) and s.get('session_gate', True):
+            if not _forced:
                 tt = strategy_engine.trade_type_of(s)
                 include_night = (s.get('futures_session', 'day_night') != 'day')
-                if not market_session.is_market_open(tt, include_night=include_night):
-                    self._qt_log_session_closed(s, tt, include_night)
-                    continue
-                else:
-                    self._qt_note_session_open(s, tt, include_night)
+                if s.get('session_gate', True):
+                    if not market_session.is_market_open(tt, include_night=include_night):
+                        self._qt_log_session_closed(s, tt, include_night)
+                        continue
+                    else:
+                        self._qt_note_session_open(s, tt, include_night)
                 # 【ADR-121】開盤暖機:閘門剛打開的那幾秒不要去要 K 線。
-                # 使用者實測 08:45/09:00 各噴一次 kbars 逾時,而那正是本檔
+                # 使用者實測 08:45/09:00/15:00 各噴一次 kbars 逾時,而那正是本檔
                 # 策略當天第一次評估的時刻 —— 開盤瞬間全市場的用戶端同時打
                 # 同一支 API。這裡刻意放在 _qt_last_boundary 被寫入**之前**,
                 # 所以這根K棒沒有被吃掉,暖機結束後同一根照樣會評估到。
+                #
+                # 【ADR-123】暖機**不可以**巢狀在 session_gate 裡面 (原本是)。
+                # 暖機解決的是「別在開盤鐘響那一秒去打券商 API」,跟使用者想不想
+                # 要時段閘門是兩件事;而且關掉閘門的策略是 24 小時都在評估的,
+                # 撞上開盤瞬間的機率反而更高,結果卻完全沒有保護。
+                # 休市時 just_opened 本來就回 False,所以其餘時間行為不變。
                 if market_session.just_opened(tt, include_night=include_night,
                                               warmup_sec=self.QT_OPEN_WARMUP_SEC):
                     self._qt_log_open_warmup(s, tt, include_night)
@@ -9462,6 +9469,11 @@ class StockTradingAppPro(tk.Tk):
             # 【ADR-120】pattern_* 幾個欄位已移除 (盤勢/型態搬到主圖【盤勢判斷】)。
             # 舊策略檔裡殘留的 pattern_* 不再被讀取,留著也無害,不主動清掉——
             # 萬一使用者想降版回舊程式,資料還在。
+            # 【ADR-123】泛用停損/停利歸零:本策略的出場完全由 X/C/F/Y/Z 決定,
+            # 編輯器裡也沒有這幾個欄位。舊策略存檔時順手洗乾淨 (真正的防線在
+            # strategy_engine.OWN_EXIT_KINDS,這裡只是讓資料本身也一致)。
+            for _k in ('stop_loss_pct', 'take_profit_pct', 'stop_loss_abs', 'take_profit_abs'):
+                s[_k] = 0.0
             return s
 
         def _save():

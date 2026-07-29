@@ -131,6 +131,14 @@ def default_strategy():
     s['watch_timeframe'] = '5分K'   # 驅動 _quant_eval_pass 每5分鐘評估一次 (隔日中午確認需要這個頻率)
     for k in PARAM_KEYS:
         s[f'ck_{k}'] = 0.0
+    # 【ADR-123】把 new_strategy() 帶進來的泛用停損/停利歸零。
+    # 本策略的出場完全由 X/C/F/Y/Z 決定 (以加權指數點位為準 + 隔天12:00
+    # 二次確認),編輯器裡也沒有這幾個欄位 —— 使用者看不到、沒設定過,卻
+    # 因為 new_strategy() 的預設 stop_loss_pct=2.0 被一個 intrabar 的 2%
+    # 停損砍掉部位 (使用者實測回報)。真正的防線在
+    # strategy_engine.OWN_EXIT_KINDS,這裡是讓資料本身也乾淨。
+    for k in ('stop_loss_pct', 'take_profit_pct', 'stop_loss_abs', 'take_profit_abs'):
+        s[k] = 0.0
     # 【新ADR 盤勢型態提醒】預設關閉 (不要沒問過使用者就多送通知);
     # 使用者在編輯器打開後,才會依 pattern_lookback/pattern_near_pct/
     # pattern_list 跑 core/market_pattern.py 的判斷並用 Telegram/日誌提醒。

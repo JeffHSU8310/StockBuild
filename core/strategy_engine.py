@@ -1310,6 +1310,26 @@ def position_mismatch(strategy, runtime, acct_position):
     return None
 
 
+# 【ADR-123】這些策略種類**自己有完整的出場邏輯**,泛用的停損/停利
+# (stop_loss_pct / take_profit_pct / stop_loss_abs / take_profit_abs)
+# 不可以插手 —— 插手等於把使用者選定的那套風控整個換掉。
+#
+# 實例:終極波段 (chukuangren_band) 的出場是 X/C/F/Y/Z 那套,以加權指數
+# 點位為準、還要隔天 12:00 二次確認。但它的 default_strategy() 疊在
+# new_strategy() 上面,把 stop_loss_pct=2.0 這個**編輯器裡看不到**的預設值
+# 一起帶了進來,於是部位被一個 intrabar 的 2% 停損搶先砍掉。
+#
+# 這裡刻意用**字串**而不是 `from . import chukuangren_band`:那個模組反過來
+# import 本模組,會變成循環 import。兩邊靠 tests/test_core.py 的一條斷言
+# 釘在一起 (KIND in OWN_EXIT_KINDS),改名了不會無聲脫鉤。
+OWN_EXIT_KINDS = frozenset({'chukuangren_band'})
+
+
+def has_own_exit_logic(strategy):
+    """這檔策略是不是自己管出場 (泛用停損停利不得插手)。"""
+    return str((strategy or {}).get('kind') or '') in OWN_EXIT_KINDS
+
+
 def check_intrabar_futures_stop(strategy, runtime, live_price):
     """【新ADR】期貨即時停損/停利:不等K棒收盤,即時價 (呼叫端傳入下單商品B的
     最新市價快照) 一觸及使用者設定的停損%/停利%/停損點數/停利點數,立刻回傳
@@ -1328,6 +1348,10 @@ def check_intrabar_futures_stop(strategy, runtime, live_price):
     FLAT,另一邊下次評估時 state!=LONG/SHORT 自然是 no-op。
 
     回傳 intent dict 或 None (未觸發/不適用)。"""
+    # 【ADR-123】自己管出場的策略種類一律不適用 —— 見 OWN_EXIT_KINDS 的說明。
+    # 放在最前面:這是「這條規則對這檔策略根本不適用」,不是「條件沒觸發」。
+    if has_own_exit_logic(strategy):
+        return None
     if trade_type_of(strategy) != '期貨':
         return None
     state = runtime.get('state', 'FLAT')
