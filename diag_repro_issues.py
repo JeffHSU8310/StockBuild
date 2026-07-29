@@ -3952,6 +3952,99 @@ run_case("ADR-124: 即時停損看交易時段 + 終極波段只做日盤",
          _session_gate_realtime_stops_124)
 
 
+
+def _enabled_strategy_locked_125():
+    """【ADR-125】啟用中的策略不可刪除;編輯只能唯讀檢視。
+
+    重現使用者截圖:策略「狀態=啟用、運轉狀態=運轉中」、持倉 `--` (FLAT),
+    卻被 🗑 刪除 直接刪掉了 —— 舊程式唯一那道檢查是「仍有持倉」,FLAT 就放行。
+
+    這裡走**完整的 GUI 路徑** (_qt_delete_strategy / _qt_edit_strategy),
+    純函式測不到「呼叫端有沒有真的用到守門」那一層 (P-64)。
+    """
+    from core import strategy_engine as _se6
+
+    logs = []
+    orig_log = app.log_message
+    orig_strats, orig_rts = app.strategies, app.strategy_runtimes
+    orig_sel = app._qt_selected
+    orig_open_editor = app._qt_open_editor
+    orig_save, orig_save_state = app._qt_save, app._qt_save_state
+    orig_refresh = app._qt_refresh_tree
+    opened = {}
+
+    def _mount(enabled=True, state='FLAT'):
+        st = _se6.new_strategy()
+        st.update({'name': '診斷ADR125', 'symbol': 'MXFR1', 'trade_type': '期貨',
+                   'market': '台期貨', 'timeframe': '5分K', 'qty': 1,
+                   'direction': '做空', 'mode': '模擬', 'enabled': enabled,
+                   'entry': [{'type': 'ma_cross_down', 'params': {'fast': 5, 'slow': 20}}]})
+        rt = _se6.new_runtime(); rt['state'] = state
+        if state in ('LONG', 'SHORT'):
+            rt.update({'qty': 1, 'entry_price': 20000.0, 'exec_entry_price': 20000.0})
+        app.strategies = [st]
+        app.strategy_runtimes = {st['id']: rt}
+        app._qt_selected = lambda: st
+        return st
+
+    try:
+        app.log_message = lambda m: (logs.append(m), orig_log(m))[0]
+        # 存檔/畫面刷新在這個案例無關,擋掉避免動到暫存檔與 mock widget
+        app._qt_save = lambda *a, **k: None
+        app._qt_save_state = lambda *a, **k: None
+        app._qt_refresh_tree = lambda *a, **k: None
+
+        # ---- 1. 啟用中 + FLAT (重現截圖) → 不可刪除 ----
+        st1 = _mount(enabled=True, state='FLAT')
+        logs.clear()
+        app._qt_delete_strategy(); app.flush_after()
+        assert any(x['id'] == st1['id'] for x in app.strategies), \
+            "啟用中的策略不可以被刪除 (使用者實測的問題)"
+        assert any('停用' in m for m in logs), \
+            f"應提示要先停用,實際日誌: {logs[-2:]}"
+
+        # ---- 2. 反向對照:停用後**確實刪得掉** ----
+        # 少了這條,把守門寫成「永遠不可刪」也會一片綠,那等於功能被鎖死。
+        st1['enabled'] = False
+        logs.clear()
+        app._qt_delete_strategy(); app.flush_after()
+        assert not any(x['id'] == st1['id'] for x in app.strategies), \
+            "停用且無持倉的策略應該要刪得掉"
+
+        # ---- 3. 停用但有持倉 → 仍刪不掉 (既有行為沒被弄壞) ----
+        st3 = _mount(enabled=False, state='SHORT')
+        logs.clear()
+        app._qt_delete_strategy(); app.flush_after()
+        assert any(x['id'] == st3['id'] for x in app.strategies), \
+            "仍有持倉的策略不可以被刪除"
+        assert any('持倉' in m for m in logs), "應提示仍有持倉"
+
+        # ---- 4. 啟用中按編輯 → 只能唯讀檢視 ----
+        st4 = _mount(enabled=True, state='FLAT')
+        opened.clear()
+        app._qt_open_editor = lambda _s, readonly=False: opened.update(readonly=readonly)
+        app._qt_edit_strategy(); app.flush_after()
+        assert opened.get('readonly') is True, \
+            f"啟用中的策略只能唯讀檢視,實際 readonly={opened.get('readonly')!r}"
+        # 反向對照:停用後編輯器要是可寫的
+        st4['enabled'] = False
+        opened.clear()
+        app._qt_edit_strategy(); app.flush_after()
+        assert opened.get('readonly') is False, \
+            "停用的策略應該可以正常編輯"
+    finally:
+        app.log_message = orig_log
+        app._qt_selected = orig_sel
+        app._qt_open_editor = orig_open_editor
+        app._qt_save, app._qt_save_state = orig_save, orig_save_state
+        app._qt_refresh_tree = orig_refresh
+        app.strategies, app.strategy_runtimes = orig_strats, orig_rts
+
+
+run_case("ADR-125: 啟用中的策略不可刪除 / 編輯只能唯讀",
+         _enabled_strategy_locked_125)
+
+
 print(f"{'案例':60s} 結果")
 print("-" * 76)
 for name, st, msg in results:

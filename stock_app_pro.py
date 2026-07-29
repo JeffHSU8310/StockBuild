@@ -7394,7 +7394,8 @@ class StockTradingAppPro(tk.Tk):
         if not s:
             self.log_message("【自動交易】請先在清單中選取要編輯的策略。")
             return
-        readonly = bool(s.get('enabled'))
+        # 【ADR-125】「啟用中不可編輯」的規則收斂到 core,與刪除共用同一個判斷。
+        readonly = strategy_engine.is_locked(s)
         if readonly:
             self.log_message(f"【自動交易】「{s.get('name')}」為啟動中，進入唯讀檢視模式。若要修改請先停用。")
         if s.get('kind') == 'custom':
@@ -7410,8 +7411,12 @@ class StockTradingAppPro(tk.Tk):
             self.log_message("【自動交易】請先在清單中選取要刪除的策略。")
             return
         rt = self._qt_runtime(s['id'])
-        if rt.get('state') in ('LONG', 'SHORT'):
-            self.log_message(f"【自動交易】策略「{s.get('name')}」仍有持倉 ({rt['state']}),請先手動處理持倉並停用後再刪除。")
+        # 【ADR-125】原本只擋「仍有持倉」,**沒有擋「啟用中」** —— 使用者實測
+        # 把一檔運轉中、但持倉是 FLAT 的策略直接刪掉了。規則移到 core 讓它
+        # 只有一份,而且離線測得到。
+        ok, reason = strategy_engine.can_delete(s, rt)
+        if not ok:
+            self.log_message(f"【自動交易】{reason}")
             return
         self.strategies = [x for x in self.strategies if x['id'] != s['id']]
         self.strategy_runtimes.pop(s['id'], None)

@@ -1341,6 +1341,37 @@ def has_own_exit_logic(strategy):
 DAY_SESSION_ONLY_KINDS = frozenset({'chukuangren_band'})
 
 
+def is_locked(strategy):
+    """【ADR-125】啟用中的策略一律鎖住:**不可編輯、不可刪除**。
+
+    使用者實測回報:一檔「狀態=啟用、運轉狀態=運轉中」的策略被直接刪掉了。
+    理由不只是使用者要求 —— 策略正在跑,底下有 runtime 狀態、隨時可能成交,
+    從腳底下把它抽掉是資料競爭。要動它就先停用。
+
+    「不可編輯」的實作方式是**唯讀檢視**(編輯器把儲存鈕換成停用狀態,而且
+    在深拷貝上操作),不是把編輯器整個擋掉 —— 能看正在跑的策略掛了什麼條件
+    是有價值的。
+    """
+    return bool((strategy or {}).get('enabled'))
+
+
+def can_delete(strategy, runtime):
+    """【ADR-125】這檔策略現在可不可以刪除。回傳 (ok, 理由)。
+
+    檢查順序刻意是「先看啟用、再看持倉」:兩者都不成立時,使用者要做的
+    第一件事都是「先停用」,訊息就該直接指向那一步,不要先叫他去處理持倉。
+    """
+    s = strategy or {}
+    name = s.get('name', '')
+    if is_locked(s):
+        return False, (f"策略「{name}」啟用中,不可刪除。請先按「停用」再刪除 "
+                       f"(執行中的策略隨時可能成交,直接刪掉會留下對不上的紀錄)。")
+    if (runtime or {}).get('state') in ('LONG', 'SHORT'):
+        return False, (f"策略「{name}」仍有持倉 ({(runtime or {}).get('state')}),"
+                       f"請先手動處理持倉後再刪除。")
+    return True, ""
+
+
 def include_night_of(strategy):
     """這檔策略要不要做期貨夜盤。
 

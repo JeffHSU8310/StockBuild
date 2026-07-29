@@ -6011,5 +6011,60 @@ class TestIncludeNightOf(unittest.TestCase):
 
 
 
+
+class TestStrategyLock(unittest.TestCase):
+    """【ADR-125】啟用中的策略不可編輯、不可刪除。
+
+    使用者實測:一檔「狀態=啟用、運轉狀態=運轉中」的策略被直接刪掉了
+    (持倉是 FLAT,所以原本唯一那道「仍有持倉」的檢查放行了)。
+    """
+
+    def test_locked_when_enabled(self):
+        self.assertTrue(strategy_engine.is_locked({'enabled': True}))
+        self.assertFalse(strategy_engine.is_locked({'enabled': False}))
+
+    def test_is_locked_safe_on_garbage(self):
+        """缺欄位要當成「沒啟用」—— 這個方向是安全的 (不會鎖死刪除功能),
+        而真正在跑的策略一定有 enabled=True。"""
+        for bad in (None, {}, {'enabled': None}, {'enabled': 0}):
+            self.assertFalse(strategy_engine.is_locked(bad), repr(bad))
+
+    def test_enabled_cannot_be_deleted(self):
+        """重現截圖:啟用中 + 持倉 FLAT —— 舊程式會直接刪掉。"""
+        ok, reason = strategy_engine.can_delete(
+            {'name': '空', 'enabled': True}, {'state': 'FLAT'})
+        self.assertFalse(ok)
+        self.assertIn('停用', reason)
+
+    def test_position_still_blocks_when_disabled(self):
+        """既有的「仍有持倉」檢查不可以被弄丟。"""
+        ok, reason = strategy_engine.can_delete(
+            {'name': '空', 'enabled': False}, {'state': 'LONG'})
+        self.assertFalse(ok)
+        self.assertIn('持倉', reason)
+
+    def test_disabled_and_flat_can_be_deleted(self):
+        """反向對照:正常情況**要刪得掉** —— 少了這條,把 can_delete 寫成
+        永遠 False 也會一片綠,那等於把刪除功能整個鎖死。"""
+        ok, reason = strategy_engine.can_delete(
+            {'name': '空', 'enabled': False}, {'state': 'FLAT'})
+        self.assertTrue(ok)
+        self.assertEqual(reason, '')
+
+    def test_enabled_reason_wins_over_position(self):
+        """兩個條件都不成立時,訊息要指向「先停用」—— 那才是使用者要做的
+        第一步,先叫他去處理持倉會讓他繞路。"""
+        ok, reason = strategy_engine.can_delete(
+            {'name': '空', 'enabled': True}, {'state': 'LONG'})
+        self.assertFalse(ok)
+        self.assertIn('停用', reason)
+        self.assertNotIn('仍有持倉', reason)
+
+    def test_missing_runtime_is_treated_as_flat(self):
+        ok, _ = strategy_engine.can_delete({'name': 'x', 'enabled': False}, None)
+        self.assertTrue(ok)
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
