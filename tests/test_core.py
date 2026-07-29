@@ -5893,5 +5893,72 @@ class TestKBarsPlan(unittest.TestCase):
 
 
 
+
+class TestOwnExitKinds(unittest.TestCase):
+    """【ADR-123】自己管出場的策略種類,泛用停損/停利不可以插手。
+
+    使用者實測:終極波段策略的 5 口 TXF 被「即時停損出場 (損益 -2.44% ≤
+    -2.0%)」砍掉,而那個 2.0% 是 new_strategy() 的預設值 —— 終極波段的
+    專屬編輯器根本沒有這個欄位,使用者從頭到尾沒看過也沒設定過。
+    它的出場應該完全由 X/C/F/Y/Z (加權指數點位 + 隔天12:00二次確認) 決定。
+    """
+
+    def _rt(self, state='LONG', entry=41700.0, qty=5):
+        rt = strategy_engine.new_runtime()
+        rt.update({'state': state, 'exec_entry_price': entry, 'entry_price': entry,
+                   'qty': qty})
+        return rt
+
+    def test_kind_constant_is_pinned_to_chukuangren(self):
+        """OWN_EXIT_KINDS 用字串寫死 (避免循環 import),所以要有一條斷言
+        把它跟真正的 KIND 釘在一起 —— 日後改名才不會無聲脫鉤。"""
+        self.assertIn(chukuangren_band.KIND, strategy_engine.OWN_EXIT_KINDS)
+
+    def test_chukuangren_never_hit_by_generic_intrabar_stop(self):
+        """重現使用者的情境:既有存檔的終極波段策略仍帶著 stop_loss_pct=2.0,
+        現價比進場價低 2.44% —— 不可以產生任何出場 intent。"""
+        s = chukuangren_band.default_strategy()
+        s.update({'symbol': 'TXF', 'trade_type': '期貨', 'qty': 5,
+                  'stop_loss_pct': 2.0})          # 舊存檔殘留值
+        self.assertIsNone(
+            strategy_engine.check_intrabar_futures_stop(s, self._rt(), 40688.0))
+
+    def test_chukuangren_immune_to_every_generic_stop_field(self):
+        """四個泛用欄位都要擋,不是只擋 stop_loss_pct。"""
+        rt = self._rt()
+        for field, value, price in (('stop_loss_pct', 1.0, 40000.0),
+                                    ('take_profit_pct', 1.0, 43000.0),
+                                    ('stop_loss_abs', 100.0, 40000.0),
+                                    ('take_profit_abs', 100.0, 43000.0)):
+            s = chukuangren_band.default_strategy()
+            s.update({'symbol': 'TXF', 'trade_type': '期貨', 'qty': 5, field: value})
+            self.assertIsNone(
+                strategy_engine.check_intrabar_futures_stop(s, rt, price), field)
+
+    def test_normal_futures_strategy_still_stops_out(self):
+        """反向對照:這個守門不可以把整個即時停損功能關掉 —— 一般期貨策略
+        在同樣條件下**仍然要**出場。少了這條,把守門寫成『全部都擋』也會
+        測起來一片綠。"""
+        s = strategy_engine.new_strategy()
+        s.update({'symbol': 'TXF', 'trade_type': '期貨', 'qty': 5,
+                  'stop_loss_pct': 2.0})
+        intent = strategy_engine.check_intrabar_futures_stop(s, self._rt(), 40688.0)
+        self.assertIsNotNone(intent)
+        self.assertEqual(intent['kind'], 'CLOSE')
+
+    def test_has_own_exit_logic_is_safe_on_garbage(self):
+        for bad in (None, {}, {'kind': None}, {'kind': ''}, {'kind': 'custom'}):
+            self.assertFalse(strategy_engine.has_own_exit_logic(bad), repr(bad))
+
+    def test_default_strategy_zeroes_generic_stops(self):
+        """治本的那一半:新建的終極波段策略資料本身就不該帶泛用停損停利。"""
+        s = chukuangren_band.default_strategy()
+        for k in ('stop_loss_pct', 'take_profit_pct', 'stop_loss_abs', 'take_profit_abs'):
+            self.assertEqual(s[k], 0.0, k)
+        # 對照:一般策略維持原本的預設 (這次沒有動到它)
+        self.assertEqual(strategy_engine.new_strategy()['stop_loss_pct'], 2.0)
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

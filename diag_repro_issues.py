@@ -3663,6 +3663,125 @@ run_case("ADR-122: 大範圍K線背景分段預抓 (runner不阻塞/小請求不
          _qt_chunked_prefetch_122)
 
 
+
+def _chukuangren_own_exits_123():
+    """【ADR-123】使用者實測回報的兩件事。
+
+    A. 終極波段策略被泛用的即時停損砍倉。截圖:
+       「策略「楚狂人之終極波段」買進 5 TXF @ 40688 [即時] | 即時停損出場
+        (損益 -2.44% ≤ -2.0%) → 已記入模擬帳戶,此筆已實現 -968,250」
+       那個 2.0% 是 new_strategy() 的預設值,終極波段的編輯器根本沒有這個
+       欄位。這裡走**完整的 GUI 路徑** (_qt_check_realtime_futures_stops),
+       純函式的單元測試擋不到「呼叫端有沒有真的用到守門」這一層。
+    B. 開盤暖機被 session_gate 關掉:關閉時段閘門的策略在開盤瞬間完全沒有
+       保護,而它是 24 小時都在評估的,撞上開盤的機率反而更高。
+    """
+    from core import strategy_engine as _se4
+    from core import chukuangren_band as _ck
+
+    class FakeContract:
+        code = 'TXF'
+        symbol = 'TXFR1'
+
+    logs = []
+    orig_log = app.log_message
+    orig_resolve = app._qt_resolve
+    orig_dl = app._download_kbars_raw
+    orig_running, orig_login, orig_api = app._qt_running, app.api_logged_in, app.sj_api
+    orig_strats, orig_rts = app.strategies, app.strategy_runtimes
+    orig_just = stock_app_pro.market_session.just_opened
+    orig_open = stock_app_pro.market_session.is_market_open
+
+    def _mount(s, state='LONG', entry=41700.0, qty=5):
+        rt = _se4.new_runtime()
+        rt.update({'state': state, 'exec_entry_price': entry, 'entry_price': entry,
+                   'qty': qty})
+        app.strategies = [s]
+        app.strategy_runtimes = {s['id']: rt}
+        return rt
+
+    try:
+        app.log_message = lambda m: (logs.append(m), orig_log(m))[0]
+        app._qt_resolve = lambda _s: (FakeContract(), 'futures')
+        app.sj_api = object()
+        app.api_logged_in = True
+        app._qt_running = True
+
+        # ---- A1. 終極波段:即使殘留 stop_loss_pct=2.0 也不可被砍倉 ----
+        ck = _ck.default_strategy()
+        ck.update({'name': '診斷終極波段', 'symbol': 'TXF', 'trade_type': '期貨',
+                   'market': '台期貨', 'qty': 5, 'mode': '模擬', 'enabled': True,
+                   'stop_loss_pct': 2.0})          # 舊存檔殘留值
+        rt = _mount(ck)
+        logs.clear()
+        app._qt_check_realtime_futures_stops({'TXF': 40688.0})   # -2.44%
+        app.flush_after()
+        assert rt['state'] == 'LONG', \
+            f"終極波段不可被泛用即時停損平倉 (state 變成 {rt['state']})"
+        assert not [m for m in logs if '即時停損' in m], \
+            f"不該出現即時停損訊息,實際: {[m for m in logs if '即時停損' in m][:1]}"
+
+        # ---- A2. 反向對照:一般期貨策略在同樣條件下**仍然要**出場 ----
+        # 少了這條,把守門寫成「全部都擋」也會一片綠。
+        norm = _se4.new_strategy()
+        norm.update({'name': '診斷一般期貨', 'symbol': 'TXF', 'trade_type': '期貨',
+                     'market': '台期貨', 'qty': 5, 'mode': '模擬', 'enabled': True,
+                     'stop_loss_pct': 2.0})
+        rt2 = _mount(norm)
+        logs.clear()
+        app._qt_check_realtime_futures_stops({'TXF': 40688.0})
+        app.flush_after()
+        assert rt2['state'] == 'FLAT', "一般期貨策略仍應被即時停損平倉 (守門不可過度攔截)"
+        assert [m for m in logs if '即時停損' in m], "一般期貨策略應記錄即時停損"
+
+        # ---- B. 開盤暖機不可以被 session_gate 關掉 ----
+        calls = {'n': 0}
+        app._download_kbars_raw = lambda *a, **k: (calls.__setitem__('n', calls['n'] + 1), None)[1]
+        stock_app_pro.market_session.is_market_open = lambda *a, **k: True
+        stock_app_pro.market_session.just_opened = lambda *a, **k: True
+        gated = _se4.new_strategy()
+        gated.update({'name': '診斷關閘門', 'symbol': 'TXF', 'trade_type': '期貨',
+                      'market': '台期貨', 'timeframe': '5分K', 'qty': 1, 'mode': '模擬',
+                      'enabled': True, 'session_gate': False,   # ← 關鍵:閘門關掉
+                      'entry': [{'type': 'ma_cross_up', 'params': {'fast': 3, 'slow': 10}}]})
+        _mount(gated, state='FLAT', qty=0)
+        app._qt_last_boundary = {}
+        app._qt_warmup_noted = {}
+        logs.clear()
+        app._quant_eval_pass(); app.flush_after()
+        assert calls['n'] == 0, \
+            f"關閉時段閘門的策略在開盤瞬間也要被暖機擋住,實際抓了 {calls['n']} 次K線"
+        assert any('避開開盤尖峰' in m for m in logs), \
+            f"暖機應記一行,實際: {logs[-2:]}"
+        # 暖機過了就要照常評估 (不可以把這根K棒吃掉)
+        stock_app_pro.market_session.just_opened = lambda *a, **k: False
+        app._qt_last_boundary = {}
+        app._quant_eval_pass(); app.flush_after()
+        assert calls['n'] >= 1, "暖機結束後應照常評估"
+    finally:
+        app.log_message = orig_log
+        app._qt_resolve = orig_resolve
+        app._download_kbars_raw = orig_dl
+        stock_app_pro.market_session.just_opened = orig_just
+        stock_app_pro.market_session.is_market_open = orig_open
+        app._qt_running, app.api_logged_in, app.sj_api = orig_running, orig_login, orig_api
+        app.strategies, app.strategy_runtimes = orig_strats, orig_rts
+        app._qt_last_boundary = {}
+        app._qt_warmup_noted = {}
+
+    # 15:00 夜盤開盤 (使用者回報的第三個時刻) 確實在暖機涵蓋範圍內
+    from datetime import datetime as _dt
+    _night = _dt(2026, 7, 29, 15, 0, 5)
+    assert stock_app_pro.market_session.just_opened('期貨', _night), \
+        "15:00 夜盤開盤要算『剛開盤』"
+    assert not stock_app_pro.market_session.just_opened(
+        '期貨', _dt(2026, 7, 29, 15, 0, 31)), "暖機過了就要放行"
+
+
+run_case("ADR-123: 終極波段不受泛用即時停損 + 暖機不被時段閘門關掉",
+         _chukuangren_own_exits_123)
+
+
 print(f"{'案例':60s} 結果")
 print("-" * 76)
 for name, st, msg in results:
