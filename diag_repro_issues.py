@@ -7,6 +7,7 @@ diag_repro_issues.py — 重現使用者第五輪回報的三個問題 (修正�
 3. 版面數值變更後重繪,面板位置有沒有真的改變。
 """
 import sys, os, time, atexit, shutil, tempfile
+from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import diag_mock_tkinter
 diag_mock_tkinter.install_mock_tkinter()
@@ -58,6 +59,31 @@ app.flush_after = getattr(app, "flush_after")  # 來自 _Tk mock
 # 【ADR-115 延伸 / ADR-120】app_settings.json 也是使用者的真實設定檔
 # (盤勢判斷面板的偏好存在裡面),診斷案例會存檔,同樣改指到暫存目錄。
 app.app_settings_file = os.path.join(_diag_tmp, "app_settings.json")
+
+
+
+def eval_pass():
+    """【ADR-123】跑一輪策略評估,但先避開「K棒邊界後 2 秒」那個窗口。
+
+    _quant_eval_pass() 對分K策略有一道「給資料源 2 秒緩衝」的閘門:
+
+        if (now_dt - boundary).total_seconds() < 2: continue
+
+    1分K 的 boundary 就是「當下這一分鐘」,所以只要診斷剛好在某一分鐘的前
+    2 秒跑到這裡,策略就完全不會被評估,斷言於是莫名其妙紅一次。實測約
+    3% 的機率,而且每次紅的案例不一定一樣 —— 這種偶發紅最消耗人:會讓人
+    去懷疑剛改的東西,而真正的原因是時鐘。
+
+    診斷的既定原則是「與時鐘無關」(ADR-099 才為此把 session_gate 關掉),
+    這個窗口是漏網的一個。等過去再跑就好;等待最多 2 秒,不影響總時間。
+
+    只包**不帶參數**的呼叫:帶 now_ts/today_str 的是 _forced,本來就跳過
+    邊界閘門,不受影響。
+    """
+    now = datetime.now()
+    if now.second < 2:
+        time.sleep(2 - now.second + 0.05)
+    return app._quant_eval_pass()
 
 
 def place_and_settle(ctx, timeout=5.0):
@@ -907,18 +933,18 @@ def _round15_quant_trading():
     app.strategies.append(s); app.strategy_runtimes[s['id']]=_se.new_runtime()
     # 總開關關閉:完全不動作 (最重要的安全行為)
     app._qt_running=False
-    app._quant_eval_pass(); app.flush_after()
+    eval_pass(); app.flush_after()
     assert api.placed==[] and app.strategy_runtimes[s['id']]['state']=='FLAT', "總開關關閉時不可有任何動作"
     # 啟動+模擬:有訊號、無真實單
     app._qt_running=True
     logs=[]; ol=app.log_message; app.log_message=lambda m:(logs.append(m), ol(m))[0]
     try:
-        app._quant_eval_pass(); app.flush_after()
+        eval_pass(); app.flush_after()
         assert any('自動交易-模擬' in m for m in logs) and api.placed==[], "模擬模式不可下真實單"
         assert app.strategy_runtimes[s['id']]['state']=='LONG', "模擬應建立虛擬持倉"
         # 同一根K棒不重複
         n=sum(1 for m in logs if '自動交易-模擬' in m)
-        app._quant_eval_pass(); app.flush_after()
+        eval_pass(); app.flush_after()
         assert sum(1 for m in logs if '自動交易-模擬' in m)==n, "同一根K棒不可重複觸發"
         # 實單參數鏡射
         s2=_se.new_strategy()
@@ -927,14 +953,14 @@ def _round15_quant_trading():
                    'session_gate':False,   # 【ADR-099】診斷需與時鐘無關,理由同上
                    'entry':[{'type':'ma_cross_up','params':{'fast':3,'slow':10}}]})
         app.strategies.append(s2); app.strategy_runtimes[s2['id']]=_se.new_runtime()
-        app._quant_eval_pass(); app.flush_after()
+        eval_pass(); app.flush_after()
         assert len(api.placed)==1 and api.placed[0][0]=='TXFR1', "實單應送出期貨委託"
         kw=api.placed[0][1]
         assert str(kw.get('price_type')).endswith('LMT') and kw.get('quantity')==1, "下單參數鏡射錯誤"
         # 急停
         app._qt_stop_all()
         n_placed=len(api.placed)
-        app._quant_eval_pass(); app.flush_after()
+        eval_pass(); app.flush_after()
         assert app._qt_running is False and len(api.placed)==n_placed, "急停後不可再有任何動作"
         # 期貨帳戶406只提示一次 (ADR-036)
         app._fut_positions_unavailable=False
@@ -1324,9 +1350,9 @@ def _round20_paper_livebar_speed():
     app._qt_fetch_closed_bars=lambda *a, **k:(calls.append(1), orig(*a, **k))[1]
     try:
         app._qt_last_boundary={}
-        app._quant_eval_pass(); app.flush_after()
+        eval_pass(); app.flush_after()
         n1=len(calls)
-        app._quant_eval_pass(); app.flush_after()
+        eval_pass(); app.flush_after()
         assert n1>=1 and len(calls)==n1, "同一K棒邊界內不應重複評估"
     finally:
         app._qt_fetch_closed_bars=orig
@@ -3360,35 +3386,35 @@ def _qt_kbars_resilience_121():
         stock_app_pro.market_session.is_market_open = lambda *a, **k: True
         stock_app_pro.market_session.just_opened = lambda *a, **k: True
         _reset(session_gate=True)
-        app._quant_eval_pass(); app.flush_after()
+        eval_pass(); app.flush_after()
         assert calls['n'] == 0, f"開盤暖機期間不該抓K線,實際抓了 {calls['n']} 次"
         assert any('避開開盤尖峰' in m for m in logs), \
             f"暖機時應記一次說明,實際日誌: {logs[-3:]}"
         # 暖機只記一次,不可每 2 秒洗版
         n_note = sum(1 for m in logs if '避開開盤尖峰' in m)
-        app._quant_eval_pass(); app.flush_after()
+        eval_pass(); app.flush_after()
         assert sum(1 for m in logs if '避開開盤尖峰' in m) == n_note, "暖機提示不可重複記錄"
 
         # 暖機過了就要抓 —— 而且是**同一根K棒**,沒有被暖機吃掉
         stock_app_pro.market_session.just_opened = lambda *a, **k: False
-        app._quant_eval_pass(); app.flush_after()
+        eval_pass(); app.flush_after()
         assert calls['n'] >= 1, "暖機結束後應正常抓K線 (該K棒不可被暖機吃掉)"
 
         # ---- 2. 抓失敗會重試,重試期間不記錯誤 ----
         _reset(fail_until=2, session_gate=False)
-        app._quant_eval_pass(); app.flush_after()
+        eval_pass(); app.flush_after()
         assert calls['n'] == 1 and not _err_logs(), "第1次失敗不該立刻記錯誤"
-        app._quant_eval_pass(); app.flush_after()
+        eval_pass(); app.flush_after()
         assert calls['n'] == 2, "boundary 應被還原,下一輪要重試同一根K棒"
         assert not _err_logs(), "第2次失敗仍不該記錯誤 (還沒用完重試)"
-        app._quant_eval_pass(); app.flush_after()
+        eval_pass(); app.flush_after()
         assert calls['n'] == 3, "第3輪應再試一次"
         assert not _err_logs(), "第3次成功了,不該有任何錯誤訊息"
 
         # ---- 3. 重試用完:只記一次,而且停手 ----
         _reset(fail_until=999, session_gate=False)
         for _ in range(5):
-            app._quant_eval_pass(); app.flush_after()
+            eval_pass(); app.flush_after()
         assert calls['n'] == app.QT_KBARS_MAX_ATTEMPTS, \
             f"重試用完後必須停手,實際打了 {calls['n']} 次 API"
         assert len(_err_logs()) == 1, f"錯誤訊息應只記一次,實際 {len(_err_logs())} 則"
@@ -3398,7 +3424,7 @@ def _qt_kbars_resilience_121():
         app._download_kbars_raw = lambda *a, **k: (_ for _ in ()).throw(
             RuntimeError('AuthError: Not authenticated'))
         st4 = app.strategies[0]
-        app._quant_eval_pass(); app.flush_after()
+        eval_pass(); app.flush_after()
         assert not _err_logs(), "斷線不是『抓不到資料』,不該走重試那條"
         assert any('自動交易-異常' in m for m in logs), "斷線應照舊記一般異常"
         app.api_logged_in = True          # _mark_session_dead 會把它撥掉,還原給後續子案例
@@ -3408,7 +3434,7 @@ def _qt_kbars_resilience_121():
         st5, rt5 = _reset(fail_until=999, session_gate=False)
         for _ in range(12):
             app._qt_last_boundary = {}    # 模擬時間往前走 (每輪都是新的K棒邊界)
-            app._quant_eval_pass(); app.flush_after()
+            eval_pass(); app.flush_after()
         assert st5['enabled'] is True, \
             "抓不到K線不可以自動停用策略 —— 停用會連即時停損一起關掉"
         assert rt5.get('data_error_count', 0) > 0, "資料錯誤應有自己的計數"
@@ -3419,7 +3445,7 @@ def _qt_kbars_resilience_121():
         app._qt_resolve = lambda _s: (None, None)     # 合約解析失敗 → 邏輯錯誤
         for _ in range(3):
             app._qt_last_boundary = {}
-            app._quant_eval_pass(); app.flush_after()
+            eval_pass(); app.flush_after()
         assert st6['enabled'] is False, "策略邏輯連續 3 次錯誤仍應自動停用"
     finally:
         app.__dict__.pop('QT_TF_DAYS', None)
@@ -3541,7 +3567,7 @@ def _qt_chunked_prefetch_122():
 
         # ---- 1. runner 這一輪不下載,只起預抓 ----
         st1, rt1 = _reset('日K')
-        app._quant_eval_pass(); app.flush_after()
+        eval_pass(); app.flush_after()
         assert _inline_calls() == [], \
             f"大範圍請求不可以在 runner 執行緒裡下載,實際在該執行緒打了 {len(_inline_calls())} 次"
         assert rt1.get('data_error_count', 0) == 0, "『資料背景補齊中』不是錯誤,不可計數"
@@ -3561,7 +3587,7 @@ def _qt_chunked_prefetch_122():
         cached = [k for k in app._kbars_raw_cache if k.endswith('|日K')]
         assert cached, f"預抓成功後快取應該有資料,實際 keys: {list(app._kbars_raw_cache)}"
         n_before = len(calls['spans'])
-        app._quant_eval_pass(); app.flush_after()
+        eval_pass(); app.flush_after()
         assert len(calls['spans']) == n_before, "第二輪應命中快取,不可再下載"
         assert rt1.get('data_error_count', 0) == 0, "補完之後不該有任何資料錯誤"
         assert st1['enabled'] is True
@@ -3573,23 +3599,23 @@ def _qt_chunked_prefetch_122():
             app._kbars_raw_cache[_k]['t'] -= 600
         n_before2 = len(calls['spans'])
         app._qt_last_boundary = {}
-        app._quant_eval_pass(); app.flush_after()
+        eval_pass(); app.flush_after()
         assert len(calls['spans']) == n_before2, \
             "日K 類快取放了 10 分鐘仍應命中 (TTL 若短於評估間隔,快取等於完全沒作用)"
 
         # ---- 3. 小請求維持原地下載 ----
         _reset('5分K')
-        app._quant_eval_pass(); app.flush_after()
+        eval_pass(); app.flush_after()
         assert len(_inline_calls()) == 1 and len(calls['spans']) == 1, \
             f"5分K (7天) 應維持在 runner 執行緒單次原地下載,實際 {calls['spans']}"
 
         # ---- 4. 預抓在途不重複開執行緒 ----
         _reset('月K')
-        app._quant_eval_pass(); app.flush_after()
+        eval_pass(); app.flush_after()
         first = getattr(app, '_qt_prefetch_thread', None)
         for _ in range(3):
             app._qt_last_boundary = {}
-            app._quant_eval_pass(); app.flush_after()
+            eval_pass(); app.flush_after()
         assert getattr(app, '_qt_prefetch_thread', None) is first, \
             "同一個 key 在途時不可以再開一條預抓執行緒"
         _wait_prefetch()
@@ -3599,10 +3625,10 @@ def _qt_chunked_prefetch_122():
         # 被誤當成失敗,錯誤計數就會累積、日誌也會冒出資料異常。
         st4b, rt4b = _reset('日K')
         calls['gate'] = _th.Event()
-        app._quant_eval_pass(); app.flush_after()
+        eval_pass(); app.flush_after()
         for _ in range(app.QT_KBARS_MAX_ATTEMPTS + 2):
             app._qt_last_boundary = {}
-            app._quant_eval_pass(); app.flush_after()
+            eval_pass(); app.flush_after()
         assert rt4b.get('data_error_count', 0) == 0, \
             f"預抓在途不可以累積成資料錯誤 (實際 {rt4b.get('data_error_count')})"
         assert not [m for m in logs if '資料異常' in m], \
@@ -3615,7 +3641,7 @@ def _qt_chunked_prefetch_122():
         # 下一輪重來,也不要拿殘缺資料冒充完整。
         _reset('日K')
         calls['fail_after'] = 2          # 前 2 段成功、其餘失敗
-        app._quant_eval_pass(); app.flush_after()
+        eval_pass(); app.flush_after()
         _wait_prefetch(); app.flush_after()
         assert not [k for k in app._kbars_raw_cache if k.endswith('|日K')], \
             "分段有段失敗時不可以把殘缺資料寫進快取"
@@ -3626,7 +3652,7 @@ def _qt_chunked_prefetch_122():
         calls['fail'] = True
         for _ in range(8):
             app._qt_last_boundary = {}
-            app._quant_eval_pass(); app.flush_after()
+            eval_pass(); app.flush_after()
             _wait_prefetch(); app.flush_after()
         assert rt5.get('data_error_count', 0) > 0, "預抓失敗必須被記成資料錯誤"
         assert st5['enabled'] is True, "抓不到資料仍然不可以自動停用策略 (ADR-121)"
@@ -3748,7 +3774,7 @@ def _chukuangren_own_exits_123():
         app._qt_last_boundary = {}
         app._qt_warmup_noted = {}
         logs.clear()
-        app._quant_eval_pass(); app.flush_after()
+        eval_pass(); app.flush_after()
         assert calls['n'] == 0, \
             f"關閉時段閘門的策略在開盤瞬間也要被暖機擋住,實際抓了 {calls['n']} 次K線"
         assert any('避開開盤尖峰' in m for m in logs), \
@@ -3756,7 +3782,7 @@ def _chukuangren_own_exits_123():
         # 暖機過了就要照常評估 (不可以把這根K棒吃掉)
         stock_app_pro.market_session.just_opened = lambda *a, **k: False
         app._qt_last_boundary = {}
-        app._quant_eval_pass(); app.flush_after()
+        eval_pass(); app.flush_after()
         assert calls['n'] >= 1, "暖機結束後應照常評估"
     finally:
         app.log_message = orig_log
