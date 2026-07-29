@@ -3267,6 +3267,171 @@ run_case("ADR-120: 主圖盤勢判斷 (自動通知/重畫不洗版/日K限定/�
          _regime_panel_120)
 
 
+
+def _qt_kbars_resilience_121():
+    """【ADR-121】量化策略抓 K 線的開盤韌性。
+
+    使用者實測:策略在 08:45 與 09:00 各噴一次
+    `ShioajiTimeoutError: Timeout Topic: api/v1/data/kbars`,而那兩個時刻正是
+    期貨/台股時段閘門打開的那一秒 —— 開盤瞬間全市場的用戶端同時打同一支 API。
+
+    這裡驗五件事,每一件錯了都不會有錯誤訊息,只會「行為怪怪的」:
+      1. 開盤暖機期間**完全不抓 K 線**;暖機過了才抓。
+      2. 抓失敗會**重試**(靠還原 boundary,下一個 runner tick 重跑同一根K棒),
+         而且重試期間**不記錯誤訊息**。
+      3. 重試用完才記**一次**,而且**停手**(不可以無限每 2 秒重打券商 API)。
+      4. 斷線類例外**不當成可重試的資料錯誤**。
+      5. 資料錯誤**永不自動停用策略**;但策略邏輯錯誤照樣 3 次停用。
+    """
+    import pandas as _pd
+    from core import strategy_engine as _se2
+
+    # 原始分K:80 個營業日 × 5 根,重採樣成日K 後夠算 MA10
+    _idx, _rows = [], []
+    _px = 100.0
+    for _d in _pd.bdate_range('2026-01-01', periods=80):
+        for _h in (9, 10, 11, 12, 13):
+            _px += 0.1
+            _idx.append(_d + _pd.Timedelta(hours=_h))
+            _rows.append({'Open': _px, 'High': _px + 0.5, 'Low': _px - 0.5,
+                          'Close': _px, 'Volume': 1000})
+    RAW = _pd.DataFrame(_rows, index=_pd.DatetimeIndex(_idx))
+
+    class FakeContract:
+        code = '2330'
+        symbol = '2330'
+
+    logs = []
+    orig_log = app.log_message
+    orig_dl = app._download_kbars_raw
+    orig_resolve = app._qt_resolve
+    orig_open = stock_app_pro.market_session.is_market_open
+    orig_just = stock_app_pro.market_session.just_opened
+    orig_running, orig_login = app._qt_running, app.api_logged_in
+    orig_strats, orig_rts = app.strategies, app.strategy_runtimes
+    orig_api = app.sj_api
+
+    calls = {'n': 0, 'fail_until': 0}
+
+    def _fake_dl(*_a, **_k):
+        calls['n'] += 1
+        if calls['n'] <= calls['fail_until']:
+            raise RuntimeError('診斷用假逾時: Timeout Topic: api/v1/data/kbars')
+        return RAW
+
+    def _reset(fail_until=0, session_gate=True):
+        """每個子案例都從乾淨狀態開始 (清快取/boundary/重試計數)。"""
+        calls['n'] = 0
+        calls['fail_until'] = fail_until
+        logs.clear()
+        app._kbars_raw_cache.clear()
+        app._qt_last_boundary = {}
+        app._qt_fetch_attempts = {}
+        app._qt_warmup_noted = {}
+        app._qt_usage_logged_date = 'x'      # 診斷不去打真的 usage()
+        st = _se2.new_strategy()
+        st.update({'name': '診斷ADR121', 'symbol': '2330', 'market': '台股',
+                   'timeframe': '日K', 'qty': 1, 'cooldown_sec': 0, 'enabled': True,
+                   'session_gate': session_gate, 'mode': '模擬',
+                   'entry': [{'type': 'ma_cross_up', 'params': {'fast': 3, 'slow': 10}}]})
+        app.strategies = [st]
+        app.strategy_runtimes = {st['id']: _se2.new_runtime()}
+        return st, app.strategy_runtimes[st['id']]
+
+    def _err_logs():
+        return [m for m in logs if '自動交易-資料異常' in m]
+
+    try:
+        app.log_message = lambda m: (logs.append(m), orig_log(m))[0]
+        app._download_kbars_raw = _fake_dl
+        app._qt_resolve = lambda _s: (FakeContract(), 'stock')
+        app.sj_api = object()
+        app.api_logged_in = True
+        app._qt_running = True
+
+        # ---- 1. 開盤暖機期間完全不抓 K 線 ----
+        stock_app_pro.market_session.is_market_open = lambda *a, **k: True
+        stock_app_pro.market_session.just_opened = lambda *a, **k: True
+        _reset(session_gate=True)
+        app._quant_eval_pass(); app.flush_after()
+        assert calls['n'] == 0, f"開盤暖機期間不該抓K線,實際抓了 {calls['n']} 次"
+        assert any('避開開盤尖峰' in m for m in logs), \
+            f"暖機時應記一次說明,實際日誌: {logs[-3:]}"
+        # 暖機只記一次,不可每 2 秒洗版
+        n_note = sum(1 for m in logs if '避開開盤尖峰' in m)
+        app._quant_eval_pass(); app.flush_after()
+        assert sum(1 for m in logs if '避開開盤尖峰' in m) == n_note, "暖機提示不可重複記錄"
+
+        # 暖機過了就要抓 —— 而且是**同一根K棒**,沒有被暖機吃掉
+        stock_app_pro.market_session.just_opened = lambda *a, **k: False
+        app._quant_eval_pass(); app.flush_after()
+        assert calls['n'] >= 1, "暖機結束後應正常抓K線 (該K棒不可被暖機吃掉)"
+
+        # ---- 2. 抓失敗會重試,重試期間不記錯誤 ----
+        _reset(fail_until=2, session_gate=False)
+        app._quant_eval_pass(); app.flush_after()
+        assert calls['n'] == 1 and not _err_logs(), "第1次失敗不該立刻記錯誤"
+        app._quant_eval_pass(); app.flush_after()
+        assert calls['n'] == 2, "boundary 應被還原,下一輪要重試同一根K棒"
+        assert not _err_logs(), "第2次失敗仍不該記錯誤 (還沒用完重試)"
+        app._quant_eval_pass(); app.flush_after()
+        assert calls['n'] == 3, "第3輪應再試一次"
+        assert not _err_logs(), "第3次成功了,不該有任何錯誤訊息"
+
+        # ---- 3. 重試用完:只記一次,而且停手 ----
+        _reset(fail_until=999, session_gate=False)
+        for _ in range(5):
+            app._quant_eval_pass(); app.flush_after()
+        assert calls['n'] == app.QT_KBARS_MAX_ATTEMPTS, \
+            f"重試用完後必須停手,實際打了 {calls['n']} 次 API"
+        assert len(_err_logs()) == 1, f"錯誤訊息應只記一次,實際 {len(_err_logs())} 則"
+
+        # ---- 4. 斷線類例外不當成可重試的資料錯誤 ----
+        _reset(session_gate=False)
+        app._download_kbars_raw = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError('AuthError: Not authenticated'))
+        st4 = app.strategies[0]
+        app._quant_eval_pass(); app.flush_after()
+        assert not _err_logs(), "斷線不是『抓不到資料』,不該走重試那條"
+        assert any('自動交易-異常' in m for m in logs), "斷線應照舊記一般異常"
+        app.api_logged_in = True          # _mark_session_dead 會把它撥掉,還原給後續子案例
+        app._download_kbars_raw = _fake_dl
+
+        # ---- 5a. 資料錯誤永不自動停用策略 ----
+        st5, rt5 = _reset(fail_until=999, session_gate=False)
+        for _ in range(12):
+            app._qt_last_boundary = {}    # 模擬時間往前走 (每輪都是新的K棒邊界)
+            app._quant_eval_pass(); app.flush_after()
+        assert st5['enabled'] is True, \
+            "抓不到K線不可以自動停用策略 —— 停用會連即時停損一起關掉"
+        assert rt5.get('data_error_count', 0) > 0, "資料錯誤應有自己的計數"
+        assert rt5.get('error_count', 0) == 0, "資料錯誤不可以累加到『會停用』的那個計數"
+
+        # ---- 5b. 策略邏輯錯誤照樣 3 次自動停用 (保護沒有被整個拿掉) ----
+        st6, rt6 = _reset(session_gate=False)
+        app._qt_resolve = lambda _s: (None, None)     # 合約解析失敗 → 邏輯錯誤
+        for _ in range(3):
+            app._qt_last_boundary = {}
+            app._quant_eval_pass(); app.flush_after()
+        assert st6['enabled'] is False, "策略邏輯連續 3 次錯誤仍應自動停用"
+    finally:
+        app.log_message = orig_log
+        app._download_kbars_raw = orig_dl
+        app._qt_resolve = orig_resolve
+        stock_app_pro.market_session.is_market_open = orig_open
+        stock_app_pro.market_session.just_opened = orig_just
+        app._qt_running, app.api_logged_in = orig_running, orig_login
+        app.strategies, app.strategy_runtimes = orig_strats, orig_rts
+        app.sj_api = orig_api
+        app._qt_last_boundary = {}
+        app._qt_fetch_attempts = {}
+        app._kbars_raw_cache.clear()
+        app._qt_usage_logged_date = None
+
+
+run_case("ADR-121: 開盤暖機/抓K線重試/資料錯誤不停用策略", _qt_kbars_resilience_121)
+
+
 print(f"{'案例':60s} 結果")
 print("-" * 76)
 for name, st, msg in results:

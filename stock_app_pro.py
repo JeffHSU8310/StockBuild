@@ -7471,7 +7471,8 @@ class StockTradingAppPro(tk.Tk):
 
     def _qt_finish_set_enabled(self, s, flag):
         s['enabled'] = bool(flag)
-        rt = self._qt_runtime(s['id']); rt['error_count'] = 0
+        # 【ADR-121】兩個計數都歸零:手動重新啟用等於「重新開始算」。
+        rt = self._qt_runtime(s['id']); rt['error_count'] = 0; rt['data_error_count'] = 0
         self._qt_save(); self._qt_save_state(); self._qt_refresh_tree(); self._qt_update_status_label()
         self.log_message(f"【自動交易】策略「{s.get('name')}」已{'啟用' if flag else '停用'}。")
 
@@ -7651,7 +7652,17 @@ class StockTradingAppPro(tk.Tk):
         key = f"QT|{_mkt}|{_sym}|{tf}"
         raw, fresh = self._kbars_cache_get(key, start_dt)
         if raw is None or not fresh:
-            raw = self._download_kbars_raw(contract, start_dt, end_dt)
+            try:
+                raw = self._download_kbars_raw(contract, start_dt, end_dt)
+            except Exception as e:
+                # 【ADR-121】把「抓資料失敗」包成專屬型別,讓 _quant_eval_pass
+                # 分得出它跟「策略邏輯壞掉」——前者要重試、不可自動停用策略。
+                # 斷線類例外維持原樣直接上拋:那不是暫時性失敗,重試沒有意義,
+                # 而且上層要靠它觸發 _mark_session_dead。
+                if self._looks_like_session_dead(e):
+                    raise
+                raise strategy_engine.KBarsFetchError(
+                    f"{type(e).__name__}: {e}") from e
             if raw is not None and not raw.empty:
                 self._kbars_cache_put(key, start_dt, raw, tf)
         if raw is None or raw.empty:
@@ -7872,6 +7883,93 @@ class StockTradingAppPro(tk.Tk):
                             f"開始自動評估與下單。")
         self._qt_session_state[s['id']] = 'open'
 
+    # ------------------------------------------------------------------
+    # 【ADR-121】開盤暖機 + 抓資料失敗的重試/記錄
+    # ------------------------------------------------------------------
+    QT_OPEN_WARMUP_SEC = market_session.QT_OPEN_WARMUP_SEC   # 開盤後幾秒內不抓K線
+    QT_KBARS_MAX_ATTEMPTS = 3                                # 同一根K棒最多試幾次
+
+    def _qt_log_open_warmup(self, s, trade_type, include_night):
+        """開盤暖機只記一次 (每檔策略每次開盤),不要每 2 秒洗版。"""
+        if not hasattr(self, '_qt_warmup_noted'):
+            self._qt_warmup_noted = {}
+        label = market_session.session_label(trade_type, include_night=include_night)
+        key = f"{datetime.now():%Y-%m-%d}|{label}"
+        if self._qt_warmup_noted.get(s['id']) == key:
+            return
+        self._qt_warmup_noted[s['id']] = key
+        self.safe_after(0, self.log_message,
+                        f"【自動交易-開盤】策略「{s.get('name')}」({label}) 先等 "
+                        f"{self.QT_OPEN_WARMUP_SEC} 秒避開開盤尖峰再開始抓K線 —— "
+                        f"開盤後第一根「已收盤」K棒本來就還沒生出來,不影響訊號。")
+
+    def _qt_on_kbars_fetch_error(self, s, rt, exc, boundary_key, prev_boundary):
+        """【ADR-121】抓 K 線失敗:先重試,重試用完才記錄;永不自動停用策略。
+
+        【為什麼重試不用 time.sleep()】量化 runner 是單執行緒,原地睡會一併
+        拖住其他策略與 _qt_update_realtime_pnl (每 3 秒,期貨即時停損停利靠
+        它)。主圖那條路可以睡 (它自己一條背景執行緒),這裡不行 —— 拿一個
+        錯誤訊息換掉即時停損,是更糟的交易。
+
+        改用 runner 自己的 2 秒節奏當退避:把 boundary 還原,下一個 tick 就會
+        再評估同一根K棒。三次都失敗才記錄,並把 boundary 寫回去停止重試
+        (不可以無限每 2 秒重打券商 API)。
+
+        【為什麼不自動停用】抓不到資料時策略本來就不會產生任何 intent,停用
+        它得不到任何保護;但停用會讓 _quant_eval_pass 與
+        _qt_check_realtime_futures_stops 都跳過這檔策略 —— 部位還在,停損卻
+        不跑了。網路瞬斷不該有這種後果。
+        """
+        if not hasattr(self, '_qt_fetch_attempts'):
+            self._qt_fetch_attempts = {}
+        sid = s['id']
+        prev_key, n = self._qt_fetch_attempts.get(sid, (None, 0))
+        n = (n + 1) if prev_key == boundary_key else 1
+        self._qt_fetch_attempts[sid] = (boundary_key, n)
+
+        if boundary_key is not None and n < self.QT_KBARS_MAX_ATTEMPTS:
+            # 還原 boundary → 下一個 runner tick (2 秒後) 重試同一根K棒
+            if prev_boundary is None:
+                self._qt_last_boundary.pop(sid, None)
+            else:
+                self._qt_last_boundary[sid] = prev_boundary
+            return
+
+        rt['data_error_count'] = int(rt.get('data_error_count', 0)) + 1
+        self.safe_after(0, self.log_message,
+                        f"【自動交易-資料異常】策略「{s.get('name')}」連 {n} 次抓不到K線: {exc}"
+                        f" —— 已自動重試,策略維持啟用 (抓不到資料時本來就不會下單)。")
+        self._qt_log_kbars_usage_once()
+        if rt['data_error_count'] % 3 == 0:
+            self.safe_after(0, self.log_message,
+                            f"【自動交易-資料異常】⚠ 策略「{s.get('name')}」已累計 "
+                            f"{rt['data_error_count']} 次抓不到K線。若持續發生,請確認網路與"
+                            f"券商 API 流量 (上方日誌會附流量數字)。")
+
+    def _qt_log_kbars_usage_once(self):
+        """【ADR-121】抓資料失敗時把 API 流量寫進日誌,每天只印一次。
+
+        沿用主圖 _download_kbars_chunked._log_usage_once 的做法。沒有這個數字,
+        「券商端暫時性管制」與「當日流量耗盡」在日誌上長得一模一樣 —— 這正是
+        使用者回報 kbars 逾時時無從判斷的原因。
+        """
+        today = f"{datetime.now():%Y-%m-%d}"
+        if getattr(self, '_qt_usage_logged_date', None) == today:
+            return
+        self._qt_usage_logged_date = today
+        try:
+            u = self.sj_api.usage()
+            used = getattr(u, 'bytes', None)
+            limit = getattr(u, 'limit_bytes', None)
+            remain = getattr(u, 'remaining_bytes', None)
+            if used is not None:
+                self.safe_after(0, self.log_message,
+                                f"【自動交易-診斷】API 流量:已用 {used/1048576:.1f}MB / 上限 "
+                                f"{(limit or 0)/1048576:.0f}MB / 剩餘 {(remain or 0)/1048576:.1f}MB "
+                                f"(剩餘充足=暫時性管制,稍後自行恢復;趨近 0=今日流量耗盡)。")
+        except Exception:
+            pass
+
     def _quant_eval_pass(self, now_ts=None, today_str=None):
         """跑一輪全部策略的評估 (抽成獨立方法方便離線測試)。在背景執行緒執行。
         【ADR-041】明確傳入 now_ts/today_str (測試/手動觸發) 時跳過邊界閘門強制評估;
@@ -7906,8 +8004,21 @@ class StockTradingAppPro(tk.Tk):
                     continue
                 else:
                     self._qt_note_session_open(s, tt, include_night)
+                # 【ADR-121】開盤暖機:閘門剛打開的那幾秒不要去要 K 線。
+                # 使用者實測 08:45/09:00 各噴一次 kbars 逾時,而那正是本檔
+                # 策略當天第一次評估的時刻 —— 開盤瞬間全市場的用戶端同時打
+                # 同一支 API。這裡刻意放在 _qt_last_boundary 被寫入**之前**,
+                # 所以這根K棒沒有被吃掉,暖機結束後同一根照樣會評估到。
+                if market_session.just_opened(tt, include_night=include_night,
+                                              warmup_sec=self.QT_OPEN_WARMUP_SEC):
+                    self._qt_log_open_warmup(s, tt, include_night)
+                    continue
             # 【ADR-041】邊界感知:只有該策略週期的K棒剛收盤才評估 (測試/手動觸發不受限)
             # 【ADR-074】看A做B 時,訊號來自 A,節奏依 A 的週期 (watch_timeframe)。
+            # 【ADR-121】boundary_key / _prev_boundary 要讓下面的 except 看得到:
+            # 抓資料失敗時要能把 boundary 還原,讓下一個 runner tick 重試同一根K棒。
+            boundary_key = None
+            _prev_boundary = None
             if not _forced:
                 # 【新ADR 自訂週期】改用 strategy_engine.timeframe_minutes()
                 # (涵蓋任意正整數的自訂 N分K/N時K,不再只認 1/5/15/30/60 這
@@ -7935,6 +8046,7 @@ class StockTradingAppPro(tk.Tk):
                     boundary_key = str(boundary)
                 if self._qt_last_boundary.get(s['id']) == boundary_key:
                     continue
+                _prev_boundary = self._qt_last_boundary.get(s['id'])
                 self._qt_last_boundary[s['id']] = boundary_key
             try:
                 # 【ADR-074 看A做B】B (執行商品):下單、損益都用它;A (訊號來源):
@@ -8071,7 +8183,14 @@ class StockTradingAppPro(tk.Tk):
                         except Exception:
                             self.safe_after(0, self.log_message, f"【自動交易-模擬】🧪 {label} | {intent['reason']} (模擬)")
                 rt['error_count'] = 0
+                rt['data_error_count'] = 0
+            except strategy_engine.KBarsFetchError as e:
+                # 【ADR-121】抓不到K線是外部環境問題,先重試;重試用完才記錄,
+                # 而且**永遠不會**因此自動停用策略 (見 _qt_on_kbars_fetch_error)。
+                self._qt_on_kbars_fetch_error(s, rt, e, boundary_key, _prev_boundary)
             except Exception as e:
+                # 【ADR-121】這裡只剩「策略邏輯/下單路徑」的錯誤。自動停用維持
+                # 原本的行為 —— 真的壞掉的策略就該停手。
                 rt['error_count'] = int(rt.get('error_count', 0)) + 1
                 self.safe_after(0, self.log_message,
                                 f"【自動交易-異常】策略「{s.get('name')}」第 {rt['error_count']} 次錯誤: {type(e).__name__}: {e}")
