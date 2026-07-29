@@ -247,6 +247,7 @@ _tg_poll_worker (背景 daemon,getUpdates long polling)
 |---|---|
 | `core/`、`data/` 純邏輯 | `python tests/test_core.py`（必跑）+ 補對應測試 |
 | 「每次重畫都會跑」的主圖附加判斷（盤勢判斷等） | diag 要**連續 `draw_chart()` 多次**再斷言日誌沒有增加（PITFALLS P-87）|
+| 任何跟交易時段有關的閘門 | `diag_repro_issues.run_case` 已統一把 `is_market_open`/`just_opened` 凍結住；需要別的值就**在案例內自己 patch**，不可依賴真實時鐘（P-94/P-97）|
 | `brokers/` 券商 adapter | `python tests/test_brokers.py`（必跑）；真實連線只能實機 |
 | `draw_chart`/版面/下單流程等 GUI 耦合 | `diag_repro_issues.py` 等假 tkinter 診斷 |
 | 任何檔案 | `python -m py_compile` + `python diag_crossref.py`（跨模組斷鏈 **與重複定義**，ADR-109） |

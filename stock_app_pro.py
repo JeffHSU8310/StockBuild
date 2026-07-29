@@ -3078,18 +3078,28 @@ class StockTradingAppPro(tk.Tk):
         except Exception:
             pass
 
+    # 【ADR-126】自選股 worker 的兩個節奏,刻意拆成兩個獨立常數。
+    #
+    # 串流上屏是**本地端**的事 (tick 是券商推播過來的,已經在記憶體裡),加快
+    # 完全沒有 API 成本;股票批次快照是**真的打 API**,受鐵則 5 管。原本兩者
+    # 綁在同一個 `i % 10` 上,改快上屏就會連帶把 API 打快 —— 這次把「幾秒打
+    # 一次快照」寫成秒數、輪數由除法算出來,以後只調上屏速度不會誤傷 API 節流。
+    WL_STREAM_UI_SEC = 0.1      # 串流報價上屏 (原 0.25;純本地,無 API 成本)
+    WL_SNAPSHOT_SEC = 2.5       # 股票批次快照 (維持原值,鐵則 5 / ADR-094)
+
     def watchlist_quote_worker(self):
-        """【新ADR 報價加速】期貨/指數串流報價每 0.25 秒上屏 (當沖等級);
-        股票批次快照維持每 10 輪 (=2.5秒) 一次。未登入時安靜等待。
-        【鐵則5】股票快照間隔調整前已查 shioaji 官方文件的次數限制
+        """【ADR-126】期貨/指數串流報價每 WL_STREAM_UI_SEC 秒上屏 (當沖等級);
+        股票批次快照維持 WL_SNAPSHOT_SEC 秒一次。未登入時安靜等待。
+
+        【鐵則5】快照間隔調整前已查 shioaji 官方文件的次數限制
         (snapshots/ticks/kbars 等合計 10 秒 50 次上限),2.5 秒一次的批次
-        快照仍遠低於這個上限,詳見 DECISIONS_ADR094.md。"""
+        快照仍遠低於這個上限,詳見 DECISIONS_ADR094.md。**這次只加快了上屏,
+        快照間隔一秒都沒有動。**"""
         i = 0
+        every = max(1, int(round(self.WL_SNAPSHOT_SEC / self.WL_STREAM_UI_SEC)))
         while True:
             try:
-                # 【新ADR 報價加速】期指/指數串流上屏 0.5→0.25 秒;
-                # 股票快照 10 輪 × 0.25 秒 = 2.5 秒一次 (原本 10×0.5=5 秒)。
-                if i % 10 == 0:
+                if i % every == 0:
                     self._wl_fetch_quotes_once()
                     self._wl_ensure_stream_subs()
                 if self._wl_stream_quotes:
@@ -3099,7 +3109,7 @@ class StockTradingAppPro(tk.Tk):
             except Exception:
                 pass
             i += 1
-            time.sleep(0.25)
+            time.sleep(self.WL_STREAM_UI_SEC)
 
     def fetch_realtime_worker(self):
         while True:
@@ -13115,13 +13125,48 @@ class StockTradingAppPro(tk.Tk):
         except Exception:
             self._live_bar_artists = None
 
+    LIVE_BAR_PAINT_MS = 200          # 【ADR-126】活K棒上屏間隔 (原 400ms)
+    LIVE_BAR_FALLBACK_SEC = 1.0      # blit 不可用時,最快每隔幾秒退回一次完整重繪
+
+    def _live_bar_blocked_reason(self):
+        """【ADR-126】活K棒**這一刻**畫不出來的原因;可以畫回 None。
+
+        存在的理由是:原本這些條件寫成一個大 if,任何一條不成立就**安靜地
+        什麼都不做**。使用者回報「K線完全不會即時更新」時,從畫面與日誌完全
+        看不出是哪一條卡住 —— 這個函式讓它變成查得到的。
+        """
+        lb = self._live_bar
+        if not lb or not lb.get('dirty'):
+            return None if lb else 'no_tick'      # 沒有新 tick 不算「卡住」
+        if not getattr(self, '_live_bar_artists', None):
+            return 'no_artists'                  # draw_chart 沒建出 artists (週期不支援?)
+        if self.current_df is None or len(self.current_df) == 0:
+            return 'no_data'
+        if self._fetch_in_progress:
+            return 'fetching'
+        if self._login_in_progress:
+            return 'logging_in'
+        if getattr(self, '_hover_bg', None) is None:
+            return 'no_blit_bg'                  # 最常見的一條 (見 ADR-126)
+        return None
+
     def _live_bar_painter(self):
-        """每 400ms 檢查一次:活K棒有新 tick 就用 blitting 疊畫 (毫秒級,不重繪全圖)。"""
+        """活K棒有新 tick 就用 blitting 疊畫 (毫秒級,不重繪全圖)。
+
+        【ADR-126】blit 畫不成時**不可以就這樣算了**:`_hover_bg` 會被縮放/
+        平移/視野變動/尚未觸發 draw_event 等好幾條路作廢,而原本的寫法在那種
+        情況下永遠靜悄悄地不畫 —— 使用者看到的就是「K線完全不會即時更新」,
+        而且日誌一個字都沒有。所以補一條退路:blit 不可用時改用節流過的
+        完整重繪 (draw_idle),慢一點但一定會動。
+        """
         try:
             if getattr(self, '_closing', False):
                 return
             lb = self._live_bar
             arts = getattr(self, '_live_bar_artists', None)
+            blocked = self._live_bar_blocked_reason()
+            if blocked in ('no_blit_bg', 'no_artists'):
+                self._live_bar_fallback_repaint(blocked)
             if (lb and lb.get('dirty') and arts and self.current_df is not None
                     and len(self.current_df) > 0 and getattr(self, '_hover_bg', None) is not None
                     and not self._fetch_in_progress and not self._login_in_progress):
@@ -13146,11 +13191,35 @@ class StockTradingAppPro(tk.Tk):
                 price_line.set_color('#FF3B30' if up else '#00C853')
                 for a in arts:
                     a.set_visible(True)
-                self._blit_hover()  # 與 hover 共用同一條 blit 管線 (含活K棒 artists)
+                if not self._blit_hover():
+                    # blit 當場失敗 (底圖剛被視野變動作廢) —— 一樣要有東西動,
+                    # 交給節流過的完整重繪,不要靜悄悄地跳過。
+                    self._live_bar_fallback_repaint('blit_failed')
         except Exception:
             pass
         finally:
-            self.safe_after(400, self._live_bar_painter)
+            self.safe_after(self.LIVE_BAR_PAINT_MS, self._live_bar_painter)
+
+    def _live_bar_fallback_repaint(self, reason):
+        """【ADR-126】blit 走不通時的退路:節流過的完整重繪。
+
+        完整重繪比 blit 貴很多 (整張圖重畫),所以最快每 LIVE_BAR_FALLBACK_SEC
+        秒一次 —— 目的是「一定會動」,不是「動得很順」。順帶在第一次退回時記
+        一行日誌並附上原因代碼,下次再出問題就查得到是哪一條,不必再猜。
+        """
+        now = time.time()
+        if now - getattr(self, '_live_bar_fallback_ts', 0.0) < self.LIVE_BAR_FALLBACK_SEC:
+            return
+        self._live_bar_fallback_ts = now
+        if getattr(self, '_live_bar_fallback_noted', None) != reason:
+            self._live_bar_fallback_noted = reason
+            self.log_message(f"【主圖】活K棒改用完整重繪更新 (原因: {reason});"
+                             f"畫面仍會即時跳動,只是比疊畫耗資源。")
+        try:
+            if self.current_canvas is not None:
+                self.current_canvas.draw_idle()
+        except Exception:
+            pass
 
     def set_bottom_tab(self, key):
         """切換底部分頁:系統日誌/我的委託單/我的已成交/我的庫存/量化/籌碼。"""

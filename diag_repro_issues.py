@@ -107,6 +107,27 @@ def place_and_settle(ctx, timeout=5.0):
 
 results = []
 def run_case(name, fn):
+    """【ADR-126】跑一個案例,並且**把時鐘相依的表面凍結住**。
+
+    為什麼要在這裡做:ADR-124 給 `_qt_check_realtime_futures_stops` 補上交易
+    時段閘門之後,ADR-123 那個「一般期貨策略仍應被即時停損平倉」的案例就
+    **悄悄變成看真實時鐘**了 —— 期貨日盤 (08:45~13:45) 或夜盤 (15:00~05:00)
+    跑就過,卡在 13:45~15:00 的空檔跑就紅。我當時連跑 5 次全綠並把它併進
+    main,正是因為那 5 次都落在日盤內(P-94 早就寫過:「跑很多次都沒紅」
+    只是沒有反證,不是證明)。
+
+    所以改成由 harness 統一預設:市場「開著」、且「不在開盤暖機窗口內」。
+    需要休市 / 需要暖機的案例自己在案例內再 patch 一次(它們的 patch 會蓋過
+    這裡的預設,`finally` 也還原得回來)。這樣**任何新案例都不會不小心又
+    依賴真實時鐘**。
+    """
+    # 別名刻意不叫 _ms —— 這個檔案裡 _ms 已經是 core.market_screener
+    # (diag_crossref 會把同名別名混在一起看,撞名就誤報跨模組斷鏈;
+    #  ADR-122 也踩過一次同樣的事,那次是 _cs)。
+    _msess = stock_app_pro.market_session
+    _orig_open, _orig_just = _msess.is_market_open, _msess.just_opened
+    _msess.is_market_open = lambda *a, **k: True
+    _msess.just_opened = lambda *a, **k: False
     try:
         fn()
         results.append((name, "PASS", ""))
@@ -114,6 +135,8 @@ def run_case(name, fn):
         results.append((name, "FAIL", str(e)))
     except Exception as e:
         results.append((name, "ERROR", f"{type(e).__name__}: {e}"))
+    finally:
+        _msess.is_market_open, _msess.just_opened = _orig_open, _orig_just
 
 
 def _make_df(n=200):
@@ -3795,13 +3818,11 @@ def _chukuangren_own_exits_123():
         app._qt_last_boundary = {}
         app._qt_warmup_noted = {}
 
-    # 15:00 夜盤開盤 (使用者回報的第三個時刻) 確實在暖機涵蓋範圍內
-    from datetime import datetime as _dt
-    _night = _dt(2026, 7, 29, 15, 0, 5)
-    assert stock_app_pro.market_session.just_opened('期貨', _night), \
-        "15:00 夜盤開盤要算『剛開盤』"
-    assert not stock_app_pro.market_session.just_opened(
-        '期貨', _dt(2026, 7, 29, 15, 0, 31)), "暖機過了就要放行"
+    # 【ADR-126】原本這裡直接斷言 market_session.just_opened(15:00:05) —— 那是
+    # **純函式的行為**,已經由 tests/test_core.py 的 TestMarketSession 完整覆蓋
+    # (含 15:00 夜盤那條)。而 run_case 現在會把時鐘相依的表面凍結住,這種
+    # 直接打真實函式的斷言放在診斷裡只會互相打架。純函式歸單元測試、
+    # GUI 接線歸診斷,各司其職。
 
 
 run_case("ADR-123: 終極波段不受泛用即時停損 + 暖機不被時段閘門關掉",
@@ -4043,6 +4064,136 @@ def _enabled_strategy_locked_125():
 
 run_case("ADR-125: 啟用中的策略不可刪除 / 編輯只能唯讀",
          _enabled_strategy_locked_125)
+
+
+
+def _live_chart_refresh_126():
+    """【ADR-126】主圖活K棒不會即時更新 + 報價上屏加速。
+
+    使用者實測回報:「主圖的K線不會即時更新,以前會,現在又不會了」,而且
+    **白天盤中也一樣**、**手動按週期按鈕重載會跳到最新**。兩件事合起來說明
+    下載那層是好的,壞的是「自動更新」那一層。
+
+    根因:`_live_bar_painter` 的所有前置條件寫成一個大 if,任何一條不成立就
+    **安靜地什麼都不做**,而 `_hover_bg` (blit 底圖) 會被縮放/平移/視野變動/
+    尚未觸發 draw_event 等好幾條路作廢 —— 一旦作廢又沒有下一次完整重繪,
+    活K棒就永遠停住,而且日誌一個字都沒有。
+    """
+    import pandas as _pd
+    import numpy as _np
+
+    n = 60
+    base = _np.linspace(40000, 40500, n)
+    df = _pd.DataFrame({'Open': base, 'High': base + 30, 'Low': base - 30,
+                        'Close': base + 5, 'Volume': [1000] * n},
+                       index=_pd.date_range('2026-07-29 09:00', periods=n, freq='5min'))
+
+    logs = []
+    orig_log = app.log_message
+    old = (app.current_symbol, app.current_stock_name, app.asset_type,
+           app.current_timeframe, app.current_df)
+    try:
+        app.log_message = lambda m: (logs.append(m), orig_log(m))[0]
+        app.current_symbol = 'TXFR1'; app.current_stock_name = '臺股期貨近月'
+        app.asset_type = 'futures'; app.current_timeframe = '5分K'
+        app.timeframe_var.set('5分K')
+        app.current_df = df
+        app.draw_chart(df)
+        app.flush_after()
+
+        # --- 1. tick 進來要累積成活K棒 ---
+        app._live_bar = None
+        app._live_bar_on_tick(40776.0)
+        assert app._live_bar and app._live_bar.get('dirty'), "tick 應累積進活K棒並標記 dirty"
+        assert app._live_bar['c'] == 40776.0
+
+        # --- 2. blit 底圖不可用時,必須有退路 (原本是安靜地什麼都不做) ---
+        app._hover_bg = None
+        app._live_bar_fallback_ts = 0.0
+        app._live_bar_fallback_noted = None
+        reason = app._live_bar_blocked_reason()
+        assert reason == 'no_blit_bg', f"應能指出卡在 blit 底圖,實際 {reason!r}"
+        drawn = {'n': 0}
+        cv = app.current_canvas
+        orig_idle = cv.draw_idle
+        try:
+            cv.draw_idle = lambda *a, **k: drawn.__setitem__('n', drawn['n'] + 1)
+            logs.clear()
+            app._live_bar_painter(); app.flush_after()
+            assert drawn['n'] >= 1, \
+                "blit 底圖不可用時必須退回完整重繪,不可以安靜地什麼都不做"
+            assert any('活K棒改用完整重繪' in m for m in logs), \
+                f"第一次退回時應記一行原因,實際: {logs[-2:]}"
+            # 節流:同一秒內不可以連續重繪 (完整重繪很貴)
+            n_before = drawn['n']
+            app._live_bar_painter(); app.flush_after()
+            assert drawn['n'] == n_before, "退路必須節流,不可以每 200ms 就重繪一次"
+        finally:
+            cv.draw_idle = orig_idle
+
+        # --- 3. 沒有新 tick 時不可以亂重繪 ---
+        app._live_bar = None
+        assert app._live_bar_blocked_reason() == 'no_tick'
+
+        # --- 4. 上屏加速:活K棒間隔要比原本的 400ms 快 ---
+        assert app.LIVE_BAR_PAINT_MS < 400, \
+            f"活K棒上屏應比原本 400ms 快,實際 {app.LIVE_BAR_PAINT_MS}"
+
+        # --- 5. 【鐵則5】加快上屏**不可以**連帶把快照 API 打快 ---
+        # 這裡刻意**真的把 worker 跑起來數**,而不是在診斷裡重算一次同樣的
+        # 除法 —— 第一版就是那樣寫的,結果把 worker 裡的 `every` 改成寫死的
+        # 10 (等於上屏變快、API 也跟著變快),診斷照樣是綠的:那只測到我自己
+        # 的公式,沒測到程式。突變測試當場抓到。
+        assert app.WL_STREAM_UI_SEC < 0.25, \
+            f"串流上屏應比原本 0.25s 快,實際 {app.WL_STREAM_UI_SEC}"
+
+        class _StopLoop(Exception):
+            pass
+
+        counters = {'snap': 0, 'rounds': 0}
+        ROUNDS = 200
+        orig_fetch_once = app._wl_fetch_quotes_once
+        orig_ensure = app._wl_ensure_stream_subs
+        orig_sleep = stock_app_pro.time.sleep
+
+        def _fake_sleep(sec):
+            counters['rounds'] += 1
+            counters['sec'] = sec
+            if counters['rounds'] >= ROUNDS:
+                raise _StopLoop
+
+        try:
+            app._wl_fetch_quotes_once = lambda: counters.__setitem__('snap', counters['snap'] + 1)
+            app._wl_ensure_stream_subs = lambda: None
+            stock_app_pro.time.sleep = _fake_sleep
+            try:
+                app.watchlist_quote_worker()
+            except _StopLoop:
+                pass
+        finally:
+            stock_app_pro.time.sleep = orig_sleep
+            app._wl_fetch_quotes_once = orig_fetch_once
+            app._wl_ensure_stream_subs = orig_ensure
+
+        assert counters['snap'] > 0, "worker 應該有打過快照"
+        assert abs(counters.get('sec', 0) - app.WL_STREAM_UI_SEC) < 1e-9, \
+            f"worker 的睡眠間隔應為 WL_STREAM_UI_SEC,實際 {counters.get('sec')}"
+        sim_sec = ROUNDS * app.WL_STREAM_UI_SEC          # 模擬經過的秒數
+        snap_interval = sim_sec / counters['snap']
+        assert abs(snap_interval - 2.5) < 0.15, \
+            (f"股票批次快照必須維持 2.5 秒一次 (鐵則5/ADR-094),"
+             f"實際 {snap_interval:.2f}s ({counters['snap']} 次 / {sim_sec:.1f}s)")
+    finally:
+        app.log_message = orig_log
+        (app.current_symbol, app.current_stock_name, app.asset_type,
+         app.current_timeframe, app.current_df) = old
+        app._live_bar = None
+        app._live_bar_fallback_ts = 0.0
+        app._live_bar_fallback_noted = None
+
+
+run_case("ADR-126: 活K棒 blit 失效要有退路 + 報價上屏加速 (快照節流不變)",
+         _live_chart_refresh_126)
 
 
 print(f"{'案例':60s} 結果")
