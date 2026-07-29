@@ -8167,7 +8167,9 @@ class StockTradingAppPro(tk.Tk):
             # 就會放行,不需要任何人工重開;總開關 _qt_running 全程維持不動。
             if not _forced:
                 tt = strategy_engine.trade_type_of(s)
-                include_night = (s.get('futures_session', 'day_night') != 'day')
+                # 【ADR-124】改走共用判斷:終極波段這類「結構上只做日盤」的種類
+                # 會覆寫存檔值,而且評估迴圈與即時停損從此用的是同一套規則。
+                include_night = strategy_engine.include_night_of(s)
                 if s.get('session_gate', True):
                     if not market_session.is_market_open(tt, include_night=include_night):
                         self._qt_log_session_closed(s, tt, include_night)
@@ -8452,6 +8454,20 @@ class StockTradingAppPro(tk.Tk):
                 continue
             if strategy_engine.trade_type_of(s) != '期貨':
                 continue
+            # 【ADR-124】這條路原本**完全沒有交易時段閘門** —— 它掛在
+            # _qt_update_realtime_pnl 底下每 3 秒跑一次,不看時間。使用者實測:
+            # 終極波段 12:01 開的空單,在 **15:00:01 夜盤開盤第一秒**被平掉
+            # (日盤 13:45 收盤後價格不動,夜盤第一筆真實報價一進來就觸發停損)。
+            # 三條會下單的路徑裡,只有這一條沒有閘門。
+            #
+            # 不會削弱 ADR-087 的原意:那是要解決「盤中帳面已經虧超過停損點卻
+            # 沒動作」,而這裡只在「市場關閉 / 使用者關掉該盤別」時擋 ——
+            # 那種時候本來就不可能成交。session_gate=False 代表使用者明確要求
+            # 不管時間都跑,照舊尊重。
+            if s.get('session_gate', True) and not market_session.is_market_open(
+                    strategy_engine.trade_type_of(s),
+                    include_night=strategy_engine.include_night_of(s)):
+                continue
             sym = s.get('symbol', '')
             live_price = live_price_by_symbol.get(sym)
             if live_price is None:
@@ -8516,6 +8532,13 @@ class StockTradingAppPro(tk.Tk):
         changed = False
         for s in list(self.strategies):
             if not s.get('enabled') or s.get('kind') != chukuangren_band.KIND:
+                continue
+            # 【ADR-124】原本靠 armed_intent + 10 分鐘時效**間接**安全 (只能在
+            # 12:01 前後動作)。補上閘門,讓「終極波段不在夜盤動作」變成結構
+            # 保證而不是巧合。12:01 在日盤內,閘門放行,既有行為不變。
+            if s.get('session_gate', True) and not market_session.is_market_open(
+                    strategy_engine.trade_type_of(s),
+                    include_night=strategy_engine.include_night_of(s)):
                 continue
             rt = self._qt_runtime(s['id'])
             if rt.get('armed_intent') is None:
