@@ -49,6 +49,10 @@ for _attr, _fn in (('QT_STRATEGY_FILE', 'quant_strategies.json'),
 # 【ADR-119】關掉「按 X 之後強制結束行程」的保底看門狗:診斷腳本會呼叫
 # on_app_close() 驗證關閉流程,但它自己還要繼續跑完其餘案例。
 StockTradingAppPro.CLOSE_FORCE_EXIT = False
+# 【ADR-122】大範圍分段下載改成原地做完,讓既有的同步斷言 (呼叫一次
+# _quant_eval_pass 就檢查結果) 維持有效。ADR-122 自己的案例會臨時關掉它,
+# 去驗真正的「背景預抓」時序。
+StockTradingAppPro.QT_PREFETCH_SYNC = True
 app = StockTradingAppPro()
 app.flush_after = getattr(app, "flush_after")  # 來自 _Tk mock
 # 【ADR-115 延伸 / ADR-120】app_settings.json 也是使用者的真實設定檔
@@ -3265,6 +3269,398 @@ def _regime_panel_120():
 
 run_case("ADR-120: 主圖盤勢判斷 (自動通知/重畫不洗版/日K限定/移出終極波段/預設加權日K)",
          _regime_panel_120)
+
+
+
+def _qt_kbars_resilience_121():
+    """【ADR-121】量化策略抓 K 線的開盤韌性。
+
+    使用者實測:策略在 08:45 與 09:00 各噴一次
+    `ShioajiTimeoutError: Timeout Topic: api/v1/data/kbars`,而那兩個時刻正是
+    期貨/台股時段閘門打開的那一秒 —— 開盤瞬間全市場的用戶端同時打同一支 API。
+
+    這裡驗五件事,每一件錯了都不會有錯誤訊息,只會「行為怪怪的」:
+      1. 開盤暖機期間**完全不抓 K 線**;暖機過了才抓。
+      2. 抓失敗會**重試**(靠還原 boundary,下一個 runner tick 重跑同一根K棒),
+         而且重試期間**不記錯誤訊息**。
+      3. 重試用完才記**一次**,而且**停手**(不可以無限每 2 秒重打券商 API)。
+      4. 斷線類例外**不當成可重試的資料錯誤**。
+      5. 資料錯誤**永不自動停用策略**;但策略邏輯錯誤照樣 3 次停用。
+    """
+    import pandas as _pd
+    from core import strategy_engine as _se2
+
+    # 原始分K:80 個營業日 × 5 根,重採樣成日K 後夠算 MA10
+    _idx, _rows = [], []
+    _px = 100.0
+    for _d in _pd.bdate_range('2026-01-01', periods=80):
+        for _h in (9, 10, 11, 12, 13):
+            _px += 0.1
+            _idx.append(_d + _pd.Timedelta(hours=_h))
+            _rows.append({'Open': _px, 'High': _px + 0.5, 'Low': _px - 0.5,
+                          'Close': _px, 'Volume': 1000})
+    RAW = _pd.DataFrame(_rows, index=_pd.DatetimeIndex(_idx))
+
+    class FakeContract:
+        code = '2330'
+        symbol = '2330'
+
+    logs = []
+    orig_log = app.log_message
+    orig_dl = app._download_kbars_raw
+    orig_resolve = app._qt_resolve
+    orig_open = stock_app_pro.market_session.is_market_open
+    orig_just = stock_app_pro.market_session.just_opened
+    # 【ADR-122】這個案例驗的是「單次下載失敗後的重試」,不是分段。把日K 的
+    # 取數天數壓到分段門檻以下,讓它維持一次請求一次呼叫,斷言才數得準。
+    app.QT_TF_DAYS = dict(StockTradingAppPro.QT_TF_DAYS, **{'日K': 30})
+    orig_running, orig_login = app._qt_running, app.api_logged_in
+    orig_strats, orig_rts = app.strategies, app.strategy_runtimes
+    orig_api = app.sj_api
+
+    calls = {'n': 0, 'fail_until': 0}
+
+    def _fake_dl(*_a, **_k):
+        calls['n'] += 1
+        if calls['n'] <= calls['fail_until']:
+            raise RuntimeError('診斷用假逾時: Timeout Topic: api/v1/data/kbars')
+        return RAW
+
+    def _reset(fail_until=0, session_gate=True):
+        """每個子案例都從乾淨狀態開始 (清快取/boundary/重試計數)。"""
+        calls['n'] = 0
+        calls['fail_until'] = fail_until
+        logs.clear()
+        app._kbars_raw_cache.clear()
+        app._qt_last_boundary = {}
+        app._qt_fetch_attempts = {}
+        app._qt_warmup_noted = {}
+        app._qt_usage_logged_date = 'x'      # 診斷不去打真的 usage()
+        st = _se2.new_strategy()
+        st.update({'name': '診斷ADR121', 'symbol': '2330', 'market': '台股',
+                   'timeframe': '日K', 'qty': 1, 'cooldown_sec': 0, 'enabled': True,
+                   'session_gate': session_gate, 'mode': '模擬',
+                   'entry': [{'type': 'ma_cross_up', 'params': {'fast': 3, 'slow': 10}}]})
+        app.strategies = [st]
+        app.strategy_runtimes = {st['id']: _se2.new_runtime()}
+        return st, app.strategy_runtimes[st['id']]
+
+    def _err_logs():
+        return [m for m in logs if '自動交易-資料異常' in m]
+
+    try:
+        app.log_message = lambda m: (logs.append(m), orig_log(m))[0]
+        app._download_kbars_raw = _fake_dl
+        app._qt_resolve = lambda _s: (FakeContract(), 'stock')
+        app.sj_api = object()
+        app.api_logged_in = True
+        app._qt_running = True
+
+        # ---- 1. 開盤暖機期間完全不抓 K 線 ----
+        stock_app_pro.market_session.is_market_open = lambda *a, **k: True
+        stock_app_pro.market_session.just_opened = lambda *a, **k: True
+        _reset(session_gate=True)
+        app._quant_eval_pass(); app.flush_after()
+        assert calls['n'] == 0, f"開盤暖機期間不該抓K線,實際抓了 {calls['n']} 次"
+        assert any('避開開盤尖峰' in m for m in logs), \
+            f"暖機時應記一次說明,實際日誌: {logs[-3:]}"
+        # 暖機只記一次,不可每 2 秒洗版
+        n_note = sum(1 for m in logs if '避開開盤尖峰' in m)
+        app._quant_eval_pass(); app.flush_after()
+        assert sum(1 for m in logs if '避開開盤尖峰' in m) == n_note, "暖機提示不可重複記錄"
+
+        # 暖機過了就要抓 —— 而且是**同一根K棒**,沒有被暖機吃掉
+        stock_app_pro.market_session.just_opened = lambda *a, **k: False
+        app._quant_eval_pass(); app.flush_after()
+        assert calls['n'] >= 1, "暖機結束後應正常抓K線 (該K棒不可被暖機吃掉)"
+
+        # ---- 2. 抓失敗會重試,重試期間不記錯誤 ----
+        _reset(fail_until=2, session_gate=False)
+        app._quant_eval_pass(); app.flush_after()
+        assert calls['n'] == 1 and not _err_logs(), "第1次失敗不該立刻記錯誤"
+        app._quant_eval_pass(); app.flush_after()
+        assert calls['n'] == 2, "boundary 應被還原,下一輪要重試同一根K棒"
+        assert not _err_logs(), "第2次失敗仍不該記錯誤 (還沒用完重試)"
+        app._quant_eval_pass(); app.flush_after()
+        assert calls['n'] == 3, "第3輪應再試一次"
+        assert not _err_logs(), "第3次成功了,不該有任何錯誤訊息"
+
+        # ---- 3. 重試用完:只記一次,而且停手 ----
+        _reset(fail_until=999, session_gate=False)
+        for _ in range(5):
+            app._quant_eval_pass(); app.flush_after()
+        assert calls['n'] == app.QT_KBARS_MAX_ATTEMPTS, \
+            f"重試用完後必須停手,實際打了 {calls['n']} 次 API"
+        assert len(_err_logs()) == 1, f"錯誤訊息應只記一次,實際 {len(_err_logs())} 則"
+
+        # ---- 4. 斷線類例外不當成可重試的資料錯誤 ----
+        _reset(session_gate=False)
+        app._download_kbars_raw = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError('AuthError: Not authenticated'))
+        st4 = app.strategies[0]
+        app._quant_eval_pass(); app.flush_after()
+        assert not _err_logs(), "斷線不是『抓不到資料』,不該走重試那條"
+        assert any('自動交易-異常' in m for m in logs), "斷線應照舊記一般異常"
+        app.api_logged_in = True          # _mark_session_dead 會把它撥掉,還原給後續子案例
+        app._download_kbars_raw = _fake_dl
+
+        # ---- 5a. 資料錯誤永不自動停用策略 ----
+        st5, rt5 = _reset(fail_until=999, session_gate=False)
+        for _ in range(12):
+            app._qt_last_boundary = {}    # 模擬時間往前走 (每輪都是新的K棒邊界)
+            app._quant_eval_pass(); app.flush_after()
+        assert st5['enabled'] is True, \
+            "抓不到K線不可以自動停用策略 —— 停用會連即時停損一起關掉"
+        assert rt5.get('data_error_count', 0) > 0, "資料錯誤應有自己的計數"
+        assert rt5.get('error_count', 0) == 0, "資料錯誤不可以累加到『會停用』的那個計數"
+
+        # ---- 5b. 策略邏輯錯誤照樣 3 次自動停用 (保護沒有被整個拿掉) ----
+        st6, rt6 = _reset(session_gate=False)
+        app._qt_resolve = lambda _s: (None, None)     # 合約解析失敗 → 邏輯錯誤
+        for _ in range(3):
+            app._qt_last_boundary = {}
+            app._quant_eval_pass(); app.flush_after()
+        assert st6['enabled'] is False, "策略邏輯連續 3 次錯誤仍應自動停用"
+    finally:
+        app.__dict__.pop('QT_TF_DAYS', None)
+        app.log_message = orig_log
+        app._download_kbars_raw = orig_dl
+        app._qt_resolve = orig_resolve
+        stock_app_pro.market_session.is_market_open = orig_open
+        stock_app_pro.market_session.just_opened = orig_just
+        app._qt_running, app.api_logged_in = orig_running, orig_login
+        app.strategies, app.strategy_runtimes = orig_strats, orig_rts
+        app.sj_api = orig_api
+        app._qt_last_boundary = {}
+        app._qt_fetch_attempts = {}
+        app._kbars_raw_cache.clear()
+        app._qt_usage_logged_date = None
+
+
+run_case("ADR-121: 開盤暖機/抓K線重試/資料錯誤不停用策略", _qt_kbars_resilience_121)
+
+
+
+def _qt_chunked_prefetch_122():
+    """【ADR-122】大範圍 K 線改走分段下載,而且分段做在背景執行緒上。
+
+    要驗六件事:
+      1. runner 這一輪**完全不下載**(只起預抓),也不算任何錯誤。
+      2. 預抓跑完後,下一輪就能正常評估;而且下載真的是**分段**的
+         (每次請求 ≤ 90 天,次數等於 chunk_plan 算出來的段數)。
+      3. 小請求(5分K)**維持原地下載**,行為與 ADR-122 之前一致。
+      4. 預抓在途不重複開執行緒。
+      5. 預抓失敗才算資料錯誤(而且策略仍不被停用)。
+      6. 主圖的分段門檻與 core/kbars_plan 的常數一致(原始碼層級)。
+    """
+    import pandas as _pd
+    from core import strategy_engine as _se3
+    from core import kbars_plan as _kp
+
+    # 【重要】日期一定要涵蓋「現在往前推 QT_TF_DAYS 天」那段區間 —— 用寫死的
+    # 舊日期會讓每一段都切出空 DataFrame,快取永遠填不進去,而下游斷言
+    # (「第二輪不可再下載」) 在那種情況下**照樣會過**,變成空殼測試 (P-28)。
+    _idx, _rows = [], []
+    _px = 100.0
+    for _d in _pd.bdate_range(end=stock_app_pro.datetime.now(), periods=600):
+        for _h in (9, 11, 13):
+            _px += 0.05
+            _idx.append(_d + _pd.Timedelta(hours=_h))
+            _rows.append({'Open': _px, 'High': _px + 0.5, 'Low': _px - 0.5,
+                          'Close': _px, 'Volume': 1000})
+    RAW = _pd.DataFrame(_rows, index=_pd.DatetimeIndex(_idx))
+
+    class FakeContract:
+        code = '2330'
+        symbol = '2330'
+
+    logs = []
+    orig_log = app.log_message
+    orig_dl = app._download_kbars_raw
+    orig_resolve = app._qt_resolve
+    orig_running, orig_login, orig_api = app._qt_running, app.api_logged_in, app.sj_api
+    orig_strats, orig_rts = app.strategies, app.strategy_runtimes
+    calls = {'spans': [], 'idents': [], 'fail': False,
+             'fail_after': None,      # 前 N 次成功、之後失敗 → 製造「部分成功」
+             'gate': None}            # 設了 Event 就在下載裡等,讓預抓確定停在途中
+
+    import threading as _th
+    _caller_ident = _th.get_ident()      # 診斷腳本自己這條 = 「runner 執行緒」
+
+    def _fake_dl(_c, s0, s1, *_a, **_k):
+        # 記下是哪一條執行緒打的 —— 這個案例的重點就是「大範圍不可以在
+        # runner 那條執行緒上下載」,只數次數分不出來 (背景那條也會累加)。
+        calls['spans'].append((s1 - s0).days)
+        calls['idents'].append(_th.get_ident())
+        if calls['gate'] is not None:
+            calls['gate'].wait(timeout=20)
+        n = len(calls['spans'])
+        if calls['fail'] or (calls['fail_after'] is not None and n > calls['fail_after']):
+            raise RuntimeError('診斷用假逾時: Timeout Topic: api/v1/data/kbars')
+        return RAW[(RAW.index >= s0) & (RAW.index <= s1)]
+
+    def _inline_calls():
+        return [i for i in calls['idents'] if i == _caller_ident]
+
+    def _reset(tf='日K'):
+        calls['spans'] = []
+        calls['idents'] = []
+        calls['fail_after'] = None
+        calls['gate'] = None
+        logs.clear()
+        app._kbars_raw_cache.clear()
+        app._qt_last_boundary = {}
+        app._qt_fetch_attempts = {}
+        app._qt_prefetch_inflight = set()
+        app._qt_prefetch_errors = {}
+        app._qt_usage_logged_date = 'x'
+        st = _se3.new_strategy()
+        st.update({'name': '診斷ADR122', 'symbol': '2330', 'market': '台股',
+                   'timeframe': tf, 'qty': 1, 'cooldown_sec': 0, 'enabled': True,
+                   'session_gate': False, 'mode': '模擬',
+                   'entry': [{'type': 'ma_cross_up', 'params': {'fast': 3, 'slow': 10}}]})
+        app.strategies = [st]
+        app.strategy_runtimes = {st['id']: _se3.new_runtime()}
+        return st, app.strategy_runtimes[st['id']]
+
+    def _wait_prefetch():
+        t = getattr(app, '_qt_prefetch_thread', None)
+        if t is not None:
+            t.join(timeout=30)
+
+    try:
+        app.log_message = lambda m: (logs.append(m), orig_log(m))[0]
+        app._download_kbars_raw = _fake_dl
+        app._qt_resolve = lambda _s: (FakeContract(), 'stock')
+        app.sj_api = object()
+        app.api_logged_in = True
+        app._qt_running = True
+        app.QT_PREFETCH_SYNC = False        # 這個案例就是要驗真正的背景時序
+        app.QT_PREFETCH_RETRIES = 0         # 診斷不需要等退避重試
+        app.QT_PREFETCH_PACE_SEC = 0
+
+        # ---- 1. runner 這一輪不下載,只起預抓 ----
+        st1, rt1 = _reset('日K')
+        app._quant_eval_pass(); app.flush_after()
+        assert _inline_calls() == [], \
+            f"大範圍請求不可以在 runner 執行緒裡下載,實際在該執行緒打了 {len(_inline_calls())} 次"
+        assert rt1.get('data_error_count', 0) == 0, "『資料背景補齊中』不是錯誤,不可計數"
+        assert not [m for m in logs if '資料異常' in m], "背景補資料中不該記資料異常"
+        assert any('背景補齊中' in m for m in logs), \
+            f"應記一行讓使用者知道在補資料,實際: {logs[-3:]}"
+
+        # ---- 2. 預抓完成後下一輪就能評估,而且下載是分段的 ----
+        _wait_prefetch(); app.flush_after()
+        plan = _kp.chunk_plan('日K', app.QT_TF_DAYS['日K'])
+        assert calls['spans'], "預抓執行緒應該真的有下載"
+        assert max(calls['spans']) <= plan['chunk_days'], \
+            f"每段不可超過 {plan['chunk_days']} 天,實際 {max(calls['spans'])}"
+        assert len(calls['spans']) >= 2, f"300 天應該被切成多段,實際 {len(calls['spans'])} 段"
+        # 直接證明「快取真的被填進去了」—— 只驗「第二輪沒再下載」是不夠的:
+        # 預抓失敗時第二輪同樣不會下載 (走的是回報失敗那條),兩種情況分不出來。
+        cached = [k for k in app._kbars_raw_cache if k.endswith('|日K')]
+        assert cached, f"預抓成功後快取應該有資料,實際 keys: {list(app._kbars_raw_cache)}"
+        n_before = len(calls['spans'])
+        app._quant_eval_pass(); app.flush_after()
+        assert len(calls['spans']) == n_before, "第二輪應命中快取,不可再下載"
+        assert rt1.get('data_error_count', 0) == 0, "補完之後不該有任何資料錯誤"
+        assert st1['enabled'] is True
+
+        # ---- 2b. 日K 類快取要放到夠長,10 分鐘的評估間隔才命中得到 ----
+        # 把快取時間戳往前撥 10 分鐘 (= 日K 類的評估間隔)。舊的 300 秒 TTL
+        # 在這裡必定已過期 → 會重新下載;ADR-122 的 1800 秒才命中得到。
+        for _k in list(app._kbars_raw_cache):
+            app._kbars_raw_cache[_k]['t'] -= 600
+        n_before2 = len(calls['spans'])
+        app._qt_last_boundary = {}
+        app._quant_eval_pass(); app.flush_after()
+        assert len(calls['spans']) == n_before2, \
+            "日K 類快取放了 10 分鐘仍應命中 (TTL 若短於評估間隔,快取等於完全沒作用)"
+
+        # ---- 3. 小請求維持原地下載 ----
+        _reset('5分K')
+        app._quant_eval_pass(); app.flush_after()
+        assert len(_inline_calls()) == 1 and len(calls['spans']) == 1, \
+            f"5分K (7天) 應維持在 runner 執行緒單次原地下載,實際 {calls['spans']}"
+
+        # ---- 4. 預抓在途不重複開執行緒 ----
+        _reset('月K')
+        app._quant_eval_pass(); app.flush_after()
+        first = getattr(app, '_qt_prefetch_thread', None)
+        for _ in range(3):
+            app._qt_last_boundary = {}
+            app._quant_eval_pass(); app.flush_after()
+        assert getattr(app, '_qt_prefetch_thread', None) is first, \
+            "同一個 key 在途時不可以再開一條預抓執行緒"
+        _wait_prefetch()
+
+        # ---- 4b. 預抓在途連跑多輪,不可以被算成資料錯誤 ----
+        # 用閘門把預抓確定卡在途中,再連跑到超過重試上限的輪數:若「補資料中」
+        # 被誤當成失敗,錯誤計數就會累積、日誌也會冒出資料異常。
+        st4b, rt4b = _reset('日K')
+        calls['gate'] = _th.Event()
+        app._quant_eval_pass(); app.flush_after()
+        for _ in range(app.QT_KBARS_MAX_ATTEMPTS + 2):
+            app._qt_last_boundary = {}
+            app._quant_eval_pass(); app.flush_after()
+        assert rt4b.get('data_error_count', 0) == 0, \
+            f"預抓在途不可以累積成資料錯誤 (實際 {rt4b.get('data_error_count')})"
+        assert not [m for m in logs if '資料異常' in m], \
+            f"預抓在途不該記資料異常,實際: {[m for m in logs if '資料異常' in m][:2]}"
+        calls['gate'].set(); _wait_prefetch(); app.flush_after()
+        calls['gate'] = None
+
+        # ---- 4c. 部分成功不可以進快取 ----
+        # 缺的若是「最近」那一段,策略會拿過期資料去評估並據此下單 —— 寧可
+        # 下一輪重來,也不要拿殘缺資料冒充完整。
+        _reset('日K')
+        calls['fail_after'] = 2          # 前 2 段成功、其餘失敗
+        app._quant_eval_pass(); app.flush_after()
+        _wait_prefetch(); app.flush_after()
+        assert not [k for k in app._kbars_raw_cache if k.endswith('|日K')], \
+            "分段有段失敗時不可以把殘缺資料寫進快取"
+        calls['fail_after'] = None
+
+        # ---- 5. 預抓失敗才算資料錯誤,而且不停用策略 ----
+        st5, rt5 = _reset('日K')
+        calls['fail'] = True
+        for _ in range(8):
+            app._qt_last_boundary = {}
+            app._quant_eval_pass(); app.flush_after()
+            _wait_prefetch(); app.flush_after()
+        assert rt5.get('data_error_count', 0) > 0, "預抓失敗必須被記成資料錯誤"
+        assert st5['enabled'] is True, "抓不到資料仍然不可以自動停用策略 (ADR-121)"
+        calls['fail'] = False
+    finally:
+        app.QT_PREFETCH_SYNC = True
+        app.__dict__.pop('QT_PREFETCH_RETRIES', None)
+        app.__dict__.pop('QT_PREFETCH_PACE_SEC', None)
+        app.log_message = orig_log
+        app._download_kbars_raw = orig_dl
+        app._qt_resolve = orig_resolve
+        app._qt_running, app.api_logged_in, app.sj_api = orig_running, orig_login, orig_api
+        app.strategies, app.strategy_runtimes = orig_strats, orig_rts
+        app._qt_last_boundary = {}
+        app._qt_fetch_attempts = {}
+        app._qt_prefetch_inflight = set()
+        app._qt_prefetch_errors = {}
+        app._kbars_raw_cache.clear()
+        app._qt_usage_logged_date = None
+
+    # ---- 6. 主圖的分段門檻必須與 core/kbars_plan 的常數一致 ----
+    # 主圖那段是已驗證過的路徑,ADR-122 刻意不動它;但兩邊的數字一旦改岔,
+    # 策略與主圖就會用不同規則,而且沒有任何症狀 (P-67 的老problem)。
+    src = open(stock_app_pro.__file__, encoding='utf-8').read()
+    for frag, why in (
+            (f"is_min_tf and (_t - _f).days > {_kp.MIN_TF_THRESHOLD_DAYS}", '分K門檻'),
+            (f"chunk_days={_kp.MIN_TF_CHUNK_DAYS}, subsplit_days={_kp.MIN_TF_SUBSPLIT_DAYS}", '分K段長'),
+            (f"(not is_min_tf) and (_t - _f).days > {_kp.DAY_TF_THRESHOLD_DAYS}", '日K門檻'),
+            (f"chunk_days={_kp.DAY_TF_CHUNK_DAYS}, abort_cb=", '日K段長')):
+        assert frag in src, f"主圖的{why}與 core/kbars_plan 不一致 (找不到 {frag!r})"
+
+
+run_case("ADR-122: 大範圍K線背景分段預抓 (runner不阻塞/小請求不變/門檻單一出處)",
+         _qt_chunked_prefetch_122)
 
 
 print(f"{'案例':60s} 結果")

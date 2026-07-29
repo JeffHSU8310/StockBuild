@@ -46,6 +46,7 @@ from core import chukuangren_band
 from core import telegram_notify
 from core import telegram_control
 from core import market_pattern
+from core import kbars_plan
 from core import regime_panel
 from core import chips_parser
 from core import chips_features
@@ -3190,6 +3191,110 @@ class TestMarketSession(unittest.TestCase):
         from datetime import datetime as _datetime
         return _datetime(y, mo, d, h, mi)
 
+    def _dts(self, y, mo, d, h, mi, sec=0):
+        from datetime import datetime as _datetime
+        return _datetime(y, mo, d, h, mi, sec)
+
+    # ---------- 【ADR-121】開盤暖機 ----------
+    def test_just_opened_stock_window(self):
+        """09:00:00 起算 30 秒內算「剛開盤」,滿 30 秒放行 (左閉右開)。
+
+        使用者實測 08:45 與 09:00 各噴一次 kbars 逾時 —— 正是閘門打開那一秒
+        去要 K 線的結果。這個窗口寫錯 (早一秒晚一秒) 不會有任何錯誤訊息,
+        只會在開盤那一瞬間繼續踩同一個坑,所以邊界要逐秒驗。
+        """
+        f = lambda sec, mi=0, h=9: market_session.just_opened(
+            '股票', self._dts(2026, 7, 13, h, mi, sec), warmup_sec=30)
+        self.assertFalse(f(59, mi=59, h=8), "08:59:59 還沒開盤")
+        self.assertTrue(f(0), "09:00:00 就算剛開盤")
+        self.assertTrue(f(29), "09:00:29 仍在暖機內")
+        self.assertFalse(f(30), "09:00:30 暖機結束,要放行")
+        self.assertFalse(f(0, mi=1), "09:01:00 早就過了")
+
+    def test_just_opened_futures_day_window(self):
+        """期貨日盤 08:45 —— 使用者兩則逾時的第一則就在這裡。"""
+        f = lambda h, mi, sec: market_session.just_opened(
+            '期貨', self._dts(2026, 7, 13, h, mi, sec), warmup_sec=30)
+        self.assertFalse(f(8, 44, 59))
+        self.assertTrue(f(8, 45, 0))
+        self.assertTrue(f(8, 45, 29))
+        self.assertFalse(f(8, 45, 30))
+
+    def test_just_opened_futures_night_only_at_evening_open(self):
+        """夜盤 15:00 是開盤;凌晨段 (00:00~05:00) 是**同一盤的延續**,不是剛開盤。
+
+        05:00 是收盤不是開盤 —— 把它也當成開盤會在收盤那一刻莫名其妙停一段
+        時間不評估。
+        """
+        self.assertTrue(market_session.just_opened(
+            '期貨', self._dts(2026, 7, 13, 15, 0, 10), warmup_sec=30))
+        self.assertFalse(market_session.just_opened(
+            '期貨', self._dts(2026, 7, 14, 0, 0, 10), warmup_sec=30), "凌晨段不是剛開盤")
+        self.assertFalse(market_session.just_opened(
+            '期貨', self._dts(2026, 7, 14, 5, 0, 10), warmup_sec=30), "05:00 是收盤")
+
+    def test_session_open_minute_contract(self):
+        """`_session_open_minute` 只回「**今天**這一盤的開盤時刻」,不是「盤別的
+        開盤時刻」。
+
+        這條要直接測這個 helper,不能只透過 just_opened 驗 —— 夜盤凌晨段
+        (00:00~05:00) 走 just_opened 時會被 `0 <= elapsed` 這個算式擋掉,
+        所以就算這裡回錯值,just_opened 的結果**看起來仍然是對的**
+        (突變測試實測:改壞它,只測 just_opened 的斷言全部照樣綠)。
+        契約錯了要當場看得見,不能靠下游的算式湊巧擋住。
+        """
+        f = market_session._session_open_minute
+        # 傍晚段:今天 15:00 開的,回 15:00
+        self.assertEqual(f('期貨', self._dts(2026, 7, 13, 15, 0, 10)),
+                         market_session.FUT_NIGHT_OPEN_MIN)
+        # 凌晨段:那一盤是**昨天** 15:00 開的,今天沒有開盤時刻可回
+        self.assertIsNone(f('期貨', self._dts(2026, 7, 14, 0, 30, 0)),
+                          "凌晨段屬前一天的夜盤,不該回今天的開盤時刻")
+        self.assertIsNone(f('期貨', self._dts(2026, 7, 14, 4, 59, 0)))
+        # 日盤與台股
+        self.assertEqual(f('期貨', self._dts(2026, 7, 13, 9, 0, 0)),
+                         market_session.FUT_DAY_OPEN_MIN)
+        self.assertEqual(f('股票', self._dts(2026, 7, 13, 10, 0, 0)),
+                         market_session.STOCK_OPEN_MIN)
+        # 休市 / 未知種類
+        self.assertIsNone(f('股票', self._dts(2026, 7, 13, 14, 0, 0)))
+        self.assertIsNone(f('不存在', self._dts(2026, 7, 13, 10, 0, 0)))
+
+    def test_just_opened_respects_include_night(self):
+        """關閉夜盤的策略,15:00 對它而言是休市,不該回 True。"""
+        self.assertFalse(market_session.just_opened(
+            '期貨', self._dts(2026, 7, 13, 15, 0, 5), include_night=False, warmup_sec=30))
+
+    def test_just_opened_false_when_closed_or_unknown(self):
+        """休市、週末、未知種類一律 False —— 這個函式只負責「剛開盤」這件事,
+        「有沒有開盤」是 is_market_open 的職責,不可以在這裡二度把關。"""
+        self.assertFalse(market_session.just_opened('股票', self._dts(2026, 7, 18, 9, 0, 5)))
+        self.assertFalse(market_session.just_opened('股票', self._dts(2026, 7, 13, 11, 0, 0)))
+        self.assertFalse(market_session.just_opened('不存在', self._dts(2026, 7, 13, 9, 0, 5)))
+
+    def test_just_opened_warmup_zero_disables(self):
+        """暖機秒數設 0/負數 = 關閉這個機制 (使用者想要完全回到舊行為時的出口)。"""
+        for w in (0, -1, None if False else 0.0):
+            self.assertFalse(market_session.just_opened(
+                '股票', self._dts(2026, 7, 13, 9, 0, 0), warmup_sec=w), repr(w))
+
+    def test_just_opened_bad_warmup_is_safe(self):
+        """暖機秒數壞掉時寧可不擋 —— 擋住等於策略整段不評估,比不擋危險。"""
+        self.assertFalse(market_session.just_opened(
+            '股票', self._dts(2026, 7, 13, 9, 0, 0), warmup_sec='abc'))
+
+    def test_just_opened_odd_lot_uses_its_own_open_time(self):
+        """盤中零股開盤時刻是可設定的 (ADR-072),暖機要跟著它走,不是寫死 09:00。"""
+        old = market_session.ODD_LOT_OPEN_MIN
+        try:
+            market_session.set_odd_lot_open_hhmm('09:10')
+            self.assertFalse(market_session.just_opened(
+                '零股', self._dts(2026, 7, 13, 9, 0, 5), warmup_sec=30), "09:00 零股還沒開盤")
+            self.assertTrue(market_session.just_opened(
+                '零股', self._dts(2026, 7, 13, 9, 10, 5), warmup_sec=30))
+        finally:
+            market_session.ODD_LOT_OPEN_MIN = old
+
     def test_stock_open_hours(self):
         # 週一 09:00 開、13:30 收 (含邊界),盤前/盤後關
         self.assertFalse(market_session.is_stock_open(self._dt(2026, 7, 13, 8, 59)))
@@ -5710,6 +5815,81 @@ class TestRegimePanel(unittest.TestCase):
                     'triangle_descending', 'wedge_rising', 'wedge_falling'):
             self.assertIn(pid, regime_panel.PERSISTENT_PATTERN_IDS, pid)
         self.assertNotIn('double_top', regime_panel.PERSISTENT_PATTERN_IDS)
+
+
+
+
+class TestKBarsPlan(unittest.TestCase):
+    """【ADR-122】kbars 請求要不要分段、每段幾天。
+
+    shioaji 的 kbars 一律回 1 分 K (日/周/月K 是本地重採樣的),所以「天數」
+    直接等於資料量 —— 範圍一大單次請求就容易在券商端逾時。門檻寫錯不會有
+    錯誤訊息,只會在某個週期上偶爾逾時,而且很難重現。
+    """
+
+    def test_decision_is_driven_by_chunk_size_not_threshold(self):
+        """判斷依據是「切得出第二段嗎」,不是「過門檻了嗎」。
+
+        threshold 常數只留給診斷去比對主圖的字面值 (確保兩邊規則沒改岔),
+        不參與判斷 —— 在 threshold <= chunk 的參數下那句永遠不會改變結果,
+        寫了就是一條測不到的死枝。
+        """
+        self.assertIsNone(kbars_plan.chunk_plan('日K', kbars_plan.DAY_TF_CHUNK_DAYS))
+        self.assertIsNotNone(kbars_plan.chunk_plan('日K', kbars_plan.DAY_TF_CHUNK_DAYS + 1))
+        self.assertIsNone(kbars_plan.chunk_plan('5分K', kbars_plan.MIN_TF_CHUNK_DAYS))
+        self.assertIsNotNone(kbars_plan.chunk_plan('5分K', kbars_plan.MIN_TF_CHUNK_DAYS + 1))
+
+    def test_single_segment_counts_as_no_chunking(self):
+        """過了門檻但只切得出一段 = 不需分段。
+
+        分K 的門檻是 5 天、段長卻是 10 天,所以 6~10 天都是「過門檻但只有
+        一段」。那跟單次下載完全一樣,卻要多繞一條背景預抓的路 —— 等於平白
+        改變一條使用者每天在跑的路徑 (5分K 取 7 天) 的行為。
+        這條實作時真的寫錯過,診斷案例當場抓到。
+        """
+        for d in range(kbars_plan.MIN_TF_THRESHOLD_DAYS + 1,
+                       kbars_plan.MIN_TF_CHUNK_DAYS + 1):
+            self.assertIsNone(kbars_plan.chunk_plan('5分K', d), f"{d} 天只有一段")
+        self.assertIsNotNone(kbars_plan.chunk_plan('5分K', kbars_plan.MIN_TF_CHUNK_DAYS + 1))
+
+    def test_min_and_day_timeframes_use_different_rules(self):
+        """分K 類與日K 類的門檻/段長不同,不可以共用一組數字。"""
+        self.assertTrue(kbars_plan.is_min_timeframe('60分K'))
+        self.assertFalse(kbars_plan.is_min_timeframe('日K'))
+        self.assertEqual(kbars_plan.chunk_plan('60分K', 35)['chunk_days'],
+                         kbars_plan.MIN_TF_CHUNK_DAYS)
+        self.assertEqual(kbars_plan.chunk_plan('60分K', 35)['segments'], 4)
+        self.assertEqual(kbars_plan.chunk_plan('日K', 300)['chunk_days'],
+                         kbars_plan.DAY_TF_CHUNK_DAYS)
+
+    def test_actual_strategy_lookbacks(self):
+        """對上策略路徑真正會用的天數 (QT_TF_DAYS):哪些要分段、哪些不用。
+
+        1分K/5分K **不可以**被判成要分段 —— 那兩個是使用者現在真的在跑的
+        週期,改成走背景預抓等於改變它們的行為 (ADR-122 明講行為零改變)。
+        """
+        for tf, days, need in [('1分K', 4, False), ('5分K', 7, False),
+                               ('15分K', 14, True), ('30分K', 21, True),
+                               ('60分K', 35, True), ('日K', 300, True),
+                               ('周K', 700, True), ('月K', 1500, True)]:
+            got = kbars_plan.chunk_plan(tf, days)
+            self.assertEqual(got is not None, need, f"{tf} {days}天")
+
+    def test_segments_estimate(self):
+        self.assertEqual(kbars_plan.chunk_plan('日K', 300)['segments'], 4)
+        self.assertEqual(kbars_plan.chunk_plan('月K', 1500)['segments'], 17)
+
+    def test_unknown_timeframe_is_conservative(self):
+        """認不得的週期當日K 類處理:寧可多切幾段 (慢但會成功),
+        也不要拿未知週期去發一個可能逾時的大請求。"""
+        self.assertFalse(kbars_plan.is_min_timeframe('45分K'))
+        self.assertIsNone(kbars_plan.chunk_plan('45分K', 30))
+        self.assertIsNotNone(kbars_plan.chunk_plan('45分K', 300))
+
+    def test_garbage_input_returns_none(self):
+        for days in (None, 'abc', 0, -5, float('nan')):
+            self.assertIsNone(kbars_plan.chunk_plan('日K', days), repr(days))
+        self.assertFalse(kbars_plan.is_min_timeframe(None))
 
 
 

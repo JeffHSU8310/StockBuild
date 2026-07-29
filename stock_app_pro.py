@@ -50,6 +50,8 @@ from core import chukuangren_band
 from core import telegram_notify
 from core import telegram_control
 from core import market_pattern
+# 【ADR-122】kbars 請求要不要分段、每段幾天 (門檻與段長的單一出處)。
+from core import kbars_plan
 # 【ADR-120】主圖【盤勢判斷】面板的純邏輯 (設定正規化 + 通知去重)。
 from core import regime_panel
 # 【ADR-100】籌碼資料:解析純邏輯在 core/,本地 CSV 存取在 data/。
@@ -3381,7 +3383,8 @@ class StockTradingAppPro(tk.Tk):
     KBARS_CACHE_MAX = 6      # 快取最多保留幾檔商品的原始分K (LRU 淘汰最舊)
 
     def _download_kbars_chunked(self, contract, start_dt, end_dt, chunk_days=90, progress_cb=None,
-                                retries=2, pace_sec=0.35, subsplit_days=30, abort_cb=None):
+                                retries=2, pace_sec=0.35, subsplit_days=30, abort_cb=None,
+                                stats=None):
         """
         【ADR-046/047 → ADR-048 強化】分段下載歷史K線。
 
@@ -3404,6 +3407,12 @@ class StockTradingAppPro(tk.Tk):
 
         progress_cb(done, total, seg_start, seg_end, n_rows) 每段完成後回呼。
         回傳串接後的 DataFrame (可能為空);session dead 直接往上拋。
+
+        【ADR-122】stats:傳一個 dict 進來,結束時會被填上
+        {'ok_segs','fail_segs','aborted','total_segs'}。**部分成功也是回傳
+        DataFrame**,呼叫端光看回傳值分不出「完整」與「缺了最近那一段」——
+        後者拿去給策略評估會用到過期的資料,所以策略路徑一定要看 stats。
+        不傳則行為完全不變 (主圖既有呼叫端不受影響)。
         """
         segs = []
         cur = start_dt
@@ -3499,7 +3508,11 @@ class StockTradingAppPro(tk.Tk):
                     sub_end = min(sub + timedelta(days=subsplit_days), s1)
                     if pace_sec > 0:
                         time.sleep(pace_sec)
-                    sp = _try_seg(sub, sub_end, 1)
+                    # 【ADR-122】原本寫死 1 次重試,等於 retries=0 的呼叫端
+                    # 「說不要重試」在這條搶救路徑上不被尊重 (每個小段照樣
+                    # 睡 1.5 秒)。min() 讓既有呼叫端行為完全不變 (retries=2
+                    # → 仍是 1),但 retries=0 現在真的是 0。
+                    sp = _try_seg(sub, sub_end, min(1, retries))
                     if sp is not None and not sp.empty:
                         sub_parts.append(sp)
                     sub = sub_end + timedelta(days=1)
@@ -3516,6 +3529,9 @@ class StockTradingAppPro(tk.Tk):
                 try: progress_cb(i, len(segs), s0, s1, n_rows)
                 except Exception: pass
 
+        if stats is not None:
+            stats.update({'ok_segs': ok_segs, 'fail_segs': fail_segs,
+                          'aborted': aborted, 'total_segs': len(segs)})
         if not parts:
             return pd.DataFrame()
         out = pd.concat(parts)
@@ -3589,12 +3605,17 @@ class StockTradingAppPro(tk.Tk):
             out.index = out.index + pd.Timedelta(minutes=mins)
         return out
 
-    def _kbars_cache_get(self, key, need_start):
-        """取快取。回傳 (raw_df涵蓋need_start之後 或 None, 是否新鮮)。"""
+    def _kbars_cache_get(self, key, need_start, ttl=None):
+        """取快取。回傳 (raw_df涵蓋need_start之後 或 None, 是否新鮮)。
+
+        【ADR-122】ttl 可由呼叫端覆寫。不傳 = 沿用類別常數 (主圖行為不變);
+        策略路徑的日K 類會傳一個長很多的值,理由見 QT_CACHE_TTL_DAY_TF。
+        """
         c = self._kbars_raw_cache.get(key)
         if not c or c['start'] > need_start:
             return None, False
-        ttl = self.CACHE_TTL_DAY_TF if c.get('tf_class') == 'day' else self.CACHE_TTL_MIN_TF
+        if ttl is None:
+            ttl = self.CACHE_TTL_DAY_TF if c.get('tf_class') == 'day' else self.CACHE_TTL_MIN_TF
         fresh = (time.time() - c['t']) <= ttl
         try:
             return c['df'].loc[c['df'].index >= need_start], fresh
@@ -7471,7 +7492,8 @@ class StockTradingAppPro(tk.Tk):
 
     def _qt_finish_set_enabled(self, s, flag):
         s['enabled'] = bool(flag)
-        rt = self._qt_runtime(s['id']); rt['error_count'] = 0
+        # 【ADR-121】兩個計數都歸零:手動重新啟用等於「重新開始算」。
+        rt = self._qt_runtime(s['id']); rt['error_count'] = 0; rt['data_error_count'] = 0
         self._qt_save(); self._qt_save_state(); self._qt_refresh_tree(); self._qt_update_status_label()
         self.log_message(f"【自動交易】策略「{s.get('name')}」已{'啟用' if flag else '停用'}。")
 
@@ -7621,13 +7643,19 @@ class StockTradingAppPro(tk.Tk):
         except Exception:
             return (None, None, sym, '台股')
 
-    def _qt_fetch_closed_bars(self, strategy, contract, asset_type, tf=None, cache_sym=None, cache_market=None):
+    def _qt_fetch_closed_bars(self, strategy, contract, asset_type, tf=None, cache_sym=None,
+                              cache_market=None, allow_blocking=False):
         """
         取策略用的「已收盤」K棒:下載(或快取)原始分K → 依週期重採樣 →
         剔除最後一根 (可能未完成)。回傳 df (可能為空)。
 
         【ADR-074】tf / cache_sym / cache_market 可覆寫,用來抓「訊號來源 A」的
         K棒 (A 的週期、A 的代碼);不帶時就抓策略本身 (執行商品 B) 的設定。
+
+        【ADR-122】allow_blocking:呼叫端是不是「自己一條執行緒、慢一點沒關係」。
+        量化 runner 一律 False (阻塞會拖住即時停損,見 P-90) —— 大範圍請求改丟
+        給背景預抓、當場拋 KBarsPending。策略試跑/回測那種本來就在自己的 worker
+        執行緒上跑的呼叫端傳 True,直接在原地把分段下載做完,不必等下一輪。
         """
         tf = tf or strategy.get('timeframe', '5分K')
         days = self.QT_TF_DAYS.get(tf)
@@ -7649,11 +7677,53 @@ class StockTradingAppPro(tk.Tk):
         _sym = (cache_sym or str(strategy.get('symbol'))).upper()
         _mkt = cache_market or strategy.get('market')
         key = f"QT|{_mkt}|{_sym}|{tf}"
-        raw, fresh = self._kbars_cache_get(key, start_dt)
+        # 【ADR-122】日K 類的快取放長:_qt_fetch_closed_bars 本來就會丟掉最後
+        # 一根,所以日K 策略盤中整段時間「評估用的資料」完全不變,重抓沒有
+        # 任何意義 (詳見 QT_CACHE_TTL_DAY_TF 的說明)。分K 類維持原本的 30 秒
+        # —— 那個資料每根K棒真的會變,拉長會漏訊號。
+        _ttl = None if kbars_plan.is_min_timeframe(tf) else self.QT_CACHE_TTL_DAY_TF
+        raw, fresh = self._kbars_cache_get(key, start_dt, ttl=_ttl)
         if raw is None or not fresh:
-            raw = self._download_kbars_raw(contract, start_dt, end_dt)
-            if raw is not None and not raw.empty:
-                self._kbars_cache_put(key, start_dt, raw, tf)
+            plan = kbars_plan.chunk_plan(tf, days)
+            if plan is not None and (allow_blocking or self.QT_PREFETCH_SYNC):
+                # 自己的執行緒:原地分段下載,睡多久都只影響自己
+                stats = {}
+                raw = self._download_kbars_chunked(
+                    contract, start_dt, end_dt, chunk_days=plan['chunk_days'],
+                    subsplit_days=plan['subsplit_days'], stats=stats)
+                if raw is not None and not raw.empty and not stats.get('fail_segs'):
+                    self._kbars_cache_put(key, start_dt, raw, tf)
+            elif plan is not None:
+                # 【ADR-122】大範圍請求不在 runner 執行緒裡做:分段要跑好幾個
+                # 請求 + 段間節流,月K 的 17 段會阻塞十幾秒,而同一條迴圈上還
+                # 有每 3 秒的即時停損檢查 (P-90)。丟給背景執行緒,這一輪先回
+                # KBarsPending,ADR-121 的 boundary 還原機制會讓下一個 tick
+                # 再來看一次快取。
+                # 上一次預抓失敗的話先把它回報出去 (消費掉),再讓下一輪重開一條。
+                # 順序很重要:先報再開,否則失敗會被新的一輪「進行中」蓋掉,
+                # 變成無聲的無限重試。
+                failed = self._qt_prefetch_take_error(key)
+                if failed:
+                    raise strategy_engine.KBarsUnavailable(failed)
+                self._qt_start_kbars_prefetch(key, contract, start_dt, end_dt, tf, plan)
+                raise strategy_engine.KBarsPending(
+                    f"{_sym} {tf} 需分 {plan['segments']} 段補資料,背景進行中")
+            else:
+                # 小範圍 (1分K/5分K):維持 ADR-122 之前的單次下載,行為零改變,
+                # 也不會為了一個小請求多開一條執行緒。
+                try:
+                    raw = self._download_kbars_raw(contract, start_dt, end_dt)
+                except Exception as e:
+                    # 【ADR-121】把「抓資料失敗」包成專屬型別,讓 _quant_eval_pass
+                    # 分得出它跟「策略邏輯壞掉」——前者要重試、不可自動停用策略。
+                    # 斷線類例外維持原樣直接上拋:那不是暫時性失敗,重試沒有意義,
+                    # 而且上層要靠它觸發 _mark_session_dead。
+                    if self._looks_like_session_dead(e):
+                        raise
+                    raise strategy_engine.KBarsUnavailable(
+                        f"{type(e).__name__}: {e}") from e
+                if raw is not None and not raw.empty:
+                    self._kbars_cache_put(key, start_dt, raw, tf)
         if raw is None or raw.empty:
             return pd.DataFrame()
         df = self._resample_sj_df(raw, tf, asset_type=asset_type)
@@ -7872,6 +7942,203 @@ class StockTradingAppPro(tk.Tk):
                             f"開始自動評估與下單。")
         self._qt_session_state[s['id']] = 'open'
 
+    # ------------------------------------------------------------------
+    # 【ADR-121】開盤暖機 + 抓資料失敗的重試/記錄
+    # ------------------------------------------------------------------
+    QT_OPEN_WARMUP_SEC = market_session.QT_OPEN_WARMUP_SEC   # 開盤後幾秒內不抓K線
+    QT_KBARS_MAX_ATTEMPTS = 3                                # 同一根K棒最多試幾次
+
+    # 【ADR-122】策略路徑的日K 類快取新鮮度。
+    #
+    # 為什麼可以放這麼長 (相對於主圖的 CACHE_TTL_DAY_TF=300):
+    # _qt_fetch_closed_bars 會**丟掉最後一根**視為未完成。對日K 策略而言,
+    # 盤中整段時間「最後一根」都是今天,丟掉之後**評估用的資料從開盤到收盤
+    # 完全不變** —— 要等到隔天第一根日K 出現,評估集合才會多一根。
+    # 舊值 300 秒 < 日K 類 10 分鐘的評估間隔,等於「快取必定過期、完全沒作用」,
+    # 每次評估都重打一次 300 天的大請求。
+    # 分K 類不適用這個推論 (資料每根K棒真的會變),維持 CACHE_TTL_MIN_TF。
+    QT_CACHE_TTL_DAY_TF = 1800
+
+    # 【ADR-122 測試接縫】True = 大範圍分段下載改成「原地做完」而不是丟背景
+    # 執行緒。production 永遠是 False;診斷腳本設 True,好讓既有的同步斷言
+    # (呼叫一次 _quant_eval_pass 就檢查結果) continue to work。
+    # 同 CLOSE_FORCE_EXIT 的做法 (P-74):會改變時序的機制一定要留一個明確的
+    # 測試開關,不要讓測試去猜執行緒什麼時候跑完。
+    QT_PREFETCH_SYNC = False
+    # 預抓執行緒的分段下載參數。跑在自己的執行緒上,所以退避重試照用
+    # (睡多久都只影響它自己);拉出來當常數是為了讓診斷能調快。
+    QT_PREFETCH_RETRIES = 2
+    QT_PREFETCH_PACE_SEC = 0.35
+
+    def _qt_prefetch_init(self):
+        """三個欄位各自獨立檢查,不可以用「第一個沒有就三個一起建」的寫法。
+
+        那種寫法只要有人單獨重設其中一個 (診斷腳本重設 _qt_prefetch_inflight
+        就踩到了),剩下兩個就永遠不會被建立,拿到的是 AttributeError。
+        """
+        if not hasattr(self, '_qt_prefetch_lock'):
+            self._qt_prefetch_lock = threading.Lock()
+        if not hasattr(self, '_qt_prefetch_inflight'):
+            self._qt_prefetch_inflight = set()
+        if not hasattr(self, '_qt_prefetch_errors'):
+            self._qt_prefetch_errors = {}
+
+    def _qt_prefetch_take_error(self, key):
+        """【ADR-122】取出並清掉某個 key 上一次預抓的失敗訊息 (只回報一次)。
+
+        清掉是刻意的:回報過之後就讓下一輪重新開一條預抓去試。若留著不清,
+        同一則失敗會在每個 tick 重複回報;若不回報只重開,失敗就會完全無聲。
+        """
+        self._qt_prefetch_init()
+        with self._qt_prefetch_lock:
+            return self._qt_prefetch_errors.pop(key, None)
+
+    def _qt_start_kbars_prefetch(self, key, contract, start_dt, end_dt, tf, plan):
+        """【ADR-122】在背景執行緒分段補一份大範圍K線,補完寫進 _kbars_raw_cache。
+
+        為什麼要另開執行緒:分段要跑好幾個請求 + 段間節流,月K 的 17 段光節流
+        就 5.6 秒。量化 runner 是單執行緒,同一條迴圈上還有每 3 秒的
+        _qt_update_realtime_pnl (期貨即時停損停利靠它) —— 在那裡阻塞十幾秒
+        正是 P-90 說不可以做的事。搬到自己的執行緒上之後,分段下載原本的
+        退避重試 (retries=2) 也可以照用,睡多久都只影響它自己。
+
+        同一個 key 只會有一條在跑 (_qt_prefetch_inflight)。中止條件不用自己寫:
+        _download_kbars_chunked 每段開始前都會問 _downloads_should_abort()
+        (涵蓋關閉程式/登出/強制終止,ADR-060)。
+        """
+        self._qt_prefetch_init()
+        with self._qt_prefetch_lock:
+            if key in self._qt_prefetch_inflight:
+                return False
+            self._qt_prefetch_inflight.add(key)
+
+        self.safe_after(0, self.log_message,
+                        f"【自動交易-資料】{key.split('|')[-2]} {tf} 歷史資料分 "
+                        f"{plan['segments']} 段在背景補齊中,補完後策略會自動開始評估。")
+
+        def _worker():
+            try:
+                stats = {}
+                raw = self._download_kbars_chunked(
+                    contract, start_dt, end_dt,
+                    chunk_days=plan['chunk_days'], subsplit_days=plan['subsplit_days'],
+                    retries=self.QT_PREFETCH_RETRIES, pace_sec=self.QT_PREFETCH_PACE_SEC,
+                    stats=stats)
+                # 【重要】部分成功不可以進快取:缺的若是**最近**那一段,策略會
+                # 拿過期資料去評估並據此下單。寧可下一輪重來,也不要拿殘缺資料
+                # 冒充完整 (同鐵則4「沒有真實資料就不要捏造」的精神)。
+                if raw is None or raw.empty or stats.get('fail_segs') or stats.get('aborted'):
+                    self._qt_prefetch_errors[key] = (
+                        f"{tf} 分段補資料未完成 (成功 {stats.get('ok_segs', 0)} 段 / "
+                        f"失敗 {stats.get('fail_segs', 0)} 段)")
+                    return
+                self._kbars_cache_put(key, start_dt, raw, tf)
+                self._qt_prefetch_errors.pop(key, None)
+            except Exception as e:
+                self._qt_prefetch_errors[key] = f"{type(e).__name__}: {e}"
+            finally:
+                with self._qt_prefetch_lock:
+                    self._qt_prefetch_inflight.discard(key)
+
+        t = threading.Thread(target=_worker, daemon=True)
+        self._qt_prefetch_thread = t      # 診斷用:可以 join 等它跑完
+        t.start()
+        return True
+
+    def _qt_log_open_warmup(self, s, trade_type, include_night):
+        """開盤暖機只記一次 (每檔策略每次開盤),不要每 2 秒洗版。"""
+        if not hasattr(self, '_qt_warmup_noted'):
+            self._qt_warmup_noted = {}
+        label = market_session.session_label(trade_type, include_night=include_night)
+        key = f"{datetime.now():%Y-%m-%d}|{label}"
+        if self._qt_warmup_noted.get(s['id']) == key:
+            return
+        self._qt_warmup_noted[s['id']] = key
+        self.safe_after(0, self.log_message,
+                        f"【自動交易-開盤】策略「{s.get('name')}」({label}) 先等 "
+                        f"{self.QT_OPEN_WARMUP_SEC} 秒避開開盤尖峰再開始抓K線 —— "
+                        f"開盤後第一根「已收盤」K棒本來就還沒生出來,不影響訊號。")
+
+    def _qt_on_kbars_fetch_error(self, s, rt, exc, boundary_key, prev_boundary):
+        """【ADR-121】抓 K 線失敗:先重試,重試用完才記錄;永不自動停用策略。
+
+        【為什麼重試不用 time.sleep()】量化 runner 是單執行緒,原地睡會一併
+        拖住其他策略與 _qt_update_realtime_pnl (每 3 秒,期貨即時停損停利靠
+        它)。主圖那條路可以睡 (它自己一條背景執行緒),這裡不行 —— 拿一個
+        錯誤訊息換掉即時停損,是更糟的交易。
+
+        改用 runner 自己的 2 秒節奏當退避:把 boundary 還原,下一個 tick 就會
+        再評估同一根K棒。三次都失敗才記錄,並把 boundary 寫回去停止重試
+        (不可以無限每 2 秒重打券商 API)。
+
+        【為什麼不自動停用】抓不到資料時策略本來就不會產生任何 intent,停用
+        它得不到任何保護;但停用會讓 _quant_eval_pass 與
+        _qt_check_realtime_futures_stops 都跳過這檔策略 —— 部位還在,停損卻
+        不跑了。網路瞬斷不該有這種後果。
+        """
+        sid = s['id']
+
+        # 【ADR-122】「資料還在背景補」不是錯誤,是預期中的等待:不計任何
+        # 錯誤、不記日誌 (啟動預抓時已經記過一行),單純把 boundary 還原,
+        # 讓下一個 tick 再看一次快取。這裡刻意**不進重試計數** —— 分段補
+        # 一份月K 要好幾十秒,用 3 次上限去卡它會讓它永遠補不完。
+        if isinstance(exc, strategy_engine.KBarsPending):
+            if boundary_key is not None:
+                if prev_boundary is None:
+                    self._qt_last_boundary.pop(sid, None)
+                else:
+                    self._qt_last_boundary[sid] = prev_boundary
+            return
+
+        if not hasattr(self, '_qt_fetch_attempts'):
+            self._qt_fetch_attempts = {}
+        prev_key, n = self._qt_fetch_attempts.get(sid, (None, 0))
+        n = (n + 1) if prev_key == boundary_key else 1
+        self._qt_fetch_attempts[sid] = (boundary_key, n)
+
+        if boundary_key is not None and n < self.QT_KBARS_MAX_ATTEMPTS:
+            # 還原 boundary → 下一個 runner tick (2 秒後) 重試同一根K棒
+            if prev_boundary is None:
+                self._qt_last_boundary.pop(sid, None)
+            else:
+                self._qt_last_boundary[sid] = prev_boundary
+            return
+
+        rt['data_error_count'] = int(rt.get('data_error_count', 0)) + 1
+        self.safe_after(0, self.log_message,
+                        f"【自動交易-資料異常】策略「{s.get('name')}」連 {n} 次抓不到K線: {exc}"
+                        f" —— 已自動重試,策略維持啟用 (抓不到資料時本來就不會下單)。")
+        self._qt_log_kbars_usage_once()
+        if rt['data_error_count'] % 3 == 0:
+            self.safe_after(0, self.log_message,
+                            f"【自動交易-資料異常】⚠ 策略「{s.get('name')}」已累計 "
+                            f"{rt['data_error_count']} 次抓不到K線。若持續發生,請確認網路與"
+                            f"券商 API 流量 (上方日誌會附流量數字)。")
+
+    def _qt_log_kbars_usage_once(self):
+        """【ADR-121】抓資料失敗時把 API 流量寫進日誌,每天只印一次。
+
+        沿用主圖 _download_kbars_chunked._log_usage_once 的做法。沒有這個數字,
+        「券商端暫時性管制」與「當日流量耗盡」在日誌上長得一模一樣 —— 這正是
+        使用者回報 kbars 逾時時無從判斷的原因。
+        """
+        today = f"{datetime.now():%Y-%m-%d}"
+        if getattr(self, '_qt_usage_logged_date', None) == today:
+            return
+        self._qt_usage_logged_date = today
+        try:
+            u = self.sj_api.usage()
+            used = getattr(u, 'bytes', None)
+            limit = getattr(u, 'limit_bytes', None)
+            remain = getattr(u, 'remaining_bytes', None)
+            if used is not None:
+                self.safe_after(0, self.log_message,
+                                f"【自動交易-診斷】API 流量:已用 {used/1048576:.1f}MB / 上限 "
+                                f"{(limit or 0)/1048576:.0f}MB / 剩餘 {(remain or 0)/1048576:.1f}MB "
+                                f"(剩餘充足=暫時性管制,稍後自行恢復;趨近 0=今日流量耗盡)。")
+        except Exception:
+            pass
+
     def _quant_eval_pass(self, now_ts=None, today_str=None):
         """跑一輪全部策略的評估 (抽成獨立方法方便離線測試)。在背景執行緒執行。
         【ADR-041】明確傳入 now_ts/today_str (測試/手動觸發) 時跳過邊界閘門強制評估;
@@ -7906,8 +8173,21 @@ class StockTradingAppPro(tk.Tk):
                     continue
                 else:
                     self._qt_note_session_open(s, tt, include_night)
+                # 【ADR-121】開盤暖機:閘門剛打開的那幾秒不要去要 K 線。
+                # 使用者實測 08:45/09:00 各噴一次 kbars 逾時,而那正是本檔
+                # 策略當天第一次評估的時刻 —— 開盤瞬間全市場的用戶端同時打
+                # 同一支 API。這裡刻意放在 _qt_last_boundary 被寫入**之前**,
+                # 所以這根K棒沒有被吃掉,暖機結束後同一根照樣會評估到。
+                if market_session.just_opened(tt, include_night=include_night,
+                                              warmup_sec=self.QT_OPEN_WARMUP_SEC):
+                    self._qt_log_open_warmup(s, tt, include_night)
+                    continue
             # 【ADR-041】邊界感知:只有該策略週期的K棒剛收盤才評估 (測試/手動觸發不受限)
             # 【ADR-074】看A做B 時,訊號來自 A,節奏依 A 的週期 (watch_timeframe)。
+            # 【ADR-121】boundary_key / _prev_boundary 要讓下面的 except 看得到:
+            # 抓資料失敗時要能把 boundary 還原,讓下一個 runner tick 重試同一根K棒。
+            boundary_key = None
+            _prev_boundary = None
             if not _forced:
                 # 【新ADR 自訂週期】改用 strategy_engine.timeframe_minutes()
                 # (涵蓋任意正整數的自訂 N分K/N時K,不再只認 1/5/15/30/60 這
@@ -7935,6 +8215,7 @@ class StockTradingAppPro(tk.Tk):
                     boundary_key = str(boundary)
                 if self._qt_last_boundary.get(s['id']) == boundary_key:
                     continue
+                _prev_boundary = self._qt_last_boundary.get(s['id'])
                 self._qt_last_boundary[s['id']] = boundary_key
             try:
                 # 【ADR-074 看A做B】B (執行商品):下單、損益都用它;A (訊號來源):
@@ -8071,7 +8352,14 @@ class StockTradingAppPro(tk.Tk):
                         except Exception:
                             self.safe_after(0, self.log_message, f"【自動交易-模擬】🧪 {label} | {intent['reason']} (模擬)")
                 rt['error_count'] = 0
+                rt['data_error_count'] = 0
+            except strategy_engine.KBarsFetchError as e:
+                # 【ADR-121】抓不到K線是外部環境問題,先重試;重試用完才記錄,
+                # 而且**永遠不會**因此自動停用策略 (見 _qt_on_kbars_fetch_error)。
+                self._qt_on_kbars_fetch_error(s, rt, e, boundary_key, _prev_boundary)
             except Exception as e:
+                # 【ADR-121】這裡只剩「策略邏輯/下單路徑」的錯誤。自動停用維持
+                # 原本的行為 —— 真的壞掉的策略就該停手。
                 rt['error_count'] = int(rt.get('error_count', 0)) + 1
                 self.safe_after(0, self.log_message,
                                 f"【自動交易-異常】策略「{s.get('name')}」第 {rt['error_count']} 次錯誤: {type(e).__name__}: {e}")
@@ -8940,7 +9228,8 @@ class StockTradingAppPro(tk.Tk):
                 self.safe_after(0, self.log_message, f"【自訂策略-試跑】合約解析失敗: {strat.get('symbol')}")
                 _notify(f"✗ 合約解析失敗: {strat.get('symbol')} (代碼打錯?未登入?)", False)
                 return
-            df = self._qt_fetch_closed_bars(strat, contract, asset_type)
+            # 【ADR-122】試跑在自己的 worker 執行緒上,可以原地把分段下載做完
+            df = self._qt_fetch_closed_bars(strat, contract, asset_type, allow_blocking=True)
             if df is None or df.empty:
                 self.safe_after(0, self.log_message, "【自訂策略-試跑】取不到K線資料。")
                 _notify("✗ 取不到K線資料。", False)

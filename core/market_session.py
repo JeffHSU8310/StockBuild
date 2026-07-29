@@ -168,3 +168,63 @@ def session_label(trade_type, dt=None, include_night=True):
             return '期貨夜盤'
         return '休市'
     return '休市'
+
+
+# ---------------------------------------------------------------------------
+# 【ADR-121】開盤暖機
+# ---------------------------------------------------------------------------
+# 使用者實測:量化策略在 08:45 與 09:00 各出現一次
+# `ShioajiTimeoutError: Timeout Topic: api/v1/data/kbars ... 30000ms`。
+# 這兩個時刻正好是 FUT_DAY_OPEN_MIN 與 STOCK_OPEN_MIN —— 也就是時段閘門
+# 打開的那一秒。量化 runner 每 2 秒醒一次,閘門一開就立刻發出當天第一個
+# kbars 請求,而那一秒全台灣所有 shioaji 用戶端都在做同一件事,券商的
+# kbars 服務同時還在為新交易日翻檔。
+#
+# 解法是「別在鐘響那一秒去要 K 線」。這個延遲**不損失任何資訊**:呼叫端
+# (_qt_fetch_closed_bars) 本來就會丟掉最後一根視為未完成,開盤後第一根
+# **新的已收盤 K 棒**要等到 08:50 (5分K) / 08:46 (1分K) 才存在。
+#
+# 放在這個模組而不是 GUI 層的理由同 ADR-070:時間邊界要能離線測試,不能
+# 只在真的開盤時才驗得到。
+QT_OPEN_WARMUP_SEC = 30
+
+
+def _session_open_minute(trade_type, dt, include_night=True):
+    """這個交易種類在 dt 當下所屬盤別的**開盤分鐘數**;判不出來回 None。
+
+    只回「開盤」的時刻,不回收盤 —— 夜盤的 05:00 是收盤不是開盤,凌晨段
+    不算「剛開盤」(那一盤是前一天 15:00 開的)。
+    """
+    if trade_type == '零股':
+        return ODD_LOT_OPEN_MIN if is_odd_lot_open(dt) else None
+    if trade_type == '股票':
+        return STOCK_OPEN_MIN if is_stock_open(dt) else None
+    if trade_type == '期貨':
+        if is_futures_day_open(dt):
+            return FUT_DAY_OPEN_MIN
+        if include_night and is_futures_night_open(dt) and _minutes(dt) >= FUT_NIGHT_OPEN_MIN:
+            return FUT_NIGHT_OPEN_MIN
+    return None
+
+
+def just_opened(trade_type, dt=None, include_night=True, warmup_sec=None):
+    """現在是不是「剛開盤 warmup_sec 秒內」。休市 / 判不出盤別一律回 False。
+
+    區間是**左閉右開** [開盤, 開盤+warmup_sec):開盤當下算「剛開盤」,
+    暖機秒數一到就放行。warmup_sec <= 0 等於關閉這個機制。
+    """
+    if dt is None:
+        dt = datetime.now()
+    if warmup_sec is None:
+        warmup_sec = QT_OPEN_WARMUP_SEC
+    try:
+        warmup_sec = float(warmup_sec)
+    except (TypeError, ValueError):
+        return False
+    if warmup_sec <= 0:
+        return False
+    open_min = _session_open_minute(trade_type, dt, include_night=include_night)
+    if open_min is None:
+        return False
+    elapsed = (_minutes(dt) - open_min) * 60 + dt.second
+    return 0 <= elapsed < warmup_sec

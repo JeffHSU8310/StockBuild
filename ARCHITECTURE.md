@@ -84,6 +84,17 @@ PITFALLS P-27）。它們存在的唯一理由就是「可離線單元測試」�
 - `order_rules.py`：`validate_stock_order(...)`、`is_daytrade_eligible(...)`，
   回傳 `(ok, reason)`，不做任何日誌或 I/O。常數 `MAX_QTY_LOT`（499 張）、
   `MAX_QTY_ODD`（999 股）。
+- `kbars_plan.py`（ADR-122）：「這個 kbars 請求要不要分段、每段幾天」的
+  **單一出處**。shioaji 的 `kbars()` 一律回 1 分 K，所以「天數」直接等於
+  資料量，範圍一大單次請求就容易逾時。門檻與段長原本只寫在
+  `fetch_data_worker` 裡的字面值，策略路徑要用同一套規則時只能再抄一份 ——
+  收斂到這裡，並由 diag 的原始碼層級斷言確保兩邊不會改岔。
+  注意 `chunk_plan()` 以**切出來幾段**為準，不是以門檻為準（PITFALLS P-91）。
+- `market_session.py`（ADR-070/121）：「現在這個市場開盤了沒」的單一真相來源。
+  `is_market_open()` 是自動交易的開/收盤閘門；`just_opened()`（ADR-121）另外
+  回答「是不是剛開盤 N 秒內」，讓策略不要在鐘響那一秒去打券商 API。
+  時刻常數（`STOCK_OPEN_MIN` / `FUT_DAY_OPEN_MIN` / `ODD_LOT_OPEN_MIN` …）
+  都在這裡，其他地方不可以另寫一份。
 - `regime_panel.py`（ADR-120）：主圖【盤勢判斷】面板的純邏輯。
   `normalize(raw)` 把設定檔讀到的東西整理成一份值域安全的設定（設定檔壞掉
   絕不可以變成主圖畫不出來）；`should_evaluate(settings, symbol, timeframe)`
@@ -129,6 +140,15 @@ shioaji 內部執行緒 (我們沒開、無法保證是 daemon)
   └─ order callback (on_order_deal_callback)
         → _handle_order_event / _handle_deal_event → safe_after 排回 UI
 ```
+
+**量化 runner (`quant_runner_worker`) 是單執行緒**：同一條迴圈上依序跑
+所有策略的評估、`_qt_chukuangren_execute_pass`、以及每 3 秒的
+`_qt_update_realtime_pnl`（期貨即時停損停利靠它）。因此**這條迴圈裡絕對
+不可以 `time.sleep()` 做退避重試** —— 睡多久就等於即時停損停擺多久。
+需要重試時用迴圈自己的 2 秒節奏（ADR-121 的做法，見 PITFALLS P-90）。
+同理，**大範圍 K 線的分段下載也不在這條迴圈上做**：改由背景預抓執行緒
+（ADR-122 `_qt_start_kbars_prefetch`）補進 `_kbars_raw_cache`，runner 這一輪
+拿不到就照 ADR-121 的 boundary 還原機制等下一個 tick。
 
 三條規則（違反就會踩 PITFALLS P-04 / P-22 / P-23）：
 1. **報價暫存跨執行緒讀寫一律經 `self.quote_lock`**；零股/整股暫存永遠分開。
@@ -255,6 +275,8 @@ G:\StockBuild\
 │   ├─ market_pattern.py    加權指數盤勢/型態偵測 (只提醒,不下單)
 │   ├─ volume_profile.py    量價支撐壓力 (POC/價值區/高量節點, ADR-102)
 │   ├─ regime_panel.py      主圖【盤勢判斷】:設定正規化 + 通知去重 (ADR-120)
+│   ├─ market_session.py    交易時段/開盤暖機 (ADR-070/121)
+│   ├─ kbars_plan.py        kbars 分段門檻/段長的單一出處 (ADR-122)
 │   └─ order_rules.py
 ├─ data/
 │   └─ config_store.py     設定 / 自選股 / 版面 I/O
