@@ -5960,5 +5960,111 @@ class TestOwnExitKinds(unittest.TestCase):
 
 
 
+
+class TestIncludeNightOf(unittest.TestCase):
+    """【ADR-124】「這檔策略要不要做夜盤」的單一判斷。
+
+    使用者實測:終極波段 12:01 開的空單,在 **15:00:01 夜盤開盤第一秒**被
+    平掉。使用者的原話是「終極波段不會在夜盤做任何動作的」—— 那不是偏好,
+    是這個策略的設計事實(看A 是加權指數日K、12:00 確認、12:01 執行)。
+    """
+
+    def test_kind_constant_is_pinned(self):
+        """用字串寫死 (避免循環 import),所以要有斷言把兩邊釘在一起。"""
+        self.assertIn(chukuangren_band.KIND, strategy_engine.DAY_SESSION_ONLY_KINDS)
+
+    def test_chukuangren_never_includes_night(self):
+        """既有存檔是 day_night 也要被覆寫 —— 不做資料遷移就正確。"""
+        for stored in ('day_night', 'day', None):
+            s = chukuangren_band.default_strategy()
+            if stored is not None:
+                s['futures_session'] = stored
+            else:
+                s.pop('futures_session', None)
+            self.assertFalse(strategy_engine.include_night_of(s), repr(stored))
+
+    def test_normal_strategy_follows_user_setting(self):
+        """一般策略照使用者設定走 —— 覆寫不可以擴大到所有策略,
+        否則「日盤+夜盤」的策略夜盤就不受保護了。"""
+        base = strategy_engine.new_strategy()
+        self.assertFalse(strategy_engine.include_night_of(
+            dict(base, futures_session='day')))
+        self.assertTrue(strategy_engine.include_night_of(
+            dict(base, futures_session='day_night')))
+        # 缺欄位維持既有預設 (含夜盤)
+        no_field = dict(base)
+        no_field.pop('futures_session', None)
+        self.assertTrue(strategy_engine.include_night_of(no_field))
+
+    def test_safe_on_garbage(self):
+        self.assertTrue(strategy_engine.include_night_of(None))
+        self.assertTrue(strategy_engine.include_night_of({}))
+        self.assertFalse(strategy_engine.include_night_of(
+            {'kind': 'chukuangren_band'}))
+
+    def test_day_only_and_own_exit_are_separate_concepts(self):
+        """兩份清單目前內容相同,但語意不同 (一個講出場邏輯、一個講交易時段),
+        不可以合併成同一個判斷 —— 日後多一個「自己管出場但要做夜盤」的策略
+        種類時,合併過的寫法會一起把夜盤關掉。"""
+        self.assertIsNot(strategy_engine.OWN_EXIT_KINDS,
+                         strategy_engine.DAY_SESSION_ONLY_KINDS)
+
+
+
+
+class TestStrategyLock(unittest.TestCase):
+    """【ADR-125】啟用中的策略不可編輯、不可刪除。
+
+    使用者實測:一檔「狀態=啟用、運轉狀態=運轉中」的策略被直接刪掉了
+    (持倉是 FLAT,所以原本唯一那道「仍有持倉」的檢查放行了)。
+    """
+
+    def test_locked_when_enabled(self):
+        self.assertTrue(strategy_engine.is_locked({'enabled': True}))
+        self.assertFalse(strategy_engine.is_locked({'enabled': False}))
+
+    def test_is_locked_safe_on_garbage(self):
+        """缺欄位要當成「沒啟用」—— 這個方向是安全的 (不會鎖死刪除功能),
+        而真正在跑的策略一定有 enabled=True。"""
+        for bad in (None, {}, {'enabled': None}, {'enabled': 0}):
+            self.assertFalse(strategy_engine.is_locked(bad), repr(bad))
+
+    def test_enabled_cannot_be_deleted(self):
+        """重現截圖:啟用中 + 持倉 FLAT —— 舊程式會直接刪掉。"""
+        ok, reason = strategy_engine.can_delete(
+            {'name': '空', 'enabled': True}, {'state': 'FLAT'})
+        self.assertFalse(ok)
+        self.assertIn('停用', reason)
+
+    def test_position_still_blocks_when_disabled(self):
+        """既有的「仍有持倉」檢查不可以被弄丟。"""
+        ok, reason = strategy_engine.can_delete(
+            {'name': '空', 'enabled': False}, {'state': 'LONG'})
+        self.assertFalse(ok)
+        self.assertIn('持倉', reason)
+
+    def test_disabled_and_flat_can_be_deleted(self):
+        """反向對照:正常情況**要刪得掉** —— 少了這條,把 can_delete 寫成
+        永遠 False 也會一片綠,那等於把刪除功能整個鎖死。"""
+        ok, reason = strategy_engine.can_delete(
+            {'name': '空', 'enabled': False}, {'state': 'FLAT'})
+        self.assertTrue(ok)
+        self.assertEqual(reason, '')
+
+    def test_enabled_reason_wins_over_position(self):
+        """兩個條件都不成立時,訊息要指向「先停用」—— 那才是使用者要做的
+        第一步,先叫他去處理持倉會讓他繞路。"""
+        ok, reason = strategy_engine.can_delete(
+            {'name': '空', 'enabled': True}, {'state': 'LONG'})
+        self.assertFalse(ok)
+        self.assertIn('停用', reason)
+        self.assertNotIn('仍有持倉', reason)
+
+    def test_missing_runtime_is_treated_as_flat(self):
+        ok, _ = strategy_engine.can_delete({'name': 'x', 'enabled': False}, None)
+        self.assertTrue(ok)
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

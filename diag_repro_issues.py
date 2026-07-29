@@ -3808,6 +3808,243 @@ run_case("ADR-123: 終極波段不受泛用即時停損 + 暖機不被時段閘�
          _chukuangren_own_exits_123)
 
 
+
+def _session_gate_realtime_stops_124():
+    """【ADR-124】即時停損要看交易時段;終極波段結構上只做日盤。
+
+    重現使用者的模擬帳戶截圖:
+        12:01:05  做空 賣出 開倉 5 口 TXF @ 39720
+        15:00:01  做空 買進 平倉 5 口 TXF @ 40688   已實現 -968,250
+    15:00:01 正好是**夜盤開盤第一秒**,而使用者說「終極波段不會在夜盤做任何
+    動作的」。
+
+    時鐘一律用 patch 過的 is_market_open 控制,**不依賴真實時間** (P-94)。
+    """
+    from core import strategy_engine as _se5
+    from core import chukuangren_band as _ck2
+
+    class FakeContract:
+        code = 'TXF'
+        symbol = 'TXFR1'
+
+    logs = []
+    orig_log = app.log_message
+    orig_resolve = app._qt_resolve
+    orig_resolve_watch = app._qt_resolve_watch
+    orig_dl = app._download_kbars_raw
+    orig_open = stock_app_pro.market_session.is_market_open
+    orig_just = stock_app_pro.market_session.just_opened
+    orig_running, orig_login, orig_api = app._qt_running, app.api_logged_in, app.sj_api
+    orig_strats, orig_rts = app.strategies, app.strategy_runtimes
+
+    # 假時段:夜盤開著、日盤關著 (= 15:00 之後的狀態)
+    def _night_only(trade_type, dt=None, include_night=True):
+        return bool(include_night)
+
+    def _mount(s, state='SHORT', entry=39720.0, qty=5):
+        rt = _se5.new_runtime()
+        rt.update({'state': state, 'exec_entry_price': entry, 'entry_price': entry,
+                   'qty': qty})
+        app.strategies = [s]
+        app.strategy_runtimes = {s['id']: rt}
+        return rt
+
+    def _mk(kind_default=False, **over):
+        s = _ck2.default_strategy() if kind_default else _se5.new_strategy()
+        s.update({'symbol': 'TXF', 'trade_type': '期貨', 'market': '台期貨',
+                  'qty': 5, 'direction': '做空', 'mode': '模擬', 'enabled': True,
+                  'stop_loss_pct': 2.0})
+        s.update(over)
+        return s
+
+    try:
+        app.log_message = lambda m: (logs.append(m), orig_log(m))[0]
+        app._qt_resolve = lambda _s: (FakeContract(), 'futures')
+        # 終極波段分支會先解析「看A」(加權指數);沒 stub 的話會在那裡就拋例外,
+        # 後面的斷言就變成「因為別的原因而沒抓K線」的空殼 (突變測試抓到過)。
+        app._qt_resolve_watch = lambda _s: (FakeContract(), 'index_tw', '^TWII', '台股')
+        app.sj_api = object()
+        app.api_logged_in = True
+        app._qt_running = True
+        stock_app_pro.market_session.just_opened = lambda *a, **k: False   # 排除暖機干擾
+        stock_app_pro.market_session.is_market_open = _night_only
+
+        # ---- 1. 重現截圖:終極波段在夜盤不可以被平倉 ----
+        ck = _mk(True, name='診斷終極波段')
+        rt1 = _mount(ck)
+        logs.clear()
+        app._qt_check_realtime_futures_stops({'TXF': 40688.0})
+        app.flush_after()
+        assert rt1['state'] == 'SHORT', \
+            f"終極波段在夜盤不可以被平倉 (state 變成 {rt1['state']})"
+        assert not [m for m in logs if '即時停損' in m], "不該出現即時停損訊息"
+
+        # ---- 2. 一般期貨策略設「只做日盤」→ 夜盤也不可以被停損 ----
+        # (這是跟終極波段無關的另一個洞:使用者明確設定被無視)
+        day_only = _mk(False, name='診斷只做日盤', futures_session='day')
+        rt2 = _mount(day_only)
+        logs.clear()
+        app._qt_check_realtime_futures_stops({'TXF': 40688.0})
+        app.flush_after()
+        assert rt2['state'] == 'SHORT', "設成只做日盤的策略,夜盤不可以被停損"
+
+        # ---- 3. 反向對照:設「日盤+夜盤」→ 夜盤**仍然要**停損 ----
+        # 少了這條,把閘門寫成「夜盤一律不停損」也會一片綠。
+        both = _mk(False, name='診斷日夜盤', futures_session='day_night')
+        rt3 = _mount(both)
+        logs.clear()
+        app._qt_check_realtime_futures_stops({'TXF': 40688.0})
+        app.flush_after()
+        assert rt3['state'] == 'FLAT', "設成日盤+夜盤的策略,夜盤仍應被停損"
+
+        # ---- 4. 反向對照:日盤時段一般策略仍要停損 (ADR-087 沒被弄壞) ----
+        stock_app_pro.market_session.is_market_open = lambda *a, **k: True
+        day_only2 = _mk(False, name='診斷日盤中', futures_session='day')
+        rt4 = _mount(day_only2)
+        logs.clear()
+        app._qt_check_realtime_futures_stops({'TXF': 40688.0})
+        app.flush_after()
+        assert rt4['state'] == 'FLAT', "日盤時段的即時停損仍應正常運作"
+
+        # ---- 5. session_gate=False → 休市也照跑 (尊重使用者設定) ----
+        stock_app_pro.market_session.is_market_open = lambda *a, **k: False
+        nogate = _mk(False, name='診斷關閘門', session_gate=False)
+        rt5 = _mount(nogate)
+        logs.clear()
+        app._qt_check_realtime_futures_stops({'TXF': 40688.0})
+        app.flush_after()
+        assert rt5['state'] == 'FLAT', \
+            "session_gate=False 代表使用者要求不管時間都跑,即時停損也該照跑"
+
+        # ---- 6. 終極波段在夜盤連評估都不該發生 ----
+        stock_app_pro.market_session.is_market_open = _night_only
+        calls = {'n': 0}
+        app._download_kbars_raw = lambda *a, **k: (calls.__setitem__('n', calls['n'] + 1), None)[1]
+        ck2 = _mk(True, name='診斷終極波段2', timeframe='5分K')
+        _mount(ck2, state='FLAT', qty=0)
+        app._qt_last_boundary = {}
+        app._qt_session_state = {}
+        eval_pass(); app.flush_after()
+        assert calls['n'] == 0, \
+            f"終極波段在夜盤不該評估 (實際抓了 {calls['n']} 次K線)"
+        # 正控:把時段打開,同一檔策略**必須**真的去抓K線 —— 沒有這條,
+        # 上面那句在「因為別的原因而沒抓」時也會是綠的 (P-28 那一類的空殼)。
+        stock_app_pro.market_session.is_market_open = lambda *a, **k: True
+        app._qt_last_boundary = {}
+        app._qt_session_state = {}
+        eval_pass(); app.flush_after()
+        assert calls['n'] > 0, \
+            "時段打開後終極波段必須真的評估 (否則上面那條斷言是空殼)"
+    finally:
+        app.log_message = orig_log
+        app._qt_resolve = orig_resolve
+        app._qt_resolve_watch = orig_resolve_watch
+        app._download_kbars_raw = orig_dl
+        stock_app_pro.market_session.is_market_open = orig_open
+        stock_app_pro.market_session.just_opened = orig_just
+        app._qt_running, app.api_logged_in, app.sj_api = orig_running, orig_login, orig_api
+        app.strategies, app.strategy_runtimes = orig_strats, orig_rts
+        app._qt_last_boundary = {}
+        app._qt_session_state = {}
+
+
+run_case("ADR-124: 即時停損看交易時段 + 終極波段只做日盤",
+         _session_gate_realtime_stops_124)
+
+
+
+def _enabled_strategy_locked_125():
+    """【ADR-125】啟用中的策略不可刪除;編輯只能唯讀檢視。
+
+    重現使用者截圖:策略「狀態=啟用、運轉狀態=運轉中」、持倉 `--` (FLAT),
+    卻被 🗑 刪除 直接刪掉了 —— 舊程式唯一那道檢查是「仍有持倉」,FLAT 就放行。
+
+    這裡走**完整的 GUI 路徑** (_qt_delete_strategy / _qt_edit_strategy),
+    純函式測不到「呼叫端有沒有真的用到守門」那一層 (P-64)。
+    """
+    from core import strategy_engine as _se6
+
+    logs = []
+    orig_log = app.log_message
+    orig_strats, orig_rts = app.strategies, app.strategy_runtimes
+    orig_sel = app._qt_selected
+    orig_open_editor = app._qt_open_editor
+    orig_save, orig_save_state = app._qt_save, app._qt_save_state
+    orig_refresh = app._qt_refresh_tree
+    opened = {}
+
+    def _mount(enabled=True, state='FLAT'):
+        st = _se6.new_strategy()
+        st.update({'name': '診斷ADR125', 'symbol': 'MXFR1', 'trade_type': '期貨',
+                   'market': '台期貨', 'timeframe': '5分K', 'qty': 1,
+                   'direction': '做空', 'mode': '模擬', 'enabled': enabled,
+                   'entry': [{'type': 'ma_cross_down', 'params': {'fast': 5, 'slow': 20}}]})
+        rt = _se6.new_runtime(); rt['state'] = state
+        if state in ('LONG', 'SHORT'):
+            rt.update({'qty': 1, 'entry_price': 20000.0, 'exec_entry_price': 20000.0})
+        app.strategies = [st]
+        app.strategy_runtimes = {st['id']: rt}
+        app._qt_selected = lambda: st
+        return st
+
+    try:
+        app.log_message = lambda m: (logs.append(m), orig_log(m))[0]
+        # 存檔/畫面刷新在這個案例無關,擋掉避免動到暫存檔與 mock widget
+        app._qt_save = lambda *a, **k: None
+        app._qt_save_state = lambda *a, **k: None
+        app._qt_refresh_tree = lambda *a, **k: None
+
+        # ---- 1. 啟用中 + FLAT (重現截圖) → 不可刪除 ----
+        st1 = _mount(enabled=True, state='FLAT')
+        logs.clear()
+        app._qt_delete_strategy(); app.flush_after()
+        assert any(x['id'] == st1['id'] for x in app.strategies), \
+            "啟用中的策略不可以被刪除 (使用者實測的問題)"
+        assert any('停用' in m for m in logs), \
+            f"應提示要先停用,實際日誌: {logs[-2:]}"
+
+        # ---- 2. 反向對照:停用後**確實刪得掉** ----
+        # 少了這條,把守門寫成「永遠不可刪」也會一片綠,那等於功能被鎖死。
+        st1['enabled'] = False
+        logs.clear()
+        app._qt_delete_strategy(); app.flush_after()
+        assert not any(x['id'] == st1['id'] for x in app.strategies), \
+            "停用且無持倉的策略應該要刪得掉"
+
+        # ---- 3. 停用但有持倉 → 仍刪不掉 (既有行為沒被弄壞) ----
+        st3 = _mount(enabled=False, state='SHORT')
+        logs.clear()
+        app._qt_delete_strategy(); app.flush_after()
+        assert any(x['id'] == st3['id'] for x in app.strategies), \
+            "仍有持倉的策略不可以被刪除"
+        assert any('持倉' in m for m in logs), "應提示仍有持倉"
+
+        # ---- 4. 啟用中按編輯 → 只能唯讀檢視 ----
+        st4 = _mount(enabled=True, state='FLAT')
+        opened.clear()
+        app._qt_open_editor = lambda _s, readonly=False: opened.update(readonly=readonly)
+        app._qt_edit_strategy(); app.flush_after()
+        assert opened.get('readonly') is True, \
+            f"啟用中的策略只能唯讀檢視,實際 readonly={opened.get('readonly')!r}"
+        # 反向對照:停用後編輯器要是可寫的
+        st4['enabled'] = False
+        opened.clear()
+        app._qt_edit_strategy(); app.flush_after()
+        assert opened.get('readonly') is False, \
+            "停用的策略應該可以正常編輯"
+    finally:
+        app.log_message = orig_log
+        app._qt_selected = orig_sel
+        app._qt_open_editor = orig_open_editor
+        app._qt_save, app._qt_save_state = orig_save, orig_save_state
+        app._qt_refresh_tree = orig_refresh
+        app.strategies, app.strategy_runtimes = orig_strats, orig_rts
+
+
+run_case("ADR-125: 啟用中的策略不可刪除 / 編輯只能唯讀",
+         _enabled_strategy_locked_125)
+
+
 print(f"{'案例':60s} 結果")
 print("-" * 76)
 for name, st, msg in results:

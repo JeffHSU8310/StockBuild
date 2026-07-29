@@ -1330,6 +1330,63 @@ def has_own_exit_logic(strategy):
     return str((strategy or {}).get('kind') or '') in OWN_EXIT_KINDS
 
 
+# 【ADR-124】這些 kind **結構上就只做日盤**,不是使用者偏好。
+#
+# 終極波段:看A 是加權指數**日K** (指數沒有夜盤)、12:00 二次確認、12:01 執行
+# —— 夜盤對它沒有任何意義。使用者的原話是「終極波段不會在夜盤做任何動作的」,
+# 那是這個策略的設計事實,所以這裡直接覆寫 futures_session 的存檔值,
+# 既有策略不必遷移就正確 (同 OWN_EXIT_KINDS 的處理哲學)。
+#
+# 一樣用字串避免循環 import,靠測試把它跟 chukuangren_band.KIND 釘在一起。
+DAY_SESSION_ONLY_KINDS = frozenset({'chukuangren_band'})
+
+
+def is_locked(strategy):
+    """【ADR-125】啟用中的策略一律鎖住:**不可編輯、不可刪除**。
+
+    使用者實測回報:一檔「狀態=啟用、運轉狀態=運轉中」的策略被直接刪掉了。
+    理由不只是使用者要求 —— 策略正在跑,底下有 runtime 狀態、隨時可能成交,
+    從腳底下把它抽掉是資料競爭。要動它就先停用。
+
+    「不可編輯」的實作方式是**唯讀檢視**(編輯器把儲存鈕換成停用狀態,而且
+    在深拷貝上操作),不是把編輯器整個擋掉 —— 能看正在跑的策略掛了什麼條件
+    是有價值的。
+    """
+    return bool((strategy or {}).get('enabled'))
+
+
+def can_delete(strategy, runtime):
+    """【ADR-125】這檔策略現在可不可以刪除。回傳 (ok, 理由)。
+
+    檢查順序刻意是「先看啟用、再看持倉」:兩者都不成立時,使用者要做的
+    第一件事都是「先停用」,訊息就該直接指向那一步,不要先叫他去處理持倉。
+    """
+    s = strategy or {}
+    name = s.get('name', '')
+    if is_locked(s):
+        return False, (f"策略「{name}」啟用中,不可刪除。請先按「停用」再刪除 "
+                       f"(執行中的策略隨時可能成交,直接刪掉會留下對不上的紀錄)。")
+    if (runtime or {}).get('state') in ('LONG', 'SHORT'):
+        return False, (f"策略「{name}」仍有持倉 ({(runtime or {}).get('state')}),"
+                       f"請先手動處理持倉後再刪除。")
+    return True, ""
+
+
+def include_night_of(strategy):
+    """這檔策略要不要做期貨夜盤。
+
+    結構上只做日盤的種類一律 False;其餘照使用者設定的 futures_session
+    ('day' = 只做日盤,其餘含缺值 = 日盤+夜盤,維持既有預設)。
+
+    所有「要不要在這個時段動作」的判斷都要走這一個函式 —— 評估迴圈與即時
+    停損原本各自算一次,結果即時停損那條根本沒算 (ADR-124 的根因)。
+    """
+    s = strategy or {}
+    if str(s.get('kind') or '') in DAY_SESSION_ONLY_KINDS:
+        return False
+    return s.get('futures_session', 'day_night') != 'day'
+
+
 def check_intrabar_futures_stop(strategy, runtime, live_price):
     """【新ADR】期貨即時停損/停利:不等K棒收盤,即時價 (呼叫端傳入下單商品B的
     最新市價快照) 一觸及使用者設定的停損%/停利%/停損點數/停利點數,立刻回傳
