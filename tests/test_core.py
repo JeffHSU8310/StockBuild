@@ -46,6 +46,7 @@ from core import chukuangren_band
 from core import telegram_notify
 from core import telegram_control
 from core import market_pattern
+from core import kbars_plan
 from core import regime_panel
 from core import chips_parser
 from core import chips_features
@@ -5814,6 +5815,81 @@ class TestRegimePanel(unittest.TestCase):
                     'triangle_descending', 'wedge_rising', 'wedge_falling'):
             self.assertIn(pid, regime_panel.PERSISTENT_PATTERN_IDS, pid)
         self.assertNotIn('double_top', regime_panel.PERSISTENT_PATTERN_IDS)
+
+
+
+
+class TestKBarsPlan(unittest.TestCase):
+    """【ADR-122】kbars 請求要不要分段、每段幾天。
+
+    shioaji 的 kbars 一律回 1 分 K (日/周/月K 是本地重採樣的),所以「天數」
+    直接等於資料量 —— 範圍一大單次請求就容易在券商端逾時。門檻寫錯不會有
+    錯誤訊息,只會在某個週期上偶爾逾時,而且很難重現。
+    """
+
+    def test_decision_is_driven_by_chunk_size_not_threshold(self):
+        """判斷依據是「切得出第二段嗎」,不是「過門檻了嗎」。
+
+        threshold 常數只留給診斷去比對主圖的字面值 (確保兩邊規則沒改岔),
+        不參與判斷 —— 在 threshold <= chunk 的參數下那句永遠不會改變結果,
+        寫了就是一條測不到的死枝。
+        """
+        self.assertIsNone(kbars_plan.chunk_plan('日K', kbars_plan.DAY_TF_CHUNK_DAYS))
+        self.assertIsNotNone(kbars_plan.chunk_plan('日K', kbars_plan.DAY_TF_CHUNK_DAYS + 1))
+        self.assertIsNone(kbars_plan.chunk_plan('5分K', kbars_plan.MIN_TF_CHUNK_DAYS))
+        self.assertIsNotNone(kbars_plan.chunk_plan('5分K', kbars_plan.MIN_TF_CHUNK_DAYS + 1))
+
+    def test_single_segment_counts_as_no_chunking(self):
+        """過了門檻但只切得出一段 = 不需分段。
+
+        分K 的門檻是 5 天、段長卻是 10 天,所以 6~10 天都是「過門檻但只有
+        一段」。那跟單次下載完全一樣,卻要多繞一條背景預抓的路 —— 等於平白
+        改變一條使用者每天在跑的路徑 (5分K 取 7 天) 的行為。
+        這條實作時真的寫錯過,診斷案例當場抓到。
+        """
+        for d in range(kbars_plan.MIN_TF_THRESHOLD_DAYS + 1,
+                       kbars_plan.MIN_TF_CHUNK_DAYS + 1):
+            self.assertIsNone(kbars_plan.chunk_plan('5分K', d), f"{d} 天只有一段")
+        self.assertIsNotNone(kbars_plan.chunk_plan('5分K', kbars_plan.MIN_TF_CHUNK_DAYS + 1))
+
+    def test_min_and_day_timeframes_use_different_rules(self):
+        """分K 類與日K 類的門檻/段長不同,不可以共用一組數字。"""
+        self.assertTrue(kbars_plan.is_min_timeframe('60分K'))
+        self.assertFalse(kbars_plan.is_min_timeframe('日K'))
+        self.assertEqual(kbars_plan.chunk_plan('60分K', 35)['chunk_days'],
+                         kbars_plan.MIN_TF_CHUNK_DAYS)
+        self.assertEqual(kbars_plan.chunk_plan('60分K', 35)['segments'], 4)
+        self.assertEqual(kbars_plan.chunk_plan('日K', 300)['chunk_days'],
+                         kbars_plan.DAY_TF_CHUNK_DAYS)
+
+    def test_actual_strategy_lookbacks(self):
+        """對上策略路徑真正會用的天數 (QT_TF_DAYS):哪些要分段、哪些不用。
+
+        1分K/5分K **不可以**被判成要分段 —— 那兩個是使用者現在真的在跑的
+        週期,改成走背景預抓等於改變它們的行為 (ADR-122 明講行為零改變)。
+        """
+        for tf, days, need in [('1分K', 4, False), ('5分K', 7, False),
+                               ('15分K', 14, True), ('30分K', 21, True),
+                               ('60分K', 35, True), ('日K', 300, True),
+                               ('周K', 700, True), ('月K', 1500, True)]:
+            got = kbars_plan.chunk_plan(tf, days)
+            self.assertEqual(got is not None, need, f"{tf} {days}天")
+
+    def test_segments_estimate(self):
+        self.assertEqual(kbars_plan.chunk_plan('日K', 300)['segments'], 4)
+        self.assertEqual(kbars_plan.chunk_plan('月K', 1500)['segments'], 17)
+
+    def test_unknown_timeframe_is_conservative(self):
+        """認不得的週期當日K 類處理:寧可多切幾段 (慢但會成功),
+        也不要拿未知週期去發一個可能逾時的大請求。"""
+        self.assertFalse(kbars_plan.is_min_timeframe('45分K'))
+        self.assertIsNone(kbars_plan.chunk_plan('45分K', 30))
+        self.assertIsNotNone(kbars_plan.chunk_plan('45分K', 300))
+
+    def test_garbage_input_returns_none(self):
+        for days in (None, 'abc', 0, -5, float('nan')):
+            self.assertIsNone(kbars_plan.chunk_plan('日K', days), repr(days))
+        self.assertFalse(kbars_plan.is_min_timeframe(None))
 
 
 
