@@ -5737,10 +5737,15 @@ class TestRegimePanel(unittest.TestCase):
         self.assertFalse(regime_panel.should_evaluate({**base, 'pattern_enabled': False},
                                                       '^TWII', '日K'))
 
-    def test_should_evaluate_only_on_daily(self):
-        """型態的定義以「一天一根」為前提,分K上算出來的沒有意義。"""
+    def test_should_evaluate_allows_only_the_listed_timeframes(self):
+        """【ADR-132】使用者要求加入 60分K,所以改成允許清單。
+
+        **不可以**變成「任何週期都能跑」:5分K/15分K 會產生大量沒有意義的型態
+        訊號,而 ADR-132 之後這些訊號會推播到手機上。"""
         base = {'enabled': True, 'pattern_enabled': True}
-        for tf in ('5分K', '60分K', '周K', '月K', '', None):
+        for tf in ('日K', '60分K'):
+            self.assertTrue(regime_panel.should_evaluate(base, '^TWII', tf), repr(tf))
+        for tf in ('5分K', '15分K', '30分K', '周K', '月K', '', None):
             self.assertFalse(regime_panel.should_evaluate(base, '^TWII', tf), repr(tf))
 
     def test_should_evaluate_index_only_switch(self):
@@ -6625,6 +6630,117 @@ class TestBollingerTwoSets(unittest.TestCase):
         df_e = self._calc(self._ohlc(), bb_show=True, bb_period=20, bb_type='EMA')
         self.assertFalse(df_s['BB_MID'].equals(df_e['BB_MID']),
                          "bb_type 沒有生效 (兩種中線算出來一樣)")
+
+
+
+class TestRegimeDailyNotify(unittest.TestCase):
+    """【ADR-132】每天收盤後把盤勢判斷推播到手機。
+
+    使用者要求:「如果有出現相關盤勢,要用傳訊息到我的手機通知我,跟我說是
+    什麼型態或是支撐壓力。每天一次,收盤後通知即可。」以及「額外增加對 60分K
+    的盤勢判斷 ... 要註明是 60分K 出現」。
+    """
+
+    def _dt(self, h, m, day=10):
+        from datetime import datetime as _d
+        return _d(2026, 3, day, h, m)
+
+    def _on(self, **over):
+        s = {'enabled': True, 'notify_enabled': True}
+        s.update(over)
+        return s
+
+    # ---------- 推播時刻 ----------
+
+    def test_default_time_is_after_market_close(self):
+        """台股 13:30 收盤 —— 預設時刻一定要晚於收盤,否則抓到的是盤中資料。"""
+        self.assertGreater(regime_panel.notify_minute({}), 13 * 60 + 30)
+
+    def test_not_before_the_configured_time(self):
+        s = self._on(notify_hhmm='14:00')
+        self.assertFalse(regime_panel.should_notify_now(s, self._dt(13, 59), None))
+        self.assertTrue(regime_panel.should_notify_now(s, self._dt(14, 0), None))
+        self.assertTrue(regime_panel.should_notify_now(s, self._dt(14, 1), None))
+
+    def test_late_start_still_sends(self):
+        """**過了時刻就送**,不是「剛好那一分鐘才送」。
+
+        程式可能 14:00 沒開機、或正忙著別的事。錯過那一分鐘就整天不發,
+        對一天只發一次的通知是最糟的失敗模式 —— 使用者不會知道自己漏掉了。"""
+        s = self._on(notify_hhmm='14:00')
+        self.assertTrue(regime_panel.should_notify_now(s, self._dt(21, 30), None))
+
+    def test_only_once_per_day(self):
+        s = self._on(notify_hhmm='14:00')
+        self.assertFalse(regime_panel.should_notify_now(s, self._dt(15, 0), '2026-03-10'))
+        # 隔天要恢復
+        self.assertTrue(regime_panel.should_notify_now(s, self._dt(15, 0, day=11), '2026-03-10'))
+
+    def test_switches_off(self):
+        self.assertFalse(regime_panel.should_notify_now(
+            {'enabled': True, 'notify_enabled': False}, self._dt(15, 0), None))
+        self.assertFalse(regime_panel.should_notify_now(
+            {'enabled': False, 'notify_enabled': True}, self._dt(15, 0), None))
+
+    def test_bad_time_falls_back_to_default(self):
+        """壞設定不可以變成「整天不停推播」或「永遠不推播」。"""
+        for bad in ('99:99', 'abc', '', None, '14', 12345):
+            self.assertEqual(regime_panel.normalize({'notify_hhmm': bad})['notify_hhmm'],
+                             regime_panel.DEFAULT_NOTIFY_HHMM, repr(bad))
+        self.assertEqual(regime_panel.normalize({'notify_hhmm': '9:5'})['notify_hhmm'], '09:05')
+
+    def test_none_datetime_is_safe(self):
+        self.assertFalse(regime_panel.should_notify_now(self._on(), None, None))
+
+    # ---------- 週期清單 ----------
+
+    def test_notify_timeframes_default_and_filtering(self):
+        self.assertEqual(tuple(regime_panel.notify_timeframes({})),
+                         regime_panel.PATTERN_TIMEFRAMES)
+        self.assertEqual(regime_panel.notify_timeframes({'notify_timeframes': ['60分K']}),
+                         ['60分K'])
+        # 認不得的週期要被濾掉 (不可以讓 5分K 混進推播)
+        self.assertEqual(regime_panel.notify_timeframes(
+            {'notify_timeframes': ['5分K', '日K']}), ['日K'])
+        # 有欄位但空的 → 尊重使用者真的全取消 (同 pattern_list 的處理)
+        self.assertEqual(regime_panel.notify_timeframes({'notify_timeframes': []}), [])
+
+    # ---------- 訊息組裝 ----------
+
+    def _sig(self, label, bias='偏多'):
+        return {'pattern': 'regime', 'label': label, 'bias': bias}
+
+    def test_report_labels_every_timeframe(self):
+        """使用者明確要求「要註明是 60分K 出現」—— 每一段都要標週期。"""
+        txt = regime_panel.format_daily_report(
+            '2026-03-10',
+            [('日K', [self._sig('多頭趨勢')], '現價 100|壓力 110|支撐 90'),
+             ('60分K', [self._sig('區間整理', '中性')], None)])
+        self.assertIn('[日K]', txt)
+        self.assertIn('[60分K]', txt)
+        self.assertIn('多頭趨勢', txt)
+        self.assertIn('區間整理', txt)
+        self.assertIn('支撐', txt)
+        self.assertIn('2026-03-10', txt)
+
+    def test_report_is_none_when_nothing_to_say(self):
+        """沒東西講就不發 —— 一天一次的通知一旦變成噪音就沒人看了 (P-99)。"""
+        self.assertIsNone(regime_panel.format_daily_report('2026-03-10', []))
+        self.assertIsNone(regime_panel.format_daily_report(
+            '2026-03-10', [('日K', [], None), ('60分K', [], None)]))
+
+    def test_report_sends_when_only_sr_is_available(self):
+        """反向對照:只有支撐壓力、沒有型態時**仍然要發** ——
+        使用者要的是「型態**或**支撐壓力」。"""
+        txt = regime_panel.format_daily_report('2026-03-10', [('日K', [], '現價 100|支撐 90')])
+        self.assertIsNotNone(txt)
+        self.assertIn('支撐壓力', txt)
+
+    def test_report_prefix_is_the_pushable_one(self):
+        """前綴要能被 telegram_notify.is_quant_message() 認出來 —— 這則訊息
+        同時會寫進系統日誌,前綴不對就只有日誌看得到。"""
+        txt = regime_panel.format_daily_report('2026-03-10', [('日K', [self._sig('多頭趨勢')], None)])
+        self.assertTrue(telegram_notify.is_quant_message(txt))
 
 
 

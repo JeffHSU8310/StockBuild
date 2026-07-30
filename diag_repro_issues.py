@@ -3247,11 +3247,21 @@ def _regime_panel_120():
             assert not [m for m in logs if m.startswith('【盤勢判斷】')], \
                 "同一根K棒重畫不可重複通知"
 
-        # 3a) 週期不是日K → 不評估 (型態定義以「一天一根」為前提)
+        # 3a) 週期要在允許清單內才評估。
+        # 【ADR-132】使用者要求加入 60分K,所以這裡從「只有日K」改成
+        # 「日K 與 60分K 都要評估、其餘一律不評估」。分K 仍然不可以放行 ——
+        # 5分K 會產生大量沒有意義的型態訊號,而 ADR-132 之後它們會推播到手機上。
         app._regime_notify_state = {}
         app.timeframe_var.set('60分K')
         logs.clear(); app.draw_chart(df)
-        assert not [m for m in logs if m.startswith('【盤勢判斷】')], "非日K不該評估型態"
+        assert [m for m in logs if m.startswith('【盤勢判斷】')], \
+            "60分K 應該要評估型態 (ADR-132 新增)"
+        for _bad_tf in ('5分K', '15分K', '30分K', '周K'):
+            app._regime_notify_state = {}
+            app.timeframe_var.set(_bad_tf)
+            logs.clear(); app.draw_chart(df)
+            assert not [m for m in logs if m.startswith('【盤勢判斷】')], \
+                f"{_bad_tf} 不該評估型態 (只有日K/60分K 在允許清單內)"
         app.timeframe_var.set('日K')
 
         # 3b) 「只在加權指數」時,看個股不評估
@@ -5049,6 +5059,155 @@ def _bollinger_two_sets_131():
 
 run_case("ADR-131: 主圖布林參數列被蓋掉 (grid撞格) + 兩組完整布林通道",
          _bollinger_two_sets_131)
+
+
+def _regime_daily_notify_132():
+    """【ADR-132】每天收盤後把盤勢判斷推播到手機,含 60分K 且要標明週期。
+
+    使用者要求:
+      「主圖盤勢判斷,如果有出現相關盤勢,要用傳訊息到我的手機通知我,跟我說
+        是什麼型態或是支撐壓力。每天一次,收盤後通知即可。另外,也額外增加對
+        60分K 的盤勢判斷 ... 也一併要通知我,而且要註明是 60分K 出現。」
+
+    走**完整的 GUI 路徑** (_regime_daily_notify_pass → _qt_resolve_watch →
+    _qt_fetch_closed_bars → _send_telegram_async)。純函式測不到:
+      * 推播有沒有真的被送出去 (而不是只寫進日誌)
+      * 有沒有繞過「自動交易總開關」那道推播閘門
+      * 收盤後有沒有把**今天**那根K棒算進去
+    """
+    import pandas as _pd
+    from core import regime_panel as _rp
+
+    class FakeContract:
+        code = 'TSE'
+        symbol = '^TWII'
+
+    sent = []
+    logs = []
+    fetched = []
+    orig_log = app.log_message
+    orig_send = app._send_telegram_async
+    orig_resolve_watch = app._qt_resolve_watch
+    orig_fetch = app._qt_fetch_closed_bars
+    orig_cfg = getattr(app, 'telegram_cfg', None)
+    orig_login, orig_api = app.api_logged_in, app.sj_api
+    orig_running = app._qt_running
+    orig_settings = app.regime_settings
+    orig_last = getattr(app, '_regime_notify_last_date', None)
+
+    # 造一段走勢明確的加權指數資料,確保 evaluate_all 一定生得出「盤勢」訊號
+    def _mk(n=160, base=20000.0, step=25.0):
+        closes = [base + i * step for i in range(n)]
+        return _pd.DataFrame(
+            {'Open': closes, 'High': [c + 30 for c in closes],
+             'Low': [c - 30 for c in closes], 'Close': closes,
+             'Volume': [10000 + (i % 5) * 100 for i in range(n)]},
+            index=_pd.date_range('2026-01-01', periods=n, freq='D'))
+
+    DF = _mk()
+
+    def _fake_fetch(_s, _c, _a, tf=None, cache_sym=None, cache_market=None,
+                    allow_blocking=False, drop_last=True):
+        fetched.append((tf, drop_last))
+        return DF
+
+    try:
+        app.log_message = lambda m: (logs.append(str(m)), orig_log(m))[0]
+        app._send_telegram_async = lambda t: sent.append(str(t))
+        app._qt_resolve_watch = lambda _s: (FakeContract(), 'index_tw', '^TWII', '台股')
+        app._qt_fetch_closed_bars = _fake_fetch
+        app.telegram_cfg = {'bot_token': 'T', 'chat_id': 'C'}
+        app.api_logged_in = True
+        app.sj_api = object()
+        # 【關鍵】自動交易總開關**關著** —— 盤勢推播是看盤輔助,不該綁在
+        # 自動交易上。這一行就是在守那件事。
+        app._qt_running = False
+        app.regime_settings = _rp.normalize({
+            'enabled': True, 'pattern_enabled': True, 'sr_enabled': True,
+            'notify_enabled': True, 'notify_hhmm': '14:00',
+        })
+
+        # ---- 1. 收盤後應該送出一則,而且兩個週期都標明 ----
+        app._regime_notify_last_date = None
+        sent.clear(); logs.clear(); fetched.clear()
+        app._regime_daily_notify_pass(now_dt=stock_app_pro.datetime(2026, 3, 10, 14, 0))
+        assert len(sent) == 1, f"收盤後應該送出剛好一則推播,實際 {len(sent)} 則"
+        _txt = sent[0]
+        assert '[日K]' in _txt, f"訊息要標明日K: {_txt[:120]}"
+        assert '[60分K]' in _txt, f"訊息要標明 60分K (使用者明確要求): {_txt[:120]}"
+        assert ('盤勢/型態' in _txt) or ('支撐壓力' in _txt), \
+            f"要講出是什麼型態或支撐壓力: {_txt[:120]}"
+        # 兩個週期都真的去抓資料了,而且**沒有丟掉最後一根**
+        assert ('日K', False) in fetched and ('60分K', False) in fetched, \
+            f"兩個週期都要抓、且 drop_last=False (收盤後今天那根已定案): {fetched}"
+
+        # ---- 2. 同一天不可以再送第二則 ----
+        sent.clear()
+        app._regime_daily_notify_pass(now_dt=stock_app_pro.datetime(2026, 3, 10, 15, 30))
+        assert not sent, f"一天只能一則,實際又送了 {len(sent)} 則"
+
+        # ---- 3. 隔天要恢復 (反向對照:不可以只送一次就再也不送) ----
+        app._regime_daily_notify_pass(now_dt=stock_app_pro.datetime(2026, 3, 11, 14, 0))
+        assert len(sent) == 1, "隔天必須再送一則"
+
+        # ---- 4. 收盤前不可以送 ----
+        app._regime_notify_last_date = None
+        sent.clear(); fetched.clear()
+        app._regime_daily_notify_pass(now_dt=stock_app_pro.datetime(2026, 3, 12, 11, 0))
+        assert not sent, "收盤前 (11:00) 不可以推播"
+        assert not fetched, "時間沒到連資料都不該抓 (省 API)"
+
+        # ---- 5. 關掉推播開關就完全不送 ----
+        app.regime_settings = _rp.normalize({
+            'enabled': True, 'pattern_enabled': True, 'sr_enabled': True,
+            'notify_enabled': False, 'notify_hhmm': '14:00'})
+        app._regime_notify_last_date = None
+        sent.clear()
+        app._regime_daily_notify_pass(now_dt=stock_app_pro.datetime(2026, 3, 12, 14, 0))
+        assert not sent, "推播開關關著就不可以送"
+
+        # ---- 6. 只勾 60分K → 訊息只能有 60分K ----
+        app.regime_settings = _rp.normalize({
+            'enabled': True, 'pattern_enabled': True, 'sr_enabled': True,
+            'notify_enabled': True, 'notify_hhmm': '14:00',
+            'notify_timeframes': ['60分K']})
+        app._regime_notify_last_date = None
+        sent.clear(); fetched.clear()
+        app._regime_daily_notify_pass(now_dt=stock_app_pro.datetime(2026, 3, 12, 14, 0))
+        assert len(sent) == 1, "只勾 60分K 仍然要送"
+        assert '[60分K]' in sent[0] and '[日K]' not in sent[0], \
+            f"只勾 60分K 時訊息不該出現日K: {sent[0][:120]}"
+        assert all(tf == '60分K' for tf, _d in fetched), f"不該去抓沒勾的週期: {fetched}"
+
+        # ---- 7. 沒登入就不推播 (抓不到指數資料),而且不可以吃掉當天的機會 ----
+        app.regime_settings = _rp.normalize({
+            'enabled': True, 'pattern_enabled': True, 'sr_enabled': True,
+            'notify_enabled': True, 'notify_hhmm': '14:00'})
+        app.api_logged_in = False
+        app._regime_notify_last_date = None
+        sent.clear()
+        app._regime_daily_notify_pass(now_dt=stock_app_pro.datetime(2026, 3, 13, 14, 0))
+        assert not sent, "沒登入時不該送 (資料抓不到)"
+        assert app._regime_notify_last_date is None, \
+            "沒登入不可以記成『今天已處理』,否則登入後整天都不會補送"
+        # 登入後同一天要補送 (正控)
+        app.api_logged_in = True
+        app._regime_daily_notify_pass(now_dt=stock_app_pro.datetime(2026, 3, 13, 15, 0))
+        assert len(sent) == 1, "登入之後同一天要補送"
+    finally:
+        app.log_message = orig_log
+        app._send_telegram_async = orig_send
+        app._qt_resolve_watch = orig_resolve_watch
+        app._qt_fetch_closed_bars = orig_fetch
+        app.telegram_cfg = orig_cfg
+        app.api_logged_in, app.sj_api = orig_login, orig_api
+        app._qt_running = orig_running
+        app.regime_settings = orig_settings
+        app._regime_notify_last_date = orig_last
+
+
+run_case("ADR-132: 盤勢判斷每日收盤後推播到手機 (含60分K,標明週期)",
+         _regime_daily_notify_132)
 
 
 print(f"{'案例':60s} 結果")
