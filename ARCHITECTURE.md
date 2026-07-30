@@ -145,13 +145,21 @@ shioaji 內部執行緒 (我們沒開、無法保證是 daemon)
 ```
 
 **量化 runner (`quant_runner_worker`) 是單執行緒**：同一條迴圈上依序跑
-所有策略的評估、`_qt_chukuangren_execute_pass`、以及每 3 秒的
-`_qt_update_realtime_pnl`（期貨即時停損停利靠它）。因此**這條迴圈裡絕對
+所有策略的評估、`_qt_chukuangren_confirm_pass`、`_qt_chukuangren_execute_pass`、
+以及每 3 秒的 `_qt_update_realtime_pnl`（期貨即時停損停利靠它）。因此**這條迴圈裡絕對
 不可以 `time.sleep()` 做退避重試** —— 睡多久就等於即時停損停擺多久。
 需要重試時用迴圈自己的 2 秒節奏（ADR-121 的做法，見 PITFALLS P-90）。
 同理，**大範圍 K 線的分段下載也不在這條迴圈上做**：改由背景預抓執行緒
 （ADR-122 `_qt_start_kbars_prefetch`）補進 `_kbars_raw_cache`，runner 這一輪
 拿不到就照 ADR-121 的 boundary 還原機制等下一個 tick。
+
+**「一天只做一次」的動作不可以掛在只放行一次的閘門底下**（ADR-128，
+PITFALLS P-101）。K 棒邊界閘門（`_qt_last_boundary`）對每個週期一天只放行
+固定次數，適合「有新 K 棒才評估」，**不適合「在某個時刻一定要做成某件事」**。
+終極波段的 12:00 二次確認原本巢狀在邊界閘門裡 → 12:00 那一次抓不到資料就
+整天丟掉且無聲；現在獨立成 `_qt_chukuangren_confirm_pass`，窗口內每個 tick
+重試到做成為止。**節拍（多久醒一次）與訊號週期（看哪一種 K 棒）是兩件事，
+不可以共用同一個設定欄位**（P-100）。
 
 三條規則（違反就會踩 PITFALLS P-04 / P-22 / P-23）：
 1. **報價暫存跨執行緒讀寫一律經 `self.quote_lock`**；零股/整股暫存永遠分開。
