@@ -3489,22 +3489,23 @@ class TestChukuangrenBand(unittest.TestCase):
             self.assertIn(k, chukuangren_band.PARAM_HELP)
             self.assertTrue(chukuangren_band.PARAM_HELP[k].strip())
 
-    def test_validate_long_requires_y_below_x(self):
+    def test_validate_allows_long_stop_above_x(self):
+        """【ADR-130】Y 與 X 的高低不再限制 —— 實際進場價不是 X,停損要貼著
+        實際進場價才控得住虧損 (使用者要求自行決定)。"""
         s = chukuangren_band.default_strategy()
         s['symbol'] = '2330'; s['qty'] = 1; s['direction'] = '做多'
         s['ck_x'] = 100; s['ck_y'] = 105
         ok, msg = chukuangren_band.validate(s)
-        self.assertFalse(ok)
-        self.assertIn('Y', msg)
+        self.assertTrue(ok, f"Y 高於 X 不該再被擋: {msg}")
 
-    def test_validate_short_requires_s1_above_x_and_futures(self):
+    def test_validate_allows_short_stop_below_x(self):
+        """【ADR-130】同上,做空方向。"""
         s = chukuangren_band.default_strategy()
         s['symbol'] = 'TXF'; s['qty'] = 1; s['direction'] = '做空'
         s['trade_type'] = '期貨'; s['market'] = '台期貨'
         s['ck_x'] = 100; s['ck_s1'] = 95
         ok, msg = chukuangren_band.validate(s)
-        self.assertFalse(ok)
-        self.assertIn('S1', msg)
+        self.assertTrue(ok, f"S1 低於 X 不該再被擋: {msg}")
 
     def test_validate_short_rejects_stock(self):
         s = chukuangren_band.default_strategy()
@@ -6339,21 +6340,38 @@ class TestMergedStopParams(unittest.TestCase):
 
     # ---------- validate 的訊息 ----------
 
-    def test_validate_short_stop_must_be_above_x_with_a_helpful_message(self):
-        """重現使用者截圖:做空 X=42500、停損填 41701 (在 X 之下) → 應該擋下,
-        而且訊息要講出「為什麼」與實際填的數字。"""
+    def test_validate_accepts_the_users_own_screenshot_params(self):
+        """【ADR-130】使用者截圖那組 (做空、X=42500、停損 41701) 現在必須存得起來。
+
+        原本被擋,理由是「做空要指數漲上去才停損」—— 但那是拿設定的分界 X 當
+        進場價在推論。實際進場要等 X 被跌破、再等隔天12:00確認,那時指數可能
+        已經在 41800,停損設 42000 才貼著實際進場價。"""
         s = self._strat(direction='做空', ck_x=42500.0, ck_s1=41701.0)
         ok, msg = chukuangren_band.validate(s)
-        self.assertFalse(ok)
-        self.assertIn('41701', msg)
-        self.assertIn('42500', msg)
-        self.assertIn('漲上去', msg)
+        self.assertTrue(ok, f"不該再擋這組參數: {msg}")
 
-    def test_validate_long_stop_must_be_below_x_with_a_helpful_message(self):
-        s = self._strat(direction='做多', ck_x=42500.0, ck_y=43000.0)
+    def test_validate_still_rejects_an_unset_stop(self):
+        """反向對照:相對關係不擋,但「有沒有填」一定要擋。
+
+        0 不是合法的加權指數點位,而 0 的後果是災難性的:
+          做多 Y=0 → `close < 0` 永遠不成立 → **完全沒有停損**
+          做空 S1=0 → `close > 0` 永遠成立 → 每天都誤記待確認停損
+        舊規則只「順便」擋到做空那半邊,做多的 Y=0 一直是沒人擋的洞 (ADR-130 補上)。"""
+        s = self._strat(direction='做多', ck_x=42500.0, ck_y=0.0)
+        ok, msg = chukuangren_band.validate(s)
+        self.assertFalse(ok, "Y=0 等於沒有停損,必須擋下來")
+        self.assertIn('Y', msg)
+        s2 = self._strat(direction='做空', ck_x=42500.0, ck_s1=0.0)
+        ok2, msg2 = chukuangren_band.validate(s2)
+        self.assertFalse(ok2, "S1=0 會讓系統每天誤判待確認停損,必須擋下來")
+        self.assertIn('S1', msg2)
+
+    def test_validate_still_rejects_unset_x(self):
+        """X=0 同樣是壞資料:做多會變成「收盤 > 0」→ 每天都進場。"""
+        s = self._strat(direction='做多', ck_x=0.0, ck_y=90.0)
         ok, msg = chukuangren_band.validate(s)
         self.assertFalse(ok)
-        self.assertIn('跌下去', msg)
+        self.assertIn('X', msg)
 
     def test_validate_passes_with_only_the_single_stop_filled(self):
         """反向對照:只填一個停損點位就必須存得起來 —— 這才是使用者要的。
@@ -6366,6 +6384,112 @@ class TestMergedStopParams(unittest.TestCase):
         s2.pop('ck_s2', None)
         ok2, msg2 = chukuangren_band.validate(s2)
         self.assertTrue(ok2, f"只填 S1 應該可以存檔,實際被擋: {msg2}")
+
+
+
+class TestStopLevelIndependentOfX(unittest.TestCase):
+    """【ADR-130】停損只看使用者填的那個點位,跟進出場分界 X 的高低無關。
+
+    使用者的要求:
+      「有時候停損點的位置不一定會高於進場點,因為實際進場的位置,已經離一開始
+        設定的進場位置太遠,導致虧損會很大。所以你說停損點必須大於進出場分界,
+        這一點不要被限制,是允許我自行設定,你只要依照我設定的停損位置去判斷
+        是否符合條件即可。」
+
+    重點:**實際進場價不是 X**。進場要等 X 被突破/跌破,再等隔天 12:00 二次確認,
+    那時指數可能已經離 X 很遠 —— 停損要貼著實際進場價才控得住虧損。
+    """
+
+    def _mk_daily_df(self, closes):
+        idx = pd.date_range('2026-01-01', periods=len(closes), freq='D')
+        return pd.DataFrame({'Open': closes, 'High': [c + 1 for c in closes],
+                             'Low': [c - 1 for c in closes], 'Close': closes,
+                             'Volume': [1000] * len(closes)}, index=idx)
+
+    def _short_params(self):
+        # 做空:X=42500,但停損設在 X **之下** 的 42000 (舊規則會擋掉)
+        return {'x': 42500.0, 'y': 0.0, 'z': 0.0,
+                's1': 42000.0, 's2': 42000.0, 'c': 1000.0, 'f': 200.0}
+
+    def _short_rt(self, entry_index_price=41800.0):
+        rt = strategy_engine.new_runtime()
+        rt.update({'state': 'SHORT', 'qty': 5, 'entry_price': 41800.0,
+                   'exec_entry_price': 41800.0, 'entry_index_price': entry_index_price})
+        chukuangren_band.ensure_runtime(rt)
+        return rt
+
+    def test_short_stop_below_x_does_not_trigger_while_index_stays_under_it(self):
+        """指數 41900 < S1=42000 → 不停損,即使 41900 也遠低於 X=42500。"""
+        p = self._short_params()
+        rt = self._short_rt()
+        chukuangren_band.on_daily_close(p, rt, self._mk_daily_df([41900.0] * 25),
+                                        direction='做空')
+        self.assertIsNone(rt['pending_exit'],
+                          "41900 還在 S1=42000 之下,不該停損")
+
+    def test_short_stop_below_x_triggers_when_index_crosses_it(self):
+        """指數 42100 > S1=42000 → 停損,而且**不必**漲過 X=42500。
+
+        這正是使用者要的:停損貼著實際進場價 (41800),而不是被迫等到 42500。"""
+        p = self._short_params()
+        rt = self._short_rt()
+        chukuangren_band.on_daily_close(p, rt, self._mk_daily_df([42100.0] * 25),
+                                        direction='做空')
+        self.assertIsNotNone(rt['pending_exit'], "42100 已突破 S1=42000,要記待確認停損")
+        self.assertEqual(rt['pending_exit']['reason'], 'SL')
+        # 隔天 12:00 仍高於 S1 → 真的平倉
+        chukuangren_band.on_noon_confirm(p, rt, 42100.0, '2026-02-01', now_ts=1000.0, qty=5)
+        self.assertIsNotNone(rt.get('armed_intent'))
+        self.assertEqual(rt['armed_intent']['action'], '買進')
+
+    def test_short_stop_below_x_invalidates_when_index_falls_back(self):
+        """反向對照:隔天 12:00 已回到 S1 之下 → 作廢、繼續持有。"""
+        p = self._short_params()
+        rt = self._short_rt()
+        chukuangren_band.on_daily_close(p, rt, self._mk_daily_df([42100.0] * 25),
+                                        direction='做空')
+        chukuangren_band.on_noon_confirm(p, rt, 41950.0, '2026-02-01', now_ts=1000.0, qty=5)
+        self.assertIsNone(rt.get('armed_intent'), "41950 已回到 S1=42000 之下,應作廢")
+        self.assertEqual(rt['state'], 'SHORT')
+
+    def test_long_stop_above_x_is_judged_by_the_stop_level_only(self):
+        """做多對稱:X=42500、停損 Y=43000 (在 X **之上**,舊規則會擋)。
+        實際進場價 43200,指數 42900 < Y=43000 → 停損。"""
+        p = {'x': 42500.0, 'y': 43000.0, 'z': 43000.0,
+             's1': 0.0, 's2': 0.0, 'c': 1000.0, 'f': 200.0}
+        rt = strategy_engine.new_runtime()
+        rt.update({'state': 'LONG', 'qty': 3, 'entry_price': 43200.0,
+                   'exec_entry_price': 43200.0, 'entry_index_price': 43200.0})
+        chukuangren_band.ensure_runtime(rt)
+        chukuangren_band.on_daily_close(p, rt, self._mk_daily_df([42900.0] * 25),
+                                        direction='做多')
+        self.assertIsNotNone(rt['pending_exit'], "42900 已跌破 Y=43000,要記待確認停損")
+        self.assertEqual(rt['pending_exit']['reason'], 'SL')
+        # 正控:還在 Y 之上就不該停損
+        rt2 = strategy_engine.new_runtime()
+        rt2.update({'state': 'LONG', 'qty': 3, 'entry_price': 43200.0,
+                    'exec_entry_price': 43200.0, 'entry_index_price': 43200.0})
+        chukuangren_band.ensure_runtime(rt2)
+        chukuangren_band.on_daily_close(p, rt2, self._mk_daily_df([43100.0] * 25),
+                                        direction='做多')
+        self.assertIsNone(rt2['pending_exit'], "43100 還在 Y=43000 之上,不該停損")
+
+    def test_entry_still_uses_x_only(self):
+        """反向對照:**進場**仍然只看 X —— 這次只放寬停損,不可以連進場一起弄鬆。"""
+        p = self._short_params()          # X=42500
+        rt = strategy_engine.new_runtime()
+        chukuangren_band.ensure_runtime(rt)
+        # 42400 < X=42500 → 記待確認空單進場
+        chukuangren_band.on_daily_close(p, rt, self._mk_daily_df([42400.0] * 25),
+                                        direction='做空')
+        self.assertIsNotNone(rt['pending_entry'])
+        self.assertEqual(rt['pending_entry']['dir'], 'SHORT')
+        # 42600 > X → 不進場
+        rt2 = strategy_engine.new_runtime()
+        chukuangren_band.ensure_runtime(rt2)
+        chukuangren_band.on_daily_close(p, rt2, self._mk_daily_df([42600.0] * 25),
+                                        direction='做空')
+        self.assertIsNone(rt2['pending_entry'], "42600 在 X 之上,做空不該進場")
 
 
 
