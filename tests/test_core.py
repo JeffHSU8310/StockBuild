@@ -3451,8 +3451,9 @@ class TestChukuangrenBand(unittest.TestCase):
         self.assertNotIn('h', p)  # H 已移除
 
     def test_param_keys_for_direction(self):
-        self.assertEqual(chukuangren_band.param_keys_for('做多'), ('x', 'y', 'z', 'c', 'f'))
-        self.assertEqual(chukuangren_band.param_keys_for('做空'), ('x', 's1', 's2', 'c', 'f'))
+        # 【ADR-129】z / s2 已併入 y / s1,不再出現在 UI 參數清單
+        self.assertEqual(chukuangren_band.param_keys_for('做多'), ('x', 'y', 'c', 'f'))
+        self.assertEqual(chukuangren_band.param_keys_for('做空'), ('x', 's1', 'c', 'f'))
 
     def _valid_long_strategy(self, **overrides):
         s = chukuangren_band.default_strategy()
@@ -6229,6 +6230,143 @@ class TestNoonConfirmWindow(unittest.TestCase):
     def test_defensive_none_and_garbage(self):
         self.assertFalse(chukuangren_band.in_noon_confirm_window(None))
         self.assertFalse(chukuangren_band.in_noon_confirm_window('12:00'))
+
+
+class TestMergedStopParams(unittest.TestCase):
+    """【ADR-129】停損的「觸發」與「隔天12:00 確認」合併成同一個點位。
+
+    使用者實機回報:「這兩個應該是要一樣,不需要分兩個,只需填一個 S1 就可以。
+    (多單也是一樣)」。截圖裡他填 S1=41701 / S2=41700 —— 差 1 點,等於在為一個
+    沒有實質作用的欄位傷腦筋。
+    """
+
+    def _strat(self, **over):
+        s = chukuangren_band.default_strategy()
+        s.update({'symbol': 'MXFR1', 'trade_type': '期貨', 'market': '台期貨', 'qty': 1,
+                  'ck_x': 100.0, 'ck_y': 90.0, 'ck_z': 92.0,
+                  'ck_s1': 110.0, 'ck_s2': 108.0, 'ck_c': 5.0, 'ck_f': 2.0})
+        s.update(over)
+        return s
+
+    # ---------- params_of 是唯一的收斂點 ----------
+
+    def test_confirm_level_is_overridden_by_trigger_level(self):
+        p = chukuangren_band.params_of(self._strat())
+        self.assertEqual(p['z'], p['y'], "多單:確認點位要等於觸發點位")
+        self.assertEqual(p['s2'], p['s1'], "空單:確認點位要等於觸發點位")
+        self.assertEqual(p['z'], 90.0)
+        self.assertEqual(p['s2'], 110.0)
+
+    def test_old_strategy_file_needs_no_migration(self):
+        """舊策略檔裡的 z/s2 就算差很多,也一律不生效 —— 不做資料遷移。
+
+        這是 ADR-123 的教訓:一個使用者看不到的欄位若還能左右出場行為,
+        遲早會出事。"""
+        p = chukuangren_band.params_of(self._strat(ck_z=99999.0, ck_s2=-1.0))
+        self.assertEqual(p['z'], 90.0)
+        self.assertEqual(p['s2'], 110.0)
+
+    def test_other_params_are_untouched(self):
+        """反向對照:只有 z/s2 被覆寫。少了這條,把 params_of 寫成「全部歸零」
+        或「全部等於 y」也會讓上面兩條綠。"""
+        p = chukuangren_band.params_of(self._strat())
+        self.assertEqual(p['x'], 100.0)
+        self.assertEqual(p['y'], 90.0)
+        self.assertEqual(p['s1'], 110.0)
+        self.assertEqual(p['c'], 5.0)
+        self.assertEqual(p['f'], 2.0)
+
+    def test_merged_pairs_point_at_the_trigger_not_the_other_way(self):
+        """方向不可以寫反 —— 反了就變成「確認值覆寫觸發值」,而使用者填的是觸發值。"""
+        self.assertEqual(chukuangren_band.MERGED_STOP_PAIRS, (('z', 'y'), ('s2', 's1')))
+
+    # ---------- UI 參數清單 ----------
+
+    def test_ui_no_longer_asks_for_the_confirm_level(self):
+        for keys in (chukuangren_band.LONG_PARAM_KEYS, chukuangren_band.SHORT_PARAM_KEYS):
+            self.assertNotIn('z', keys)
+            self.assertNotIn('s2', keys)
+        self.assertIn('y', chukuangren_band.LONG_PARAM_KEYS)
+        self.assertIn('s1', chukuangren_band.SHORT_PARAM_KEYS)
+
+    def test_data_format_still_carries_the_keys(self):
+        """z/s2 留在 PARAM_KEYS:舊策略檔讀得進來,使用者降版回舊程式也不會壞。"""
+        self.assertIn('z', chukuangren_band.PARAM_KEYS)
+        self.assertIn('s2', chukuangren_band.PARAM_KEYS)
+        # 每個 key 都要有標籤與說明,否則編輯器 _mk_param_rows 會 KeyError
+        for k in chukuangren_band.PARAM_KEYS:
+            self.assertIn(k, chukuangren_band.PARAM_LABELS)
+            self.assertIn(k, chukuangren_band.PARAM_HELP)
+
+    # ---------- 行為差異:合併之後出場判斷真的改變 ----------
+
+    def test_long_confirm_now_follows_y_not_the_old_z(self):
+        """做多、Y=90、舊檔 Z=92,隔天12:00 指數 91:
+             舊行為 91 < Z=92 → 平倉
+             新行為 91 > Y=90 → 作廢、繼續持有
+        這條就是合併前後**唯一會看到差別**的地方,所以一定要測到。"""
+        p = chukuangren_band.params_of(self._strat())     # 經過 params_of
+        rt = strategy_engine.new_runtime()
+        rt['state'] = 'LONG'; rt['qty'] = 2
+        rt['pending_exit'] = {'reason': 'SL', 'date': '2026-01-01'}
+        chukuangren_band.on_noon_confirm(p, rt, 91.0, '2026-01-02', now_ts=1000.0, qty=2)
+        self.assertIsNone(rt.get('armed_intent'),
+                          "91 已站回 Y=90 之上,不該平倉 (舊行為會因為 91<Z=92 而平倉)")
+        self.assertEqual(rt['state'], 'LONG')
+        # 正控:真的跌破 Y 就要平倉 —— 少了這條,把停損整個關掉也會綠
+        rt2 = strategy_engine.new_runtime()
+        rt2['state'] = 'LONG'; rt2['qty'] = 2
+        rt2['pending_exit'] = {'reason': 'SL', 'date': '2026-01-01'}
+        chukuangren_band.on_noon_confirm(p, rt2, 89.0, '2026-01-02', now_ts=1000.0, qty=2)
+        self.assertIsNotNone(rt2.get('armed_intent'), "89 < Y=90,停損確認要成立")
+        self.assertEqual(rt2['armed_intent']['action'], '賣出')
+
+    def test_short_confirm_now_follows_s1_not_the_old_s2(self):
+        p = chukuangren_band.params_of(self._strat())
+        rt = strategy_engine.new_runtime()
+        rt['state'] = 'SHORT'; rt['qty'] = 2
+        rt['pending_exit'] = {'reason': 'SL', 'date': '2026-01-01'}
+        chukuangren_band.on_noon_confirm(p, rt, 109.0, '2026-01-02', now_ts=1000.0, qty=2)
+        self.assertIsNone(rt.get('armed_intent'),
+                          "109 已回到 S1=110 之下,不該平倉 (舊行為會因為 109>S2=108 而平倉)")
+        # 正控
+        rt2 = strategy_engine.new_runtime()
+        rt2['state'] = 'SHORT'; rt2['qty'] = 2
+        rt2['pending_exit'] = {'reason': 'SL', 'date': '2026-01-01'}
+        chukuangren_band.on_noon_confirm(p, rt2, 111.0, '2026-01-02', now_ts=1000.0, qty=2)
+        self.assertIsNotNone(rt2.get('armed_intent'), "111 > S1=110,停損確認要成立")
+        self.assertEqual(rt2['armed_intent']['action'], '買進')
+
+    # ---------- validate 的訊息 ----------
+
+    def test_validate_short_stop_must_be_above_x_with_a_helpful_message(self):
+        """重現使用者截圖:做空 X=42500、停損填 41701 (在 X 之下) → 應該擋下,
+        而且訊息要講出「為什麼」與實際填的數字。"""
+        s = self._strat(direction='做空', ck_x=42500.0, ck_s1=41701.0)
+        ok, msg = chukuangren_band.validate(s)
+        self.assertFalse(ok)
+        self.assertIn('41701', msg)
+        self.assertIn('42500', msg)
+        self.assertIn('漲上去', msg)
+
+    def test_validate_long_stop_must_be_below_x_with_a_helpful_message(self):
+        s = self._strat(direction='做多', ck_x=42500.0, ck_y=43000.0)
+        ok, msg = chukuangren_band.validate(s)
+        self.assertFalse(ok)
+        self.assertIn('跌下去', msg)
+
+    def test_validate_passes_with_only_the_single_stop_filled(self):
+        """反向對照:只填一個停損點位就必須存得起來 —— 這才是使用者要的。
+        (舊程式沒有 z/s2 的檢查,所以這裡真正守的是「別為了合併而多加驗證」)"""
+        s = self._strat(direction='做多', ck_x=42500.0, ck_y=42000.0)
+        s.pop('ck_z', None)
+        ok, msg = chukuangren_band.validate(s)
+        self.assertTrue(ok, f"只填 Y 應該可以存檔,實際被擋: {msg}")
+        s2 = self._strat(direction='做空', ck_x=42500.0, ck_s1=43000.0, trade_type='期貨')
+        s2.pop('ck_s2', None)
+        ok2, msg2 = chukuangren_band.validate(s2)
+        self.assertTrue(ok2, f"只填 S1 應該可以存檔,實際被擋: {msg2}")
+
 
 
 if __name__ == "__main__":

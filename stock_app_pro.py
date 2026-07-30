@@ -9583,8 +9583,13 @@ class StockTradingAppPro(tk.Tk):
         _at = (dlg, e_wsym, cb_wtt_a, lambda *_a: None, 'A')
         e_wsym.bind('<FocusIn>', lambda *_a: setattr(self, '_qt_editor_symbol_target', _at), add='+')
 
-        # 參數區:X/C/F 兩方向共用;Y/Z 只做多顯示、S1/S2 只做空顯示 (ADR-085)。
-        # 依「方向」下拉選單動態切換要顯示的那組停損參數。
+        # 參數區:X/C/F 兩方向共用;Y 只做多顯示、S1 只做空顯示 (ADR-085)。
+        # 依「方向」下拉選單動態切換要顯示的那個停損參數。
+        # 【ADR-129】原本做多顯示 Y+Z、做空顯示 S1+S2 (觸發線 + 確認線)。使用者
+        # 實測回報「這兩個應該是要一樣,不需要分兩個,只需填一個 S1 就可以」——
+        # 停損的觸發與隔天12:00 確認改用同一個點位,所以這裡各只留一個欄位。
+        # z/s2 仍在資料格式裡 (讀得懂舊檔),值由 _collect() 鏡射、由
+        # chukuangren_band.params_of() 覆寫,兩層都指向觸發值。
         pcontainer = tk.Frame(body, bg="#1A2026"); pcontainer.pack(fill=tk.X, padx=12, pady=(6, 4))
         tk.Label(pcontainer, text="參數 (加權指數點位/點數,依你的判斷自行設定)", bg="#1A2026",
                  fg="#FFCA28", font=('微軟正黑體', 9, 'bold')).pack(anchor='w', pady=(0, 4))
@@ -9604,8 +9609,8 @@ class StockTradingAppPro(tk.Tk):
             return fr
 
         common_fr = _mk_param_rows(pcontainer, ('x', 'c', 'f')); common_fr.pack(fill=tk.X, anchor='w')
-        long_fr = _mk_param_rows(pcontainer, ('y', 'z'))
-        short_fr = _mk_param_rows(pcontainer, ('s1', 's2'))
+        long_fr = _mk_param_rows(pcontainer, ('y',))
+        short_fr = _mk_param_rows(pcontainer, ('s1',))
 
         def _refresh_dir(*_a):
             long_fr.pack_forget(); short_fr.pack_forget()
@@ -9646,10 +9651,20 @@ class StockTradingAppPro(tk.Tk):
             # 這裡是讓舊策略「下次儲存時」資料本身也洗乾淨 (同 ADR-123 的做法)。
             s['watch_timeframe'] = strategy_engine.DAY_SIGNAL_TIMEFRAME
             for k in chukuangren_band.PARAM_KEYS:
+                # 【ADR-129】z / s2 已經沒有輸入框了 (併入 y / s1),所以這裡不能
+                # 直接 param_entries[k] —— 會 KeyError。用 .get() 取,取不到就
+                # 留給下面的鏡射處理。
+                e = param_entries.get(k)
+                if e is None:
+                    continue
                 try:
-                    s[f'ck_{k}'] = float(param_entries[k].get().strip())
+                    s[f'ck_{k}'] = float(e.get().strip())
                 except (TypeError, ValueError):
                     s[f'ck_{k}'] = 0.0
+            # 停損確認點位鏡射成觸發點位,讓存檔資料本身也一致 (真正的防線在
+            # params_of(),這裡只是不留下自相矛盾的舊值,同 ADR-123 的做法)。
+            for _dst, _src in chukuangren_band.MERGED_STOP_PAIRS:
+                s[f'ck_{_dst}'] = s.get(f'ck_{_src}', 0.0)
             s['entry'] = s.get('entry') or []
             s['exit_signals'] = s.get('exit_signals') or []
             # 【ADR-120】pattern_* 幾個欄位已移除 (盤勢/型態搬到主圖【盤勢判斷】)。

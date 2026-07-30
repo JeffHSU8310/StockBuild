@@ -4597,6 +4597,155 @@ run_case("ADR-128: 終極波段的訊號週期回到日K + 12:00確認獨立通�
          _chukuangren_eval_cadence_128)
 
 
+def _merged_stop_level_129():
+    """【ADR-129】停損的「觸發」與「隔天12:00 確認」合併成同一個點位。
+
+    使用者實機回報 (截圖:做空 X=42500、S1=41701、S2=41700):
+        「這兩個應該是要一樣,不需要分兩個,只需填一個 S1 就可以。(多單也是一樣)」
+
+    這個案例走**完整的 GUI 路徑** (_quant_eval_pass → _qt_chukuangren_confirm_pass),
+    因為 core 的單元測試是拿手寫的 params dict 測狀態機,**測不到「GUI 有沒有經過
+    params_of() 去拿參數」** —— 而覆寫就發生在 params_of() 裡 (P-64)。
+    """
+    import pandas as _pd
+    from core import strategy_engine as _se9
+    from core import chukuangren_band as _ck9
+
+    class FakeContract:
+        code = 'TXF'
+        symbol = 'TXFR1'
+
+    # 加權指數日K:最後一根收 85,低於 Y=90 → on_daily_close 記下待確認停損
+    _n = 40
+    _daily = _pd.DataFrame(
+        {'Open': [100.0] * _n, 'High': [102.0] * _n, 'Low': [84.0] * _n,
+         'Close': [100.0] * (_n - 1) + [85.0], 'Volume': [1000] * _n},
+        index=_pd.bdate_range(end=stock_app_pro.datetime.now().replace(
+            hour=0, minute=0, second=0, microsecond=0), periods=_n))
+
+    confirm_px = {'v': 91.0}
+    orig_log = app.log_message
+    orig_resolve = app._qt_resolve
+    orig_resolve_watch = app._qt_resolve_watch
+    orig_fetch = app._qt_fetch_closed_bars
+    orig_open = stock_app_pro.market_session.is_market_open
+    orig_just = stock_app_pro.market_session.just_opened
+    orig_window = _ck9.in_noon_confirm_window
+    orig_running, orig_login, orig_api = app._qt_running, app.api_logged_in, app.sj_api
+    orig_strats, orig_rts = app.strategies, app.strategy_runtimes
+
+    def _fake_fetch(_s, _c, _a, tf=None, cache_sym=None, cache_market=None, **_k):
+        if tf == '日K':
+            return _daily
+        return _pd.DataFrame({'Close': [confirm_px['v']]},
+                             index=[stock_app_pro.datetime.now()])
+
+    def _mount(**over):
+        """掛一檔『舊策略檔』:Y=90 但殘留 Z=92 (合併前使用者可能填的兩個值)。"""
+        s = _ck9.default_strategy()
+        s.update({'name': '診斷ADR129', 'symbol': 'TXF', 'trade_type': '期貨',
+                  'market': '台期貨', 'qty': 2, 'direction': '做多', 'mode': '模擬',
+                  'enabled': True, 'session_gate': False,
+                  'ck_x': 100.0, 'ck_y': 90.0, 'ck_z': 92.0,
+                  'ck_s1': 110.0, 'ck_s2': 108.0, 'ck_c': 5.0, 'ck_f': 2.0})
+        s.update(over)
+        rt = _se9.new_runtime()
+        rt.update({'state': 'LONG', 'qty': 2, 'entry_price': 100.0,
+                   'exec_entry_price': 100.0, 'entry_index_price': 100.0})
+        app.strategies = [s]
+        app.strategy_runtimes = {s['id']: rt}
+        app._qt_last_boundary = {}
+        app._qt_session_state = {}
+        return s, rt
+
+    try:
+        app.log_message = lambda m: (None, orig_log(m))[0]
+        app._qt_resolve = lambda _s: (FakeContract(), 'futures')
+        app._qt_resolve_watch = lambda _s: (FakeContract(), 'index_tw', '^TWII', '台股')
+        app._qt_fetch_closed_bars = _fake_fetch
+        app.sj_api = object(); app.api_logged_in = True; app._qt_running = True
+        stock_app_pro.market_session.is_market_open = lambda *a, **k: True
+        stock_app_pro.market_session.just_opened = lambda *a, **k: False
+        _ck9.in_noon_confirm_window = lambda _dt: True
+
+        # ---- 1. 【行為差異的核心】指數 91:站回 Y=90 之上 → 不可以平倉 ----
+        # 舊行為:91 < Z=92 → 平倉。這是合併前後唯一看得出差別的地方。
+        s1_, rt1 = _mount()
+        confirm_px['v'] = 91.0
+        eval_pass(); app.flush_after()
+        assert rt1.get('pending_exit'), \
+            f"前置條件:日K 收 85 < Y=90,應記下待確認停損 (實際 {rt1.get('pending_exit')})"
+        app._qt_chukuangren_confirm_pass(); app.flush_after()
+        assert rt1.get('last_confirm_date'), "前置條件:確認流程應該有跑到"
+        assert not rt1.get('armed_intent'), \
+            "指數 91 已站回 Y=90 之上,不可以平倉 (舊行為會因為 91 < 殘留的 Z=92 而平倉)"
+        assert rt1['state'] == 'LONG', f"不該平倉,state 應維持 LONG (實際 {rt1['state']})"
+
+        # ---- 2. 正控:真的跌破 Y 就必須平倉 ----
+        # 少了這條,把停損整個關掉也會讓第 1 條綠 —— 那是嚴重得多的問題。
+        s2_, rt2 = _mount()
+        confirm_px['v'] = 89.0
+        eval_pass(); app.flush_after()
+        assert rt2.get('pending_exit'), "前置條件:應記下待確認停損"
+        app._qt_chukuangren_confirm_pass(); app.flush_after()
+        assert rt2.get('armed_intent'), \
+            "指數 89 < Y=90,停損確認要成立 (否則等於把停損關掉了)"
+        assert rt2['armed_intent']['action'] == '賣出'
+
+        # ---- 3. 舊檔的殘留值不可以有任何影響 (不做資料遷移) ----
+        # 把 Z 改成極端值,結果必須跟第 1 條完全一樣。
+        s3_, rt3 = _mount(ck_z=99999.0)
+        confirm_px['v'] = 91.0
+        eval_pass(); app.flush_after()
+        app._qt_chukuangren_confirm_pass(); app.flush_after()
+        assert not rt3.get('armed_intent'), \
+            "殘留的 Z=99999 不可以生效 (若生效,91 < 99999 會誤平倉)"
+
+        # ---- 4. 原始碼層級:編輯器只留一個停損欄位 + 有鏡射 ----
+        _src = open('stock_app_pro.py', encoding='utf-8').read()
+        assert "_mk_param_rows(pcontainer, ('y',))" in _src, \
+            "做多方向的編輯器應只剩一個停損欄位 Y"
+        assert "_mk_param_rows(pcontainer, ('s1',))" in _src, \
+            "做空方向的編輯器應只剩一個停損欄位 S1"
+        assert "chukuangren_band.MERGED_STOP_PAIRS" in _src, \
+            "_collect() 要把確認點位鏡射成觸發點位,存檔資料才不自相矛盾"
+        # 而且不可以再用 param_entries[k] 直取 —— z/s2 已經沒有輸入框,會 KeyError
+        assert "param_entries[k].get()" not in _src, \
+            "z/s2 沒有輸入框了,_collect() 不可以再用 param_entries[k] 直取 (會 KeyError)"
+
+        # ---- 5. 重現使用者截圖的驗證訊息 ----
+        s5 = _ck9.default_strategy()
+        s5.update({'symbol': 'TXF', 'trade_type': '期貨', 'market': '台期貨', 'qty': 5,
+                   'direction': '做空', 'ck_x': 42500.0, 'ck_s1': 41701.0,
+                   'ck_c': 1000.0, 'ck_f': 200.0})
+        _ok, _msg = _ck9.validate(s5)
+        assert not _ok, "做空的停損點位填在 X 之下,應該被擋下來"
+        assert '41701' in _msg and '42500' in _msg and '漲上去' in _msg, \
+            f"訊息要講出為什麼與實際數字,方便使用者自己修正: {_msg}"
+        # 反向對照:改成 X 之上就要存得起來 (只填一個 S1)
+        s5['ck_s1'] = 43000.0
+        s5.pop('ck_s2', None)
+        _ok2, _msg2 = _ck9.validate(s5)
+        assert _ok2, f"只填一個 S1 (且大於 X) 必須存得起來,實際被擋: {_msg2}"
+    finally:
+        app.log_message = orig_log
+        app._qt_resolve = orig_resolve
+        app._qt_resolve_watch = orig_resolve_watch
+        app._qt_fetch_closed_bars = orig_fetch
+        _ck9.in_noon_confirm_window = orig_window
+        stock_app_pro.market_session.is_market_open = orig_open
+        stock_app_pro.market_session.just_opened = orig_just
+        app._qt_running, app.api_logged_in, app.sj_api = orig_running, orig_login, orig_api
+        app.strategies, app.strategy_runtimes = orig_strats, orig_rts
+        app._qt_last_boundary = {}
+        app._qt_session_state = {}
+        app.__dict__.pop('_qt_confirm_err_noted', None)
+
+
+run_case("ADR-129: 停損觸發/確認合併成一個點位 (舊檔殘留值不生效)",
+         _merged_stop_level_129)
+
+
 print(f"{'案例':60s} 結果")
 print("-" * 76)
 for name, st, msg in results:
