@@ -120,14 +120,32 @@ def run_case(name, fn):
     需要休市 / 需要暖機的案例自己在案例內再 patch 一次(它們的 patch 會蓋過
     這裡的預設,`finally` 也還原得回來)。這樣**任何新案例都不會不小心又
     依賴真實時鐘**。
+
+    【ADR-131 追加:同一個教訓的第三次】ADR-127 把日K 快取的新鮮度從「TTL」
+    改成「這段期間有沒有跨過開盤」(`any_session_opens_between`) 之後,
+    **兩個既有案例又悄悄變成時鐘相依**:
+      * ADR-122「日K 類快取放了 10 分鐘仍應命中」
+      * ADR-127「35 分鐘內沒有跨過開盤,不可以重抓」
+    兩者都用「把快取時間戳往前撥」模擬時間經過,而往前撥出來的區間若剛好
+    跨過真實的開盤時刻 (08:45/09:00/09:10/15:00),就會被判定為過期 → 紅。
+    也就是**每天 08:45~09:45 與 15:00~15:35 這兩段時間跑診斷必紅**,
+    其餘時間全綠 —— 而我先前的驗證全部落在 02:4x / 11:5x / 12:2x。
+
+    這正是 P-97 寫過的那句話:「加了閘門/前置條件之後,回頭看既有測試有沒有
+    因此變成時鐘相依」。我寫下來了,卻沒有在改 ADR-127 時真的回頭看。
+
+    修法一樣放在 harness:預設「期間內沒有跨過任何開盤」(= False),
+    需要相反值的案例自己 patch(ADR-127 的正反對照本來就自己 patch)。
     """
     # 別名刻意不叫 _ms —— 這個檔案裡 _ms 已經是 core.market_screener
     # (diag_crossref 會把同名別名混在一起看,撞名就誤報跨模組斷鏈;
     #  ADR-122 也踩過一次同樣的事,那次是 _cs)。
     _msess = stock_app_pro.market_session
     _orig_open, _orig_just = _msess.is_market_open, _msess.just_opened
+    _orig_between = _msess.any_session_opens_between
     _msess.is_market_open = lambda *a, **k: True
     _msess.just_opened = lambda *a, **k: False
+    _msess.any_session_opens_between = lambda *a, **k: False
     try:
         fn()
         results.append((name, "PASS", ""))
@@ -137,6 +155,7 @@ def run_case(name, fn):
         results.append((name, "ERROR", f"{type(e).__name__}: {e}"))
     finally:
         _msess.is_market_open, _msess.just_opened = _orig_open, _orig_just
+        _msess.any_session_opens_between = _orig_between
 
 
 def _make_df(n=200):
@@ -4906,6 +4925,130 @@ def _stop_level_free_of_x_130():
 
 run_case("ADR-130: 停損點位不受進出場分界 X 限制 (但仍要真的填)",
          _stop_level_free_of_x_130)
+
+
+def _bollinger_two_sets_131():
+    """【ADR-131】主圖布林:參數列不見了 + 改成兩組完整通道。
+
+    使用者實機截圖:「主圖指標參數設定」裡看得到 MA1~MA6,**布林那一整列
+    卻不見了**,只剩一行說明文字、旁邊露出半截「(σ2=0不畫第二組)」跟一個
+    沒有標題的色彩下拉。
+
+    根因是 grid 版面撞格:說明文字那一行寫成 `row=8, columnspan=4`,跟布林的
+    checkbox / 期間 / σ1 / σ2 **同一個 grid 儲存格**,而 tkinter 的 grid 是
+    後放的蓋前放的。從第一版就是這樣。
+
+    這個案例守兩件事:
+      A. **版面**:用 AST 靜態算出 open_main_settings 裡每個 grid 呼叫佔用的
+         儲存格,任何兩個 widget 不可以佔到同一格。這是那個 bug 的**類別**,
+         不是那一行字串 —— 換個位置再撞一次照樣會抓到。
+      B. **功能**:兩組布林各自獨立 (中線類型/期間 + 兩條上下線),而且第1組
+         的欄位名沒有被改掉。
+    """
+    import ast as _ast
+    import pandas as _pd
+    from core import indicators as _ind
+
+    # ---- A. grid 儲存格不可以重疊 ----
+    _src = open('stock_app_pro.py', encoding='utf-8').read()
+    _tree = _ast.parse(_src)
+    _fn = None
+    for _node in _ast.walk(_tree):
+        if isinstance(_node, _ast.FunctionDef) and _node.name == 'open_main_settings':
+            _fn = _node
+            break
+    assert _fn is not None, "找不到 open_main_settings"
+
+    def _lit(kw, name, default):
+        for k in kw:
+            if k.arg == name:
+                if isinstance(k.value, _ast.Constant) and isinstance(k.value.value, int):
+                    return k.value.value
+                return None          # 非字面值 (例如迴圈裡的 row=i+1) → 跳過
+        return default
+
+    occupied = {}
+    for _node in _ast.walk(_fn):
+        if not (isinstance(_node, _ast.Call) and isinstance(_node.func, _ast.Attribute)
+                and _node.func.attr == 'grid'):
+            continue
+        row = _lit(_node.keywords, 'row', None)
+        col = _lit(_node.keywords, 'column', 0)
+        cspan = _lit(_node.keywords, 'columnspan', 1)
+        rspan = _lit(_node.keywords, 'rowspan', 1)
+        if row is None or col is None or cspan is None or rspan is None:
+            continue                  # 迴圈產生的位置不在這條規則的範圍內
+        for r in range(row, row + rspan):
+            for c in range(col, col + cspan):
+                if (r, c) in occupied:
+                    raise AssertionError(
+                        f"主圖指標設定的 grid 撞格:第 {_node.lineno} 行與第 "
+                        f"{occupied[(r, c)]} 行都佔到 (row={r}, column={c}) —— "
+                        "tkinter 會讓後放的蓋掉前放的,參數就會像使用者截圖那樣不見")
+                occupied[(r, c)] = _node.lineno
+    assert occupied, "應該解析得到 grid 呼叫 (解析不到就等於這條檢查是空殼)"
+
+    # ---- B. 兩組布林的功能 ----
+    for _v in ('bb_type', 'bb2_show', 'bb2_type', 'bb2_period', 'bb2_std1',
+               'bb2_std2', 'bb2_color'):
+        assert hasattr(app, _v), f"缺少第2組布林的設定變數 {_v}"
+
+    _n = 90
+    _close = [100.0 + (i % 7) - 3 for i in range(_n)]
+    _df = _pd.DataFrame(
+        {'Open': _close, 'High': [c + 2 for c in _close],
+         'Low': [c - 2 for c in _close], 'Close': _close,
+         'Volume': [1000] * _n},
+        index=_pd.date_range('2026-01-01', periods=_n, freq='D'))
+
+    _orig = {k: getattr(app, k).get() for k in
+             ('bb_show', 'bb_period', 'bb_std1', 'bb_std2', 'bb_type',
+              'bb2_show', 'bb2_period', 'bb2_std1', 'bb2_std2', 'bb2_type')}
+    try:
+        # 只開第1組:第2組欄位不可以出現 (反向對照 —— 否則圖上會多出線)
+        app.bb_show.set(True); app.bb_period.set(20)
+        app.bb_std1.set(2.0); app.bb_std2.set(3.0); app.bb_type.set('SMA')
+        app.bb2_show.set(False)
+        out1 = app.calculate_custom_indicators(_df)
+        for c in ('BB_MID', 'BB_UPPER', 'BB_LOWER', 'BB_UPPER2', 'BB_LOWER2'):
+            assert c in out1.columns, f"第1組布林欄位 {c} 不見了 (繪圖與十字線都靠它)"
+        assert 'BB2_MID' not in out1.columns, "沒開第2組就不該有 BB2 欄位"
+
+        # 兩組都開:各自獨立的中線
+        app.bb2_show.set(True); app.bb2_period.set(60)
+        app.bb2_std1.set(1.5); app.bb2_std2.set(2.5); app.bb2_type.set('EMA')
+        out2 = app.calculate_custom_indicators(_df)
+        for c in ('BB2_MID', 'BB2_UPPER', 'BB2_LOWER', 'BB2_UPPER2', 'BB2_LOWER2'):
+            assert c in out2.columns, f"第2組布林欄位 {c} 沒有算出來"
+        assert not out2['BB_MID'].equals(out2['BB2_MID']), \
+            "兩組中線 (SMA20 / EMA60) 算出來一樣,等於第2組的參數沒有生效"
+        # 上下線確實照各自的 σ 展開
+        import numpy as _np
+        _i = -1
+        assert abs((out2['BB_UPPER'].iloc[_i] - out2['BB_MID'].iloc[_i])
+                   - 2.0 * out2['BB_STD'].iloc[_i]) < 1e-6, "第1組 σa 不對"
+        assert abs((out2['BB2_UPPER'].iloc[_i] - out2['BB2_MID'].iloc[_i])
+                   - 1.5 * out2['BB2_STD'].iloc[_i]) < 1e-6, "第2組 σa 不對"
+
+        # σb=0 → 該組只畫一對上下線
+        app.bb2_std2.set(0.0)
+        out3 = app.calculate_custom_indicators(_df)
+        assert 'BB2_UPPER2' not in out3.columns, "σb=0 不該畫第二條上下線"
+        assert 'BB2_UPPER' in out3.columns, "σb=0 只影響第二條,第一條仍要在"
+
+        # 只開第2組:第1組關著也要能單獨畫
+        app.bb_show.set(False)
+        app.__dict__.pop('_bb_param_warned', None)
+        out4 = app.calculate_custom_indicators(_df)
+        assert 'BB2_MID' in out4.columns, "第1組關著時,第2組仍要能畫"
+    finally:
+        for k, v in _orig.items():
+            getattr(app, k).set(v)
+        app.__dict__.pop('_bb_param_warned', None)
+
+
+run_case("ADR-131: 主圖布林參數列被蓋掉 (grid撞格) + 兩組完整布林通道",
+         _bollinger_two_sets_131)
 
 
 print(f"{'案例':60s} 結果")

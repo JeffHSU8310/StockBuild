@@ -23,6 +23,75 @@ def _calc_wma(series: pd.Series, period: int) -> pd.Series:
     return series.rolling(period).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)
 
 
+# 【ADR-131】均線類型的單一出處。原本這段內嵌在 MA1~MA6 的迴圈裡,布林中線
+# 要支援 SMA/EMA/WMA 時只能再抄一份 —— 兩份各自維護遲早分歧 (P-67)。
+MA_TYPES = ('SMA', 'EMA', 'WMA')
+
+
+def moving_average(series: pd.Series, period: int, kind: str = 'SMA'):
+    """回傳指定類型的均線;類型不認得或期間不合法回 None (呼叫端自行略過)。"""
+    try:
+        p = int(period)
+    except (TypeError, ValueError):
+        return None
+    if p < 1:
+        return None
+    k = str(kind or 'SMA').strip().upper()
+    if k == 'EMA':
+        return series.ewm(span=p, adjust=False).mean()
+    if k == 'WMA':
+        return _calc_wma(series, p)
+    if k == 'SMA':
+        return series.rolling(window=p).mean()
+    return None
+
+
+def bollinger_set(df: pd.DataFrame, period, std_a, std_b, ma_type='SMA',
+                  prefix='BB', with_width=False) -> pd.DataFrame:
+    """【ADR-131】算一組布林通道 (中線 + 兩條上下線),就地寫進 df。
+
+    欄位名:{prefix}_MID / _STD / _UPPER / _LOWER,第二條上下線是
+    {prefix}_UPPER2 / _LOWER2。prefix='BB' 時產生的欄位名與 ADR-029 完全相同,
+    所以第1組不需要任何呼叫端配合修改。
+
+    參數轉換失敗一律退回安全值 (期間 20、σ 2.0、不畫第二條),維持本模組
+    「壞參數不可以讓整張圖畫不出來」的慣例 (P-?? / 見 ADR-029 的降級處理)。
+
+    ※ 中線可以是 SMA/EMA/WMA,但**標準差一律取收盤價的 rolling std** ——
+      那是布林通道的定義,不隨中線類型改變。
+    """
+    try:
+        p = max(2, int(float(str(period))))
+    except (TypeError, ValueError):
+        p = 20
+    try:
+        s_a = float(str(std_a))
+        if s_a <= 0:
+            s_a = 2.0
+    except (TypeError, ValueError):
+        s_a = 2.0
+    try:
+        s_b = float(str(std_b))
+    except (TypeError, ValueError):
+        s_b = 0.0
+
+    mid = moving_average(df['Close'], p, ma_type)
+    if mid is None:
+        mid = df['Close'].rolling(window=p).mean()
+    df[f'{prefix}_MID'] = mid
+    df[f'{prefix}_STD'] = df['Close'].rolling(window=p).std()
+    df[f'{prefix}_UPPER'] = df[f'{prefix}_MID'] + (s_a * df[f'{prefix}_STD'])
+    df[f'{prefix}_LOWER'] = df[f'{prefix}_MID'] - (s_a * df[f'{prefix}_STD'])
+    if with_width:
+        df[f'{prefix}_WIDTH'] = (
+            (df[f'{prefix}_UPPER'] - df[f'{prefix}_LOWER']) / df[f'{prefix}_MID'] * 100)
+    # 第二條上下線:σ<=0 或跟第一條一樣就不畫 (畫了也是重疊的兩條線)
+    if s_b > 0 and abs(s_b - s_a) > 1e-9:
+        df[f'{prefix}_UPPER2'] = df[f'{prefix}_MID'] + (s_b * df[f'{prefix}_STD'])
+        df[f'{prefix}_LOWER2'] = df[f'{prefix}_MID'] - (s_b * df[f'{prefix}_STD'])
+    return df
+
+
 def calculate_indicators(
     df: pd.DataFrame,
     ma_flags,        # list[bool] 長度6, 對應 MA1~MA6 是否啟用
@@ -35,49 +104,35 @@ def calculate_indicators(
     kdj_show: bool, kd_n: str, kd_m1: str, kd_m2: str,
     dmi_show: bool, dmi_n: str,
     bb_period=20, bb_std1=2.0, bb_std2=0.0,  # 【ADR-029】布林自訂:期間+兩組標準差 (std2<=0 不算第二組)
+    bb_type='SMA',                            # 【ADR-131】中線類型 SMA/EMA/WMA
+    # 【ADR-131】第2組完整布林 (自己的中線 + 自己的兩條上下線)。
+    # 全部給預設值,舊呼叫端不傳也能跑。
+    bb2_show=False, bb2_period=60, bb2_std1=2.0, bb2_std2=0.0, bb2_type='SMA',
 ) -> pd.DataFrame:
     df = df.copy()
 
     for i in range(6):
         if ma_flags[i]:
             try:
-                p = int(ma_periods[i])
-                t = ma_types[i]
                 col = f"MA_CUSTOM_{i}"
-                if t == "SMA":
-                    df[col] = df['Close'].rolling(window=p).mean()
-                elif t == "EMA":
-                    df[col] = df['Close'].ewm(span=p, adjust=False).mean()
-                elif t == "WMA":
-                    df[col] = _calc_wma(df['Close'], p)
+                out = moving_average(df['Close'], int(ma_periods[i]), ma_types[i])
+                if out is not None:
+                    df[col] = out
             except Exception:
                 pass
 
     if bb_show or bbw_show:
-        # 【ADR-029】布林通道參數化:期間與第一組標準差可自訂;第二組標準差
-        # (bb_std2) > 0 時額外產出 BB_UPPER2/BB_LOWER2 (上下限各兩組)。
-        # 參數轉換失敗時退回 20/2.0/不畫第二組,維持本模組「靜默略過」慣例。
-        try:
-            _p = max(2, int(float(str(bb_period))))
-        except (TypeError, ValueError):
-            _p = 20
-        try:
-            _s1 = float(str(bb_std1))
-            if _s1 <= 0: _s1 = 2.0
-        except (TypeError, ValueError):
-            _s1 = 2.0
-        try:
-            _s2 = float(str(bb_std2))
-        except (TypeError, ValueError):
-            _s2 = 0.0
-        df['BB_MID'] = df['Close'].rolling(window=_p).mean()
-        df['BB_STD'] = df['Close'].rolling(window=_p).std()
-        df['BB_UPPER'] = df['BB_MID'] + (_s1 * df['BB_STD'])
-        df['BB_LOWER'] = df['BB_MID'] - (_s1 * df['BB_STD'])
-        df['BB_WIDTH'] = (df['BB_UPPER'] - df['BB_LOWER']) / df['BB_MID'] * 100
-        if _s2 > 0 and abs(_s2 - _s1) > 1e-9:
-            df['BB_UPPER2'] = df['BB_MID'] + (_s2 * df['BB_STD'])
-            df['BB_LOWER2'] = df['BB_MID'] - (_s2 * df['BB_STD'])
+        # 第1組布林:**沿用原本的欄位名** (BB_MID/BB_UPPER/...),所以既有的
+        # 繪圖、十字線提示、BBW 副圖完全不用改 —— 這是 ADR-131 刻意的選擇,
+        # 把新功能的迴歸風險壓在「只有第2組是新的」。
+        bollinger_set(df, bb_period, bb_std1, bb_std2, ma_type=bb_type,
+                      prefix='BB', with_width=True)
+
+    if bb2_show:
+        # 【ADR-131】第2組布林:自己的中線期間/類型 + 自己的兩條上下線。
+        # BB_WIDTH 只由第1組產生 (副圖只有一條,不改副圖語意)。
+        bollinger_set(df, bb2_period, bb2_std1, bb2_std2, ma_type=bb2_type,
+                      prefix='BB2', with_width=False)
 
     try:
         if macd_show:
