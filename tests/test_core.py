@@ -6493,5 +6493,140 @@ class TestStopLevelIndependentOfX(unittest.TestCase):
 
 
 
+class TestBollingerTwoSets(unittest.TestCase):
+    """【ADR-131】布林改成「兩組完整通道」:每組有自己的中線 (類型+期間) 與
+    自己的兩條上下線。
+
+    背景:使用者實機截圖顯示主圖指標設定裡**布林那一整列不見了** (被說明文字
+    蓋掉,見 diag 的 grid 版面檢查),同時要求「可以自己設定中線&上下線各2組
+    的參數」。
+    """
+
+    def _ohlc(self, n=80):
+        idx = pd.date_range("2026-01-01", periods=n, freq="D")
+        rng = np.random.default_rng(7)
+        close = 100 + np.cumsum(rng.normal(0, 1, n))
+        return pd.DataFrame({'Open': close, 'High': close + 1,
+                             'Low': close - 1, 'Close': close}, index=idx)
+
+    def _calc(self, df, **over):
+        kw = dict(bb_show=True, bbw_show=False,
+                  macd_show=False, macd_f="12", macd_s="26", macd_sig="9",
+                  rsi_show=False, rsi_p="14",
+                  kdj_show=False, kd_n="9", kd_m1="3", kd_m2="3",
+                  dmi_show=False, dmi_n="14")
+        kw.update(over)
+        return indicators.calculate_indicators(
+            df, [False] * 6, ["SMA"] * 6, ["5"] * 6, **kw)
+
+    # ---------- moving_average:均線類型的單一出處 ----------
+
+    def test_moving_average_kinds(self):
+        s = pd.Series([float(i) for i in range(1, 21)])
+        pd.testing.assert_series_equal(indicators.moving_average(s, 5, 'SMA'),
+                                       s.rolling(window=5).mean())
+        pd.testing.assert_series_equal(indicators.moving_average(s, 5, 'EMA'),
+                                       s.ewm(span=5, adjust=False).mean())
+        self.assertFalse(indicators.moving_average(s, 5, 'WMA').isna().all())
+        # 大小寫/空白不該影響
+        pd.testing.assert_series_equal(indicators.moving_average(s, 5, ' ema '),
+                                       s.ewm(span=5, adjust=False).mean())
+
+    def test_moving_average_bad_input_returns_none(self):
+        s = pd.Series([1.0, 2.0, 3.0])
+        self.assertIsNone(indicators.moving_average(s, 'abc', 'SMA'))
+        self.assertIsNone(indicators.moving_average(s, 0, 'SMA'))
+        self.assertIsNone(indicators.moving_average(s, 5, 'NOPE'))
+
+    def test_ma_types_constant_matches_what_the_ui_offers(self):
+        self.assertEqual(tuple(indicators.MA_TYPES), ('SMA', 'EMA', 'WMA'))
+
+    # ---------- bollinger_set 的數學 ----------
+
+    def test_bollinger_math(self):
+        df = self._ohlc()
+        indicators.bollinger_set(df, 20, 2.0, 3.0, ma_type='SMA', prefix='BB',
+                                 with_width=True)
+        mid = df['Close'].rolling(window=20).mean()
+        std = df['Close'].rolling(window=20).std()
+        pd.testing.assert_series_equal(df['BB_MID'], mid, check_names=False)
+        pd.testing.assert_series_equal(df['BB_UPPER'], mid + 2.0 * std, check_names=False)
+        pd.testing.assert_series_equal(df['BB_LOWER'], mid - 2.0 * std, check_names=False)
+        pd.testing.assert_series_equal(df['BB_UPPER2'], mid + 3.0 * std, check_names=False)
+        pd.testing.assert_series_equal(df['BB_LOWER2'], mid - 3.0 * std, check_names=False)
+
+    def test_second_band_omitted_when_zero_or_same_as_first(self):
+        for sb in (0.0, 2.0):
+            df = self._ohlc()
+            indicators.bollinger_set(df, 20, 2.0, sb, prefix='BB')
+            self.assertNotIn('BB_UPPER2', df.columns, f"σb={sb} 不該畫第二條")
+
+    def test_std_always_from_close_regardless_of_middle_type(self):
+        """中線可以是 EMA/WMA,但標準差一律取收盤價的 rolling std ——
+        那是布林通道的定義,不隨中線類型改變。"""
+        df_s, df_e = self._ohlc(), self._ohlc()
+        indicators.bollinger_set(df_s, 20, 2.0, 0.0, ma_type='SMA', prefix='BB')
+        indicators.bollinger_set(df_e, 20, 2.0, 0.0, ma_type='EMA', prefix='BB')
+        pd.testing.assert_series_equal(df_s['BB_STD'], df_e['BB_STD'])
+        # 但中線本身要真的不一樣 (否則等於 ma_type 沒有生效)
+        self.assertFalse(df_s['BB_MID'].equals(df_e['BB_MID']))
+
+    def test_bad_params_fall_back_instead_of_crashing(self):
+        """壞參數不可以讓整張圖畫不出來 (ADR-029 的降級慣例)。"""
+        df = self._ohlc()
+        indicators.bollinger_set(df, 'abc', 'x', 'y', prefix='BB', with_width=True)
+        self.assertIn('BB_MID', df.columns)
+        self.assertFalse(df['BB_MID'].isna().all())
+
+    def test_prefix_isolates_the_two_sets(self):
+        df = self._ohlc()
+        indicators.bollinger_set(df, 20, 2.0, 0.0, prefix='BB')
+        indicators.bollinger_set(df, 60, 1.5, 0.0, prefix='BB2')
+        for c in ('BB_MID', 'BB_UPPER', 'BB_LOWER', 'BB2_MID', 'BB2_UPPER', 'BB2_LOWER'):
+            self.assertIn(c, df.columns)
+        self.assertFalse(df['BB_MID'].equals(df['BB2_MID']), "兩組中線期間不同,值不該一樣")
+
+    # ---------- calculate_indicators 的整合 ----------
+
+    def test_set1_column_names_unchanged(self):
+        """第1組**必須**沿用原本的欄位名 —— 繪圖/十字線/BBW 副圖都靠它們,
+        改名等於一次弄壞三個地方。這條是本次改動的迴歸防線。"""
+        df = self._calc(self._ohlc(), bb_show=True, bbw_show=True,
+                        bb_period=20, bb_std1=2.0, bb_std2=3.0)
+        for c in ('BB_MID', 'BB_STD', 'BB_UPPER', 'BB_LOWER', 'BB_WIDTH',
+                  'BB_UPPER2', 'BB_LOWER2'):
+            self.assertIn(c, df.columns)
+
+    def test_second_set_off_by_default(self):
+        """反向對照:沒開第2組就不可以產生 BB2 欄位 (否則圖上會多出線)。"""
+        df = self._calc(self._ohlc(), bb_show=True)
+        self.assertNotIn('BB2_MID', df.columns)
+
+    def test_second_set_on_produces_its_own_columns(self):
+        df = self._calc(self._ohlc(), bb_show=True, bb_period=20,
+                        bb2_show=True, bb2_period=60, bb2_std1=1.5, bb2_std2=2.5,
+                        bb2_type='EMA')
+        for c in ('BB2_MID', 'BB2_UPPER', 'BB2_LOWER', 'BB2_UPPER2', 'BB2_LOWER2'):
+            self.assertIn(c, df.columns)
+        # 第2組的中線是 EMA(60),跟第1組 SMA(20) 必須不同
+        self.assertFalse(df['BB_MID'].equals(df['BB2_MID']))
+        # BB_WIDTH 只由第1組產生 (副圖只有一條,不改副圖語意)
+        self.assertNotIn('BB2_WIDTH', df.columns)
+
+    def test_second_set_independent_of_first(self):
+        """第2組開著、第1組關著也要能畫 —— 兩組互相獨立。"""
+        df = self._calc(self._ohlc(), bb_show=False, bbw_show=False,
+                        bb2_show=True, bb2_period=30)
+        self.assertIn('BB2_MID', df.columns)
+        self.assertNotIn('BB_MID', df.columns)
+
+    def test_bb_type_applies_to_first_set(self):
+        df_s = self._calc(self._ohlc(), bb_show=True, bb_period=20, bb_type='SMA')
+        df_e = self._calc(self._ohlc(), bb_show=True, bb_period=20, bb_type='EMA')
+        self.assertFalse(df_s['BB_MID'].equals(df_e['BB_MID']),
+                         "bb_type 沒有生效 (兩種中線算出來一樣)")
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

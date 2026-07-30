@@ -370,7 +370,16 @@ class StockTradingAppPro(tk.Tk):
         self.bb_period = tk.IntVar(value=20)
         self.bb_std1 = tk.DoubleVar(value=2.0)
         self.bb_std2 = tk.DoubleVar(value=3.0)
-        
+        # 【ADR-131】布林改成「兩組完整通道」:每組有自己的中線 (類型+期間) 與
+        # 自己的兩條上下線。第1組沿用上面既有的變數與欄位名 (零迴歸),
+        # 這裡只新增「中線類型」與整個第2組。
+        self.bb_type = tk.StringVar(value="SMA")
+        self.bb2_show, self.bb2_color = tk.BooleanVar(value=False), tk.StringVar(value="紫 (#E040FB)")
+        self.bb2_type = tk.StringVar(value="SMA")
+        self.bb2_period = tk.IntVar(value=60)
+        self.bb2_std1 = tk.DoubleVar(value=2.0)
+        self.bb2_std2 = tk.DoubleVar(value=0.0)
+
         self.var_macd = tk.BooleanVar(value=True)
         self.macd_f, self.macd_s, self.macd_sig = tk.StringVar(value="12"), tk.StringVar(value="26"), tk.StringVar(value="9")
         self.var_rsi = tk.BooleanVar(value=False)
@@ -2592,6 +2601,11 @@ class StockTradingAppPro(tk.Tk):
             'ma_colors': [v.get() for v in self.ma_colors],
             'bb_show': self.bb_show.get(), 'bb_color': self.bb_color.get(),
             'bb_period': self.bb_period.get(), 'bb_std1': self.bb_std1.get(), 'bb_std2': self.bb_std2.get(),
+            # 【ADR-131】中線類型 + 第2組完整布林
+            'bb_type': self.bb_type.get(),
+            'bb2_show': self.bb2_show.get(), 'bb2_color': self.bb2_color.get(),
+            'bb2_type': self.bb2_type.get(), 'bb2_period': self.bb2_period.get(),
+            'bb2_std1': self.bb2_std1.get(), 'bb2_std2': self.bb2_std2.get(),
             'var_bbw': self.var_bbw.get(),
             'var_macd': self.var_macd.get(), 'macd_f': self.macd_f.get(),
             'macd_s': self.macd_s.get(), 'macd_sig': self.macd_sig.get(),
@@ -2619,6 +2633,15 @@ class StockTradingAppPro(tk.Tk):
             self.bb_period.set(d.get('bb_period', self.bb_period.get()))
             self.bb_std1.set(d.get('bb_std1', self.bb_std1.get()))
             self.bb_std2.set(d.get('bb_std2', self.bb_std2.get()))
+            # 【ADR-131】舊設定檔沒有這幾個 key → 用 .get(預設) 沿用程式碼預設值,
+            # 等於「第1組維持原樣、第2組預設關閉」,使用者的既有設定不受影響。
+            self.bb_type.set(d.get('bb_type', self.bb_type.get()))
+            self.bb2_show.set(d.get('bb2_show', self.bb2_show.get()))
+            self.bb2_color.set(d.get('bb2_color', self.bb2_color.get()))
+            self.bb2_type.set(d.get('bb2_type', self.bb2_type.get()))
+            self.bb2_period.set(d.get('bb2_period', self.bb2_period.get()))
+            self.bb2_std1.set(d.get('bb2_std1', self.bb2_std1.get()))
+            self.bb2_std2.set(d.get('bb2_std2', self.bb2_std2.get()))
             self.var_bbw.set(d.get('var_bbw', self.var_bbw.get()))
             self.var_macd.set(d.get('var_macd', self.var_macd.get()))
             self.macd_f.set(d.get('macd_f', self.macd_f.get()))
@@ -2641,27 +2664,59 @@ class StockTradingAppPro(tk.Tk):
         config_store.save_indicator_settings(self.indicator_settings_file, self._collect_indicator_settings())
 
     def open_main_settings(self):
-        dlg = tk.Toplevel(self); dlg.title("主圖指標參數設定"); dlg.configure(bg="#1A2026"); self.center_window(dlg, 400, 350); dlg.transient(self); dlg.grab_set()      
+        # 【ADR-131】視窗放大:布林從 1 行變成「標題 + 欄位名 + 兩組」共 4 行,
+        # 沿用 400x350 會把「確認並套用」按鈕擠出視窗外 (等於設定存不了)。
+        dlg = tk.Toplevel(self); dlg.title("主圖指標參數設定"); dlg.configure(bg="#1A2026"); self.center_window(dlg, 620, 520); dlg.transient(self); dlg.grab_set()
         tk.Label(dlg, text="開關", bg="#1A2026", fg="white").grid(row=0, column=0, pady=10); tk.Label(dlg, text="類型", bg="#1A2026", fg="white").grid(row=0, column=1); tk.Label(dlg, text="週期", bg="#1A2026", fg="white").grid(row=0, column=2); tk.Label(dlg, text="色彩", bg="#1A2026", fg="white").grid(row=0, column=3)
         for i in range(6):
             tk.Checkbutton(dlg, text=f"MA{i+1}", variable=self.ma_shows[i], bg="#1A2026", fg="white", selectcolor="#2A323D").grid(row=i+1, column=0, sticky="w", padx=15, pady=2)
             ttk.Combobox(dlg, textvariable=self.ma_types[i], values=["SMA", "EMA", "WMA"], width=6, state="readonly", style="BlackText.TCombobox").grid(row=i+1, column=1, padx=5)
             tk.Entry(dlg, textvariable=self.ma_periods[i], width=5, bg="#2A323D", fg="white", justify="center").grid(row=i+1, column=2, padx=5)
             ttk.Combobox(dlg, textvariable=self.ma_colors[i], values=list(self.color_map.keys()), width=10, state="readonly", style="BlackText.TCombobox").grid(row=i+1, column=3, padx=5)
-        ttk.Separator(dlg, orient='horizontal').grid(row=7, column=0, columnspan=4, sticky='ew', pady=15)
-        # 【第九輪 圖3需求】布林通道參數可自訂:期間 + 兩組標準差 (σ2=0 不顯示第二組)。
-        tk.Checkbutton(dlg, text="布林通道", variable=self.bb_show, bg="#1A2026", fg="#00E5FF", selectcolor="#2A323D").grid(row=8, column=0, sticky="w", padx=15)
-        bb_frame = tk.Frame(dlg, bg="#1A2026"); bb_frame.grid(row=8, column=1, columnspan=2, sticky="w")
-        tk.Label(bb_frame, text="期間", bg="#1A2026", fg="white").pack(side=tk.LEFT)
-        tk.Entry(bb_frame, textvariable=self.bb_period, width=4, bg="#2A323D", fg="white", justify="center").pack(side=tk.LEFT, padx=(2, 6))
-        tk.Label(bb_frame, text="σ1", bg="#1A2026", fg="white").pack(side=tk.LEFT)
-        tk.Entry(bb_frame, textvariable=self.bb_std1, width=4, bg="#2A323D", fg="white", justify="center").pack(side=tk.LEFT, padx=(2, 6))
-        tk.Label(bb_frame, text="σ2", bg="#1A2026", fg="white").pack(side=tk.LEFT)
-        tk.Entry(bb_frame, textvariable=self.bb_std2, width=4, bg="#2A323D", fg="white", justify="center").pack(side=tk.LEFT, padx=2)
-        tk.Label(bb_frame, text="(σ2=0不畫第二組)", bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8)).pack(side=tk.LEFT, padx=4)
-        ttk.Combobox(dlg, textvariable=self.bb_color, values=list(self.color_map.keys()), width=10, state="readonly", style="BlackText.TCombobox").grid(row=8, column=3, padx=5)
-        tk.Label(dlg, text="※ 按下方按鈕會記住這些設定,下次開啟程式直接沿用。", bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8)).grid(row=8, column=0, columnspan=4, sticky='w', padx=15)
-        tk.Button(dlg, text="確認並套用 (並記住此設定)", bg="#29B6F6", fg="black", font=('微軟正黑體', 10, 'bold'), command=lambda: [self._save_indicator_settings(), self.trigger_redraw(), dlg.destroy()]).grid(row=9, column=0, columnspan=4, pady=20)
+        ttk.Separator(dlg, orient='horizontal').grid(row=7, column=0, columnspan=4, sticky='ew', pady=10)
+        # 【ADR-131】布林通道:兩組完整通道,每組 = 中線 (類型 + 期間) + 兩條上下線。
+        #
+        # 這一區原本整個看不見:說明文字那一行被寫成 row=8、columnspan=4,
+        # 跟布林的 checkbox / 期間 / σ1 / σ2 **同一個 grid 儲存格**,而 tkinter 的
+        # grid 是後放的蓋前放的 —— 於是使用者只看得到說明文字、旁邊露出半截
+        # 「(σ2=0不畫第二組)」跟一個沒有標題的色彩下拉 (實機截圖)。
+        # 從第一版就是這樣,不是這幾輪改出來的。
+        tk.Label(dlg, text="布林通道 (中線 + 上下線,可開兩組)", bg="#1A2026", fg="#00E5FF",
+                 font=('微軟正黑體', 9, 'bold')).grid(row=8, column=0, columnspan=4, sticky='w', padx=15)
+        bb_hdr = tk.Frame(dlg, bg="#1A2026"); bb_hdr.grid(row=9, column=0, columnspan=4, sticky='w', padx=15)
+        for _t, _w in (("開關", 9), ("中線類型", 9), ("中線期間", 9), ("上下線σa", 9), ("上下線σb", 9), ("色彩", 11)):
+            tk.Label(bb_hdr, text=_t, bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8),
+                     width=_w, anchor='w').pack(side=tk.LEFT, padx=1)
+
+        def _bb_row(parent, label, v_show, v_type, v_period, v_a, v_b, v_color):
+            fr = tk.Frame(parent, bg="#1A2026")
+            tk.Checkbutton(fr, text=label, variable=v_show, bg="#1A2026", fg="white",
+                           selectcolor="#2A323D", width=7, anchor='w').pack(side=tk.LEFT)
+            ttk.Combobox(fr, textvariable=v_type, values=list(core_indicators.MA_TYPES), width=6,
+                         state="readonly", style="BlackText.TCombobox").pack(side=tk.LEFT, padx=(2, 8))
+            tk.Entry(fr, textvariable=v_period, width=5, bg="#2A323D", fg="white",
+                     justify="center").pack(side=tk.LEFT, padx=(6, 12))
+            tk.Entry(fr, textvariable=v_a, width=5, bg="#2A323D", fg="white",
+                     justify="center").pack(side=tk.LEFT, padx=(6, 12))
+            tk.Entry(fr, textvariable=v_b, width=5, bg="#2A323D", fg="white",
+                     justify="center").pack(side=tk.LEFT, padx=(6, 10))
+            ttk.Combobox(fr, textvariable=v_color, values=list(self.color_map.keys()), width=10,
+                         state="readonly", style="BlackText.TCombobox").pack(side=tk.LEFT, padx=2)
+            return fr
+
+        _bb_row(dlg, "第1組", self.bb_show, self.bb_type, self.bb_period,
+                self.bb_std1, self.bb_std2, self.bb_color).grid(
+                row=10, column=0, columnspan=4, sticky='w', padx=15, pady=1)
+        _bb_row(dlg, "第2組", self.bb2_show, self.bb2_type, self.bb2_period,
+                self.bb2_std1, self.bb2_std2, self.bb2_color).grid(
+                row=11, column=0, columnspan=4, sticky='w', padx=15, pady=1)
+        tk.Label(dlg, text="※ σb 填 0 = 該組只畫一對上下線;兩組可各自開關,中線類型/期間互相獨立。",
+                 bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8)).grid(
+                 row=12, column=0, columnspan=4, sticky='w', padx=15, pady=(2, 0))
+        tk.Label(dlg, text="※ 按下方按鈕會記住這些設定,下次開啟程式直接沿用。",
+                 bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8)).grid(
+                 row=13, column=0, columnspan=4, sticky='w', padx=15)
+        tk.Button(dlg, text="確認並套用 (並記住此設定)", bg="#29B6F6", fg="black", font=('微軟正黑體', 10, 'bold'), command=lambda: [self._save_indicator_settings(), self.trigger_redraw(), dlg.destroy()]).grid(row=14, column=0, columnspan=4, pady=15)
 
     def open_sub_settings(self, ind):
         dlg = tk.Toplevel(self); dlg.title(f"{ind} 參數設定"); dlg.configure(bg="#1A2026"); self.center_window(dlg, 250, 180); dlg.transient(self); dlg.grab_set()
@@ -2708,6 +2763,10 @@ class StockTradingAppPro(tk.Tk):
             return core_indicators.calculate_indicators(
                 df, ma_flags, ma_types, ma_periods,
                 bb_period=self.bb_period.get(), bb_std1=self.bb_std1.get(), bb_std2=self.bb_std2.get(),
+                bb_type=self.bb_type.get(),
+                bb2_show=self.bb2_show.get(), bb2_period=self.bb2_period.get(),
+                bb2_std1=self.bb2_std1.get(), bb2_std2=self.bb2_std2.get(),
+                bb2_type=self.bb2_type.get(),
                 **common_kwargs)
         except TypeError:
             # 【第十輪修正 問題1】使用者機器上的 core/indicators.py 若還是舊版
@@ -5354,15 +5413,23 @@ class StockTradingAppPro(tk.Tk):
                     c_hex = self.color_map.get(self.ma_colors[i].get(), "#FFFFFF")
                     apds.append(mpf.make_addplot(df[col_name], panel=0, color=c_hex, width=1.2, secondary_y=False))
 
-            if self.bb_show.get() and 'BB_UPPER' in df.columns:
-                bb_hex = self.color_map.get(self.bb_color.get(), "#00E5FF")
-                apds.append(mpf.make_addplot(df['BB_UPPER'], panel=0, color=bb_hex, linestyle='--', width=1.0, secondary_y=False))
-                apds.append(mpf.make_addplot(df['BB_MID'], panel=0, color=bb_hex, linestyle='-', width=1.0, secondary_y=False))
-                apds.append(mpf.make_addplot(df['BB_LOWER'], panel=0, color=bb_hex, linestyle='--', width=1.0, secondary_y=False))
-                # 【第九輪 圖3需求】第二組上下限 (σ2):同色點線,與第一組虛線區隔。
-                if 'BB_UPPER2' in df.columns:
-                    apds.append(mpf.make_addplot(df['BB_UPPER2'], panel=0, color=bb_hex, linestyle=':', width=1.0, secondary_y=False))
-                    apds.append(mpf.make_addplot(df['BB_LOWER2'], panel=0, color=bb_hex, linestyle=':', width=1.0, secondary_y=False))
+            # 【ADR-131】兩組布林共用同一段畫法,只差前綴/開關/顏色 ——
+            # 抄第二份的話,日後改線寬/線型只改到一組 (P-67)。
+            def _add_bb(prefix, show_var, color_var, default_hex):
+                if not (show_var.get() and f'{prefix}_UPPER' in df.columns):
+                    return
+                _hex = self.color_map.get(color_var.get(), default_hex)
+                apds.append(mpf.make_addplot(df[f'{prefix}_UPPER'], panel=0, color=_hex, linestyle='--', width=1.0, secondary_y=False))
+                apds.append(mpf.make_addplot(df[f'{prefix}_MID'], panel=0, color=_hex, linestyle='-', width=1.0, secondary_y=False))
+                apds.append(mpf.make_addplot(df[f'{prefix}_LOWER'], panel=0, color=_hex, linestyle='--', width=1.0, secondary_y=False))
+                if f'{prefix}_UPPER2' in df.columns:
+                    apds.append(mpf.make_addplot(df[f'{prefix}_UPPER2'], panel=0, color=_hex, linestyle=':', width=1.0, secondary_y=False))
+                    apds.append(mpf.make_addplot(df[f'{prefix}_LOWER2'], panel=0, color=_hex, linestyle=':', width=1.0, secondary_y=False))
+
+            # 第2組先畫、第1組後畫:重疊時第1組 (使用者的主要設定) 蓋在上面。
+            # 每組內部:σa 虛線、σb 點線 (【第九輪 圖3需求】的區隔方式沿用)。
+            _add_bb('BB2', self.bb2_show, self.bb2_color, "#E040FB")
+            _add_bb('BB', self.bb_show, self.bb_color, "#00E5FF")
 
             if self.var_macd.get() and 'MACD' in df.columns:
                 macd_color = ['#FF1744' if v > 0 else '#00E676' for v in df['Hist']]
@@ -5500,18 +5567,28 @@ class StockTradingAppPro(tk.Tk):
                         return _fmt
                     self.txt_main_segments.append({'obj': obj, 'fmt': _mk_ma_fmt()})
                     main_x += 0.095
-            if self.bb_show.get() and 'BB_UPPER' in df.columns:
-                bb_hex = self.color_map.get(self.bb_color.get(), "#00E5FF")
-                obj = axlist[0].text(main_x, 0.97, '', transform=axlist[0].transAxes, color=bb_hex, **main_text_props)
+            # 【ADR-131】兩組布林各一段十字線提示 (同一個工廠函式,不抄第二份)。
+            def _add_bb_readout(prefix, show_var, color_var, default_hex, label):
+                nonlocal main_x
+                if not (show_var.get() and f'{prefix}_UPPER' in df.columns):
+                    return
+                _hex = self.color_map.get(color_var.get(), default_hex)
+                obj = axlist[0].text(main_x, 0.97, '', transform=axlist[0].transAxes,
+                                     color=_hex, **main_text_props)
 
-                def _fmt_bb(row):
-                    if 'BB_UPPER' in row and not np.isnan(row['BB_UPPER']):
-                        s = f"BB上:{row['BB_UPPER']:.2f} 中:{row['BB_MID']:.2f} 下:{row['BB_LOWER']:.2f}"
-                        if 'BB_UPPER2' in row and not np.isnan(row['BB_UPPER2']):
-                            s += f" 上2:{row['BB_UPPER2']:.2f} 下2:{row['BB_LOWER2']:.2f}"
+                def _fmt(row, _p=prefix, _l=label):
+                    if f'{_p}_UPPER' in row and not np.isnan(row[f'{_p}_UPPER']):
+                        s = (f"{_l}上:{row[f'{_p}_UPPER']:.2f} 中:{row[f'{_p}_MID']:.2f}"
+                             f" 下:{row[f'{_p}_LOWER']:.2f}")
+                        if f'{_p}_UPPER2' in row and not np.isnan(row[f'{_p}_UPPER2']):
+                            s += f" 上2:{row[f'{_p}_UPPER2']:.2f} 下2:{row[f'{_p}_LOWER2']:.2f}"
                         return s
                     return None
-                self.txt_main_segments.append({'obj': obj, 'fmt': _fmt_bb})
+                self.txt_main_segments.append({'obj': obj, 'fmt': _fmt})
+                main_x += 0.20
+
+            _add_bb_readout('BB', self.bb_show, self.bb_color, "#00E5FF", 'BB')
+            _add_bb_readout('BB2', self.bb2_show, self.bb2_color, "#E040FB", 'BB2')
 
             # 【使用者調整#8】副圖 (MACD/RSI/KDJ/DMI/布林寬度) 的 hover 文字，
             # 同樣改成每個數值各自獨立的 text 物件，顏色跟隨該數值在副圖裡的
