@@ -4374,6 +4374,229 @@ run_case("ADR-127: 日K快取用『有沒有跨過開盤』判斷 + 補資料通
          _day_cache_session_freshness_127)
 
 
+def _chukuangren_eval_cadence_128():
+    """【ADR-128】終極波段的「5分K」不是訊號週期,是被借用的評估節拍器。
+
+    使用者實機回報:「我明明設定就是看日K,為什麼哪裡有看5分K?到底是哪裡有問題?」
+
+    查證結果:
+      * 訊號一直是日K —— `tf='日K'` 寫死在 _quant_eval_pass 的呼叫端。
+      * 但 watch_timeframe 被寫死成 '5分K' (core 與編輯器各一處),用途是驅動
+        K 棒邊界節拍,好讓迴圈踩進 12:00~12:04 的二次確認窗口。
+      * 終極波段編輯器裡沒有這個欄位 → 使用者看不到也改不了。
+
+    這個案例走**完整的 GUI 路徑**,守住三件事:
+      1. 節拍改走「日K 類」(10 分鐘對齊),不再是 5 分鐘。
+      2. 12:00 二次確認搬到獨立通道後**仍然會發生**,而且**當天不再只有一次
+         機會** —— 這是舊做法真正的隱患:5分K 邊界在 12:00 觸發一次就被
+         _qt_last_boundary 記住,下一次是 12:05 (窗口外),那一次抓不到資料
+         就整天無聲丟掉。
+      3. 反向對照:窗口外不可以確認;一般策略的節拍與週期不可以被改壞。
+
+    時鐘一律用 patch 控制,不依賴真實時間 (P-94/P-97)。
+    """
+    import pandas as _pd
+    from core import strategy_engine as _se8
+    from core import chukuangren_band as _ck8
+
+    class FakeContract:
+        code = 'TXF'
+        symbol = 'TXFR1'
+
+    # 加權指數日K:收盤一路走高到 120 > X=100 → on_daily_close 會記 pending_entry
+    _n = 40
+    _daily = _pd.DataFrame(
+        {'Open': [80.0 + i for i in range(_n)], 'High': [85.0 + i for i in range(_n)],
+         'Low': [78.0 + i for i in range(_n)], 'Close': [81.0 + i for i in range(_n)],
+         'Volume': [1000] * _n},
+        index=_pd.bdate_range(end=stock_app_pro.datetime.now().replace(
+            hour=0, minute=0, second=0, microsecond=0), periods=_n))
+
+    logs = []
+    orig_log = app.log_message
+    orig_resolve = app._qt_resolve
+    orig_resolve_watch = app._qt_resolve_watch
+    orig_fetch = app._qt_fetch_closed_bars
+    orig_open = stock_app_pro.market_session.is_market_open
+    orig_just = stock_app_pro.market_session.just_opened
+    orig_window = _ck8.in_noon_confirm_window
+    orig_running, orig_login, orig_api = app._qt_running, app.api_logged_in, app.sj_api
+    orig_strats, orig_rts = app.strategies, app.strategy_runtimes
+
+    fetches = []          # 每次 _qt_fetch_closed_bars 的週期,用來斷言「抓了什麼」
+    intraday_ok = {'v': True}     # False = 模擬 5分K 還抓不到 (背景補齊中/空表)
+    today_str_dummy = f"{stock_app_pro.datetime.now():%Y-%m-%d}"
+
+    def _fake_fetch(_s, _c, _a, tf=None, cache_sym=None, cache_market=None, **_k):
+        fetches.append(tf)
+        if tf == '日K':
+            return _daily
+        if not intraday_ok['v']:
+            return None                     # 模擬資料還沒到
+        return _pd.DataFrame({'Close': [120.0]},
+                             index=[stock_app_pro.datetime.now()])
+
+    def _mk():
+        s = _ck8.default_strategy()
+        s.update({'symbol': 'TXF', 'trade_type': '期貨', 'market': '台期貨',
+                  'qty': 1, 'direction': '做多', 'mode': '模擬', 'enabled': True,
+                  'ck_x': 100.0, 'ck_y': 90.0, 'ck_z': 92.0, 'ck_c': 5.0, 'ck_f': 2.0})
+        return s
+
+    def _mount(s):
+        rt = _se8.new_runtime()
+        app.strategies = [s]
+        app.strategy_runtimes = {s['id']: rt}
+        app._qt_last_boundary = {}
+        app._qt_session_state = {}
+        return rt
+
+    try:
+        app.log_message = lambda m: (logs.append(m), orig_log(m))[0]
+        app._qt_resolve = lambda _s: (FakeContract(), 'futures')
+        app._qt_resolve_watch = lambda _s: (FakeContract(), 'index_tw', '^TWII', '台股')
+        app._qt_fetch_closed_bars = _fake_fetch
+        app.sj_api = object(); app.api_logged_in = True; app._qt_running = True
+        stock_app_pro.market_session.is_market_open = lambda *a, **k: True
+        stock_app_pro.market_session.just_opened = lambda *a, **k: False
+
+        # ---- 1. 介面回答真話:訊號週期是日K,即使存檔殘留 '5分K' ----
+        ck = _mk()
+        ck['watch_timeframe'] = '5分K'          # 模擬使用者現有的舊策略檔
+        assert _se8.watch_timeframe_of(ck) == '日K', \
+            f"終極波段的訊號週期應是日K,實際 {_se8.watch_timeframe_of(ck)}"
+
+        # ---- 2. 節拍走「日K 類」(10 分鐘對齊),不是 5 分鐘 ----
+        rt = _mount(ck)
+        fetches.clear()
+        eval_pass(); app.flush_after()
+        _bkey = app._qt_last_boundary.get(ck['id'])
+        assert _bkey, "評估後應該記下邊界"
+        _bmin = stock_app_pro.datetime.fromisoformat(_bkey).minute
+        assert _bmin % 10 == 0, \
+            f"日K 類的邊界應對齊 10 分鐘 (5分K 節拍的殘留會對齊 5 分鐘): {_bkey}"
+        assert '日K' in fetches, f"終極波段的訊號一定要抓日K,實際抓了 {fetches}"
+        assert rt.get('pending_entry'), \
+            f"日K 收盤 120 > X=100 應記下待確認進場訊號 (實際 rt={ {k: rt[k] for k in ('pending_entry','last_daily_bar_date')} })"
+
+        # ---- 3. 反向對照:窗口外**不可以**確認 ----
+        _ck8.in_noon_confirm_window = lambda _dt: False
+        fetches.clear()
+        app._qt_chukuangren_confirm_pass(); app.flush_after()
+        assert not rt.get('last_confirm_date'), \
+            "12:00 窗口外不可以做二次確認 (否則等於隨時都在確認)"
+        assert '5分K' not in fetches, \
+            f"窗口外連 5分K 都不該去抓 (省 API),實際 {fetches}"
+
+        # ---- 4. 窗口內:獨立通道**必須**真的完成確認 ----
+        # 少了這條,把 in_noon_confirm_window 寫成「永遠 False」也會讓第 3 條綠。
+        _ck8.in_noon_confirm_window = lambda _dt: True
+        fetches.clear(); logs.clear()
+        app._qt_chukuangren_confirm_pass(); app.flush_after()
+        assert '5分K' in fetches, f"窗口內必須抓 5分K 當確認價,實際 {fetches}"
+        assert rt.get('last_confirm_date'), "窗口內必須真的呼叫 on_noon_confirm"
+        assert rt.get('armed_intent'), \
+            "指數 120 > X=100,進場確認應成立並記下 armed_intent"
+        assert [m for m in logs if '12:00確認成立' in m], \
+            f"確認成立要有日誌讓使用者看得到: {logs[:3]}"
+
+        # ---- 5. 同一天不可以重複確認 (既有防重複沒被弄壞) ----
+        # 【第一版是空殼斷言,突變測試抓到的】原本只是「確認成功後再呼叫一次,
+        # 斷言沒有多抓」—— 但 on_noon_confirm 成立後會把 pending_entry 清成 None,
+        # 於是第二次在**最前面那道「有沒有待確認訊號」**就 continue 了,根本走不到
+        # 防重複那一行。把兩層 last_confirm_date 檢查全部拿掉,斷言照樣綠
+        # (同 P-28:要問「它是因為我想測的那個原因才通過的嗎」)。
+        # 所以這裡刻意**手動把狀態擺回**「有待確認訊號 + 當天已確認過」,
+        # 直接測那道守門。
+        rt['pending_entry'] = {'dir': 'LONG', 'date': today_str_dummy}
+        _n_before = len(fetches)
+        app._qt_chukuangren_confirm_pass(); app.flush_after()
+        assert len(fetches) == _n_before, \
+            f"同一天已確認過就不該再抓資料 (實際多抓了 {len(fetches) - _n_before} 次)"
+        rt['pending_entry'] = None
+
+        # ---- 6. 【本次真正的隱患】資料還沒到時,當天必須還有第二次機會 ----
+        # 舊做法:5分K 邊界在 12:00 觸發一次 → _qt_last_boundary 記住 → 下一次
+        # 是 12:05,已在窗口外 → 當天的二次確認整個無聲丟掉。
+        ck2 = _mk(); ck2['name'] = '診斷ADR128重試'
+        rt2 = _mount(ck2)
+        eval_pass(); app.flush_after()               # 先讓 on_daily_close 記下 pending
+        assert rt2.get('pending_entry'), "前置條件:應先有待確認進場訊號"
+        intraday_ok['v'] = False                     # 第一次:5分K 還抓不到
+        fetches.clear()
+        app._qt_chukuangren_confirm_pass(); app.flush_after()
+        assert '5分K' in fetches, "第一次應該有試著抓 5分K"
+        assert not rt2.get('last_confirm_date'), \
+            "資料還沒到就不可以算「已確認」(否則當天的機會被吃掉)"
+        intraday_ok['v'] = True                      # 下一個 runner tick:資料到了
+        app._qt_chukuangren_confirm_pass(); app.flush_after()
+        assert rt2.get('last_confirm_date'), \
+            "資料到了之後,同一天必須還能完成確認 (舊做法一天只有一次機會)"
+        assert rt2.get('armed_intent'), "重試成功後 armed_intent 應該記下來"
+
+        # ---- 7. 【ADR-124】時段閘門對這條新通道也要有效 ----
+        ck3 = _mk(); ck3['name'] = '診斷ADR128閘門'
+        rt3 = _mount(ck3)
+        eval_pass(); app.flush_after()
+        assert rt3.get('pending_entry'), "前置條件:應先有待確認進場訊號"
+        stock_app_pro.market_session.is_market_open = lambda *a, **k: False
+        fetches.clear()
+        app._qt_chukuangren_confirm_pass(); app.flush_after()
+        assert not rt3.get('last_confirm_date'), \
+            "市場關閉時這條路徑也不該確認 (三條會動到部位的路徑要同一套閘門)"
+        # 正控:閘門打開後同一檔策略必須真的確認 —— 否則上面那條是空殼
+        stock_app_pro.market_session.is_market_open = lambda *a, **k: True
+        app._qt_chukuangren_confirm_pass(); app.flush_after()
+        assert rt3.get('last_confirm_date'), \
+            "閘門打開後必須真的確認 (否則第 7 條的前半是空殼斷言)"
+
+        # ---- 8. 反向對照:一般策略的週期與節拍不可以被改壞 ----
+        gen = _se8.new_strategy()
+        gen.update({'watch_enabled': True, 'watch_symbol': '^TWII',
+                    'watch_timeframe': '5分K', 'timeframe': '5分K'})
+        assert _se8.watch_timeframe_of(gen) == '5分K', \
+            f"一般策略的訊號週期不可以被覆寫成日K (實際 {_se8.watch_timeframe_of(gen)})"
+
+        # ---- 9. 原始碼層級:寫死的 '5分K' 不可以再出現在這兩處 ----
+        # 純函式測不到「編輯器存檔時有沒有真的寫對」(P-64)。
+        _src = open('stock_app_pro.py', encoding='utf-8').read()
+        assert "s['watch_timeframe'] = '5分K'" not in _src, \
+            "終極波段編輯器不可以再把 watch_timeframe 寫死成 '5分K'"
+        _csrc = open('core/chukuangren_band.py', encoding='utf-8').read()
+        assert "s['watch_timeframe'] = '5分K'" not in _csrc, \
+            "chukuangren_band.default_strategy() 不可以再寫死 '5分K'"
+
+        # ---- 10. runner 必須真的接上這條通道 ----
+        # 上面每一條都是**直接呼叫** _qt_chukuangren_confirm_pass(),所以完全測不到
+        # 「production 有沒有人去呼叫它」—— 把 runner 那一行刪掉,1~9 全都還是綠,
+        # 但 12:00 確認一輩子不會發生 (P-64 的教訓)。
+        import inspect as _insp8
+        _runner_src = _insp8.getsource(stock_app_pro.StockTradingAppPro.quant_runner_worker)
+        assert '_qt_chukuangren_confirm_pass' in _runner_src, \
+            "quant_runner_worker 必須呼叫 _qt_chukuangren_confirm_pass,否則這條通道永遠不會跑"
+        # 而且必須排在送單之前 (確認 → 60 秒後送單)
+        assert _runner_src.index('_qt_chukuangren_confirm_pass') \
+            < _runner_src.index('_qt_chukuangren_execute_pass'), \
+            "確認要排在送單之前"
+    finally:
+        app.log_message = orig_log
+        app._qt_resolve = orig_resolve
+        app._qt_resolve_watch = orig_resolve_watch
+        app._qt_fetch_closed_bars = orig_fetch
+        _ck8.in_noon_confirm_window = orig_window
+        stock_app_pro.market_session.is_market_open = orig_open
+        stock_app_pro.market_session.just_opened = orig_just
+        app._qt_running, app.api_logged_in, app.sj_api = orig_running, orig_login, orig_api
+        app.strategies, app.strategy_runtimes = orig_strats, orig_rts
+        app._qt_last_boundary = {}
+        app._qt_session_state = {}
+        app.__dict__.pop('_qt_confirm_err_noted', None)
+
+
+run_case("ADR-128: 終極波段的訊號週期回到日K + 12:00確認獨立通道 (當天可重試)",
+         _chukuangren_eval_cadence_128)
+
+
 print(f"{'案例':60s} 結果")
 print("-" * 76)
 for name, st, msg in results:

@@ -3443,7 +3443,9 @@ class TestChukuangrenBand(unittest.TestCase):
         self.assertEqual(s['direction'], '做多')
         self.assertTrue(s['watch_enabled'])
         self.assertEqual(s['watch_symbol'], '^TWII')
-        self.assertEqual(s['watch_timeframe'], '5分K')
+        # 【ADR-128】舊值是 '5分K',但那不是訊號週期 —— 是被拿去驅動評估節拍的
+        # 借用值。訊號一直看日K,這裡要存真話。
+        self.assertEqual(s['watch_timeframe'], '日K')
         p = chukuangren_band.params_of(s)
         self.assertEqual(set(p.keys()), set(chukuangren_band.PARAM_KEYS))
         self.assertNotIn('h', p)  # H 已移除
@@ -6143,6 +6145,90 @@ class TestSessionOpensBetween(unittest.TestCase):
                   market_session.FUT_DAY_OPEN_MIN, market_session.FUT_NIGHT_OPEN_MIN):
             self.assertIn(m, mins)
 
+
+
+class TestDaySignalTimeframe(unittest.TestCase):
+    """【ADR-128】終極波段的「看A 訊號週期」是結構上固定的日K,不是存檔值。
+
+    使用者實機回報:「我明明設定就是看日K,為什麼哪裡有看5分K?」——
+    因為 watch_timeframe 被寫死成 '5分K',而那個值的用途根本不是訊號週期,
+    是拿去驅動 _quant_eval_pass 的 K 棒邊界節拍 (為了踩進 12:00 確認窗口)。
+    訊號本身一直是日K (`tf='日K'` 寫死在呼叫端),所以介面回答錯了。
+    """
+
+    def test_kind_is_pinned_to_the_module(self):
+        """字串清單與 chukuangren_band.KIND 釘在一起,改名不會無聲脫鉤。"""
+        self.assertIn(chukuangren_band.KIND, strategy_engine.DAY_SIGNAL_KINDS)
+
+    def test_override_ignores_saved_value(self):
+        """既有策略檔裡殘留的 '5分K' 必須被覆寫 —— 不做資料遷移也正確。"""
+        s = chukuangren_band.default_strategy()
+        s['watch_timeframe'] = '5分K'          # 模擬舊存檔
+        self.assertEqual(strategy_engine.watch_timeframe_of(s), '日K')
+        s['watch_timeframe'] = '30分K'
+        self.assertEqual(strategy_engine.watch_timeframe_of(s), '日K')
+
+    def test_default_strategy_stores_the_truth(self):
+        self.assertEqual(chukuangren_band.default_strategy()['watch_timeframe'], '日K')
+
+    def test_other_kinds_are_untouched(self):
+        """反向對照:一般策略的 watch_timeframe 不可以被改掉 —— 少了這條,
+        把 watch_timeframe_of() 寫成「永遠回日K」也會一片綠,那會把所有
+        看A做B 策略的訊號週期都毀掉。"""
+        s = strategy_engine.new_strategy()
+        s.update({'watch_enabled': True, 'watch_symbol': '^TWII', 'watch_timeframe': '30分K'})
+        self.assertEqual(strategy_engine.watch_timeframe_of(s), '30分K')
+        s['watch_timeframe'] = '5分K'
+        self.assertEqual(strategy_engine.watch_timeframe_of(s), '5分K')
+        # 看A做B 關閉時仍沿用執行週期 (既有行為)
+        s2 = strategy_engine.new_strategy()
+        s2.update({'watch_enabled': False, 'timeframe': '15分K'})
+        self.assertEqual(strategy_engine.watch_timeframe_of(s2), '15分K')
+
+    def test_day_timeframe_drives_the_day_class_cadence(self):
+        """覆寫成日K 之後,評估節拍會走「日K 類」那一支 (timeframe_minutes 回 None),
+        也就是 _quant_eval_pass 的 10 分鐘檢查,而不是 5 分鐘的分K 邊界。"""
+        self.assertIsNone(strategy_engine.timeframe_minutes(
+            strategy_engine.DAY_SIGNAL_TIMEFRAME))
+        self.assertTrue(strategy_engine.is_valid_timeframe(
+            strategy_engine.DAY_SIGNAL_TIMEFRAME))
+
+    def test_three_kind_lists_stay_separate(self):
+        """三份清單目前內容相同但語意不同 (出場邏輯 / 交易時段 / 訊號週期),
+        刻意不合併 —— 合併過的寫法在日後多一個『自己管出場但訊號看分K』的
+        種類時會一起把週期改錯。"""
+        self.assertIsNot(strategy_engine.OWN_EXIT_KINDS, strategy_engine.DAY_SIGNAL_KINDS)
+        self.assertIsNot(strategy_engine.DAY_SESSION_ONLY_KINDS, strategy_engine.DAY_SIGNAL_KINDS)
+
+
+class TestNoonConfirmWindow(unittest.TestCase):
+    """【ADR-128】12:00 二次確認的時間窗口收斂成 core 的純函式。"""
+
+    def _d(self, h, m, s=0):
+        from datetime import datetime as _dt
+        return _dt(2026, 7, 30, h, m, s)
+
+    def test_inside_window(self):
+        for h, m in ((12, 0), (12, 1), (12, 4)):
+            self.assertTrue(chukuangren_band.in_noon_confirm_window(self._d(h, m)),
+                            f"{h}:{m:02d} 應在窗口內")
+        self.assertTrue(chukuangren_band.in_noon_confirm_window(self._d(12, 4, 59)))
+
+    def test_outside_window(self):
+        for h, m in ((11, 59), (12, 5), (12, 30), (13, 0), (9, 0)):
+            self.assertFalse(chukuangren_band.in_noon_confirm_window(self._d(h, m)),
+                             f"{h}:{m:02d} 不該在窗口內")
+
+    def test_window_is_five_minutes_not_one_instant(self):
+        """窗口刻意不是「12:00 那一秒」:確認要抓 5分K,資料可能還在背景補齊
+        (ADR-122) 或逾時重試 (ADR-121),需要可以重試的餘裕。這也是舊做法
+        「一天只有一次機會」的修正重點。"""
+        self.assertEqual(chukuangren_band.NOON_CONFIRM_HOUR, 12)
+        self.assertGreaterEqual(chukuangren_band.NOON_CONFIRM_END_MINUTE, 2)
+
+    def test_defensive_none_and_garbage(self):
+        self.assertFalse(chukuangren_band.in_noon_confirm_window(None))
+        self.assertFalse(chukuangren_band.in_noon_confirm_window('12:00'))
 
 
 if __name__ == "__main__":

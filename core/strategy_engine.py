@@ -793,7 +793,15 @@ def watch_trade_type_of(strategy):
 
 
 def watch_timeframe_of(strategy):
-    """A 的訊號週期;未啟用或沒填就等於執行週期。"""
+    """A 的訊號週期;未啟用或沒填就等於執行週期。
+
+    【ADR-128】DAY_SIGNAL_KINDS 的種類一律回 DAY_SIGNAL_TIMEFRAME,忽略存檔值
+    —— 那些策略的訊號週期是結構上固定的,存檔裡的殘留值 (終極波段舊版是 '5分K')
+    不代表訊號真的看那個週期。這個覆寫同時決定了 _quant_eval_pass 的邊界節拍,
+    所以「介面回答真話」與「節拍正確」是同一件事。
+    """
+    if str((strategy or {}).get('kind') or '') in DAY_SIGNAL_KINDS:
+        return DAY_SIGNAL_TIMEFRAME
     if not watch_enabled(strategy):
         return strategy.get('timeframe', '5分K')
     return strategy.get('watch_timeframe') or strategy.get('timeframe', '5分K')
@@ -1339,6 +1347,26 @@ def has_own_exit_logic(strategy):
 #
 # 一樣用字串避免循環 import,靠測試把它跟 chukuangren_band.KIND 釘在一起。
 DAY_SESSION_ONLY_KINDS = frozenset({'chukuangren_band'})
+
+
+# 【ADR-128】這些 kind 的「看A 訊號週期」是**結構上固定**的,存檔值不算。
+#
+# 使用者實機回報:「我明明設定就是看日K,為什麼哪裡有看5分K?」—— 因為終極波段
+# 的 watch_timeframe 被寫死成 '5分K',而那個值的用途根本不是訊號週期,是拿去
+# 驅動 _quant_eval_pass 的 K 棒邊界節拍 (為了讓迴圈能踩進 12:00~12:04 的二次
+# 確認窗口)。訊號本身一直是日K (`tf='日K'` 寫死在呼叫端),所以:
+#   * 使用者的設定沒錯、清單顯示的「日K」也沒錯,
+#   * 但 watch_timeframe_of() 這個「A 的訊號週期」介面會回答 5分K —— 語意錯了。
+#
+# ADR-128 把節拍交給獨立的確認通道 (_qt_chukuangren_confirm_pass),這裡則讓
+# 介面回答真話。覆寫存檔值,所以**既有策略不必遷移就正確**
+# (同 OWN_EXIT_KINDS / DAY_SESSION_ONLY_KINDS 的處理哲學)。
+#
+# 刻意**不**跟上面兩個清單合併:三者目前內容相同,但語意是三件事 (出場邏輯 /
+# 交易時段 / 訊號週期)。日後多一個「自己管出場但訊號看分K」的種類時,合併過的
+# 寫法會一起把週期改錯。有單元測試守著這個區分。
+DAY_SIGNAL_KINDS = frozenset({'chukuangren_band'})
+DAY_SIGNAL_TIMEFRAME = '日K'
 
 
 def is_locked(strategy):

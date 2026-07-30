@@ -8293,13 +8293,23 @@ class StockTradingAppPro(tk.Tk):
 
                 if s.get('kind') == chukuangren_band.KIND:
                     # 【新ADR 終極波段策略】獨立分派:A固定用日K做突破/停損/停利
-                    # 訊號判斷,5分K做「隔天中午12:00」二次確認 (只確認,不下單)。
+                    # 訊號判斷。
                     # 【新ADR 確認/下單分兩個時間點】確認成立後不會在這裡立刻下單,
                     # 而是記進 rt['armed_intent'],真正送單延後約60秒 (12:01) 由
-                    # _qt_chukuangren_execute_pass() 獨立檢查執行——那個節奏不受
-                    # 這裡5分K邊界閘門限制 (5分K邊界只在整5分鐘觸發,不會剛好落在
-                    # 12:01)。intents 這裡永遠是空的,下面共用的intent處理迴圈對
-                    # 終極波段策略是no-op,合乎預期。
+                    # _qt_chukuangren_execute_pass() 獨立檢查執行。intents 這裡
+                    # 永遠是空的,下面共用的intent處理迴圈對終極波段策略是no-op,
+                    # 合乎預期。
+                    #
+                    # 【ADR-128】「12:00 二次確認」已經從這裡搬到
+                    # _qt_chukuangren_confirm_pass() —— 原本它巢狀在這個 K 棒邊界
+                    # 閘門底下,而閘門的節拍來自 watch_timeframe,所以策略被迫把
+                    # watch_timeframe 寫死成 '5分K' 才踩得進 12:00~12:04 的窗口。
+                    # 那個借用造成三個問題 (見 chukuangren_band.default_strategy()),
+                    # 而且**一天只有一次機會**:5分K 邊界在 12:00 觸發一次就被
+                    # _qt_last_boundary 記住,下一次是 12:05 —— 已經在窗口外。那一次
+                    # 若剛好抓不到 5分K 資料 (背景補齊中/空 DataFrame),當天的二次
+                    # 確認就整個丟掉,而且完全無聲。搬出去之後窗口內每個 runner tick
+                    # 都能重試,反而比原本可靠。
                     w_contract, w_asset, w_sym, w_mkt = self._qt_resolve_watch(s)
                     if w_contract is None:
                         raise RuntimeError(f"看盤商品(看A)合約解析失敗: {strategy_engine.watch_symbol_of(s)}")
@@ -8315,23 +8325,12 @@ class StockTradingAppPro(tk.Tk):
                                                     chukuangren_band.direction_of(s))
                     intents = []
                     b_exec_price = None
-                    now_dt = datetime.now()
-                    today_key = now_dt.strftime('%Y-%m-%d')
-                    # 隔天中午確認視窗:12:00~12:04 (跟這個策略5分K的邊界評估頻率對齊)
-                    in_noon_window = _forced or (now_dt.hour == 12 and now_dt.minute < 5)
-                    if in_noon_window and (rt.get('pending_entry') or rt.get('pending_exit')) \
-                            and rt.get('last_confirm_date') != today_key:
-                        intraday_df = self._qt_fetch_closed_bars(s, w_contract, w_asset, tf='5分K',
-                                                                 cache_sym=w_sym, cache_market=w_mkt)
-                        if intraday_df is not None and not intraday_df.empty:
-                            confirm_price = float(intraday_df['Close'].iloc[-1])
-                            chukuangren_band.on_noon_confirm(
-                                params, rt, confirm_price, today_key, now_ts, qty=int(s.get('qty', 1)))
-                            if rt.get('armed_intent'):
-                                self.safe_after(0, self.log_message,
-                                                f"【自動交易-待下單】策略「{s.get('name')}」12:00確認成立"
-                                                f" ({rt['armed_intent']['reason']}),約1分鐘後 (12:01) 依"
-                                                f"{s.get('symbol')}當時最新價自動送單。")
+                    # 【ADR-128】這裡**只**做日K 訊號判斷。12:00 二次確認整條搬到
+                    # _qt_chukuangren_confirm_pass(),這個分支不再保留任何捷徑 ——
+                    # 中途版本曾在這裡留一個 `if _forced:` 的橋接當測試接縫,但查證
+                    # 後沒有任何測試或 production 路徑需要它 (_quant_eval_pass 的唯一
+                    # 呼叫端是 runner,不帶參數),留著只會變成「只有測試會走的
+                    # production 分支」+ 第二個確認呼叫點 (P-67 的風險)。
                 else:
                     w_contract, w_asset, w_sym, w_mkt = self._qt_resolve_watch(s)
                     if w_contract is None:
@@ -8568,6 +8567,104 @@ class StockTradingAppPro(tk.Tk):
                 self.safe_after(0, self.log_message,
                                 f"【自動交易-即時停損異常】策略「{s.get('name')}」: {type(e).__name__}: {e}")
 
+    def _qt_chukuangren_confirm_one(self, s, rt, params, w_contract, w_asset,
+                                    w_sym, w_mkt, today_key, now_ts):
+        """【ADR-128】對單一終極波段策略做一次「12:00 二次確認」。
+
+        回傳 True = 這次真的呼叫了 on_noon_confirm (不論確認成立或作廢,
+        on_noon_confirm 都會寫 rt['last_confirm_date'],所以當天不會再進來);
+        False = 還沒做成 (沒有待確認訊號 / 當天已確認 / **5分K 資料還沒到**),
+        呼叫端應該讓下一個 tick 再試。
+
+        「資料還沒到就回 False」是這次修正的核心:回 True 會讓當天的機會被吃掉,
+        而那正是舊做法的隱患 (見 _qt_chukuangren_confirm_pass 的說明)。
+        """
+        if not (rt.get('pending_entry') or rt.get('pending_exit')):
+            return False
+        if rt.get('last_confirm_date') == today_key:
+            return False
+        intraday_df = self._qt_fetch_closed_bars(s, w_contract, w_asset, tf='5分K',
+                                                 cache_sym=w_sym, cache_market=w_mkt)
+        if intraday_df is None or intraday_df.empty:
+            return False
+        confirm_price = float(intraday_df['Close'].iloc[-1])
+        chukuangren_band.on_noon_confirm(
+            params, rt, confirm_price, today_key, now_ts, qty=int(s.get('qty', 1)))
+        if rt.get('armed_intent'):
+            self.safe_after(0, self.log_message,
+                            f"【自動交易-待下單】策略「{s.get('name')}」12:00確認成立"
+                            f" ({rt['armed_intent']['reason']}),約1分鐘後 (12:01) 依"
+                            f"{s.get('symbol')}當時最新價自動送單。")
+        return True
+
+    def _qt_chukuangren_confirm_pass(self):
+        """【ADR-128】終極波段的「隔天中午 12:00 二次確認」獨立通道。
+
+        原本這件事巢狀在 `_quant_eval_pass` 的 K 棒邊界閘門底下,而閘門的節拍
+        取自 `watch_timeframe` —— 所以策略被迫把 watch_timeframe 寫死成 '5分K'
+        才踩得進 12:00~12:04 的窗口。使用者實機回報就是這個外洩:
+        「我明明設定就是看日K,為什麼哪裡有看5分K?」
+
+        搬出來之後有兩個好處:
+        1. `watch_timeframe` 可以回到真話 (日K),節拍不再跟訊號週期綁在一起。
+        2. **當天的確認不再只有一次機會**。舊做法在 12:00 觸發一次後,
+           `_qt_last_boundary` 就記住了這個邊界,下一次是 12:05 —— 已經在窗口外。
+           那一次若剛好拿不到 5分K (ADR-122 背景補齊中、ADR-121 逾時、空
+           DataFrame),當天的二次確認就整個丟掉,而且完全無聲。現在窗口內每個
+           runner tick (2 秒) 都會重試,直到 on_noon_confirm 真的被呼叫。
+
+        掛在 quant_runner_worker 既有的 2 秒輪詢上。窗口外、沒有待確認訊號、
+        當天已確認過的,都在打任何 API 之前就 continue,所以成本可忽略。
+        """
+        if not getattr(self, '_qt_running', False):
+            return
+        if not (self.api_logged_in and getattr(self, 'sj_api', None)):
+            return
+        now_dt = datetime.now()
+        if not chukuangren_band.in_noon_confirm_window(now_dt):
+            return
+        today_key = now_dt.strftime('%Y-%m-%d')
+        now_ts = time.time()
+        for s in list(getattr(self, 'strategies', []) or []):
+            if not s.get('enabled') or s.get('kind') != chukuangren_band.KIND:
+                continue
+            rt = self._qt_runtime(s['id'])
+            # 【便宜的檢查放最前面】沒有待確認訊號 / 當天已確認過 → 完全不碰 API。
+            if not (rt.get('pending_entry') or rt.get('pending_exit')):
+                continue
+            if rt.get('last_confirm_date') == today_key:
+                continue
+            # 【ADR-124】跟其他兩條會動到部位的路徑用同一個時段閘門。
+            # 12:00 本來就在期貨日盤與台股盤中,所以正常情況下這裡一定放行;
+            # 有閘門是為了「使用者把盤別關掉時,這條路徑也要聽話」。
+            if s.get('session_gate', True) and not market_session.is_market_open(
+                    strategy_engine.trade_type_of(s),
+                    include_night=strategy_engine.include_night_of(s)):
+                continue
+            try:
+                w_contract, w_asset, w_sym, w_mkt = self._qt_resolve_watch(s)
+                if w_contract is None:
+                    raise RuntimeError(
+                        f"看盤商品(看A)合約解析失敗: {strategy_engine.watch_symbol_of(s)}")
+                if self._qt_chukuangren_confirm_one(
+                        s, rt, chukuangren_band.params_of(s), w_contract, w_asset,
+                        w_sym, w_mkt, today_key, now_ts):
+                    self._qt_save_state()
+            except strategy_engine.KBarsPending:
+                # 【ADR-122】資料正在背景補齊,不是錯誤。窗口還有好幾分鐘,
+                # 下一個 tick 再試 —— 這正是搬出邊界閘門要換到的能力。
+                continue
+            except Exception as e:
+                # 窗口內每 2 秒會走一次,錯誤訊息**每檔策略每天只記一次**,
+                # 否則同一則會刷 150 次 (ADR-127 P-99 的同一類問題)。
+                if not hasattr(self, '_qt_confirm_err_noted'):
+                    self._qt_confirm_err_noted = {}
+                if self._qt_confirm_err_noted.get(s['id']) != today_key:
+                    self._qt_confirm_err_noted[s['id']] = today_key
+                    self.safe_after(0, self.log_message,
+                                    f"【自動交易-12:00確認異常】策略「{s.get('name')}」: "
+                                    f"{type(e).__name__}: {e}(窗口內會持續重試)")
+
     def _qt_chukuangren_execute_pass(self):
         """【新ADR 確認/下單分兩個時間點】終極波段策略12:00確認成立後不會立刻
         下單,而是記進 rt['armed_intent']——真正送單要等
@@ -8733,6 +8830,10 @@ class StockTradingAppPro(tk.Tk):
                 if getattr(self, '_closing', False):
                     return
                 self._quant_eval_pass()
+                # 【ADR-128】12:00 二次確認 → 12:01 送單,兩者都獨立於 K 棒邊界
+                # 閘門之外,順序上確認必須在送單之前 (同一個 tick 內不會同時發生,
+                # on_execute_armed 要等 60 秒,但順序寫對比較不容易誤讀)。
+                self._qt_chukuangren_confirm_pass()
                 self._qt_chukuangren_execute_pass()
 
                 now_ts = _time.time()
@@ -9539,7 +9640,11 @@ class StockTradingAppPro(tk.Tk):
             s['watch_enabled'] = True
             s['watch_symbol'] = e_wsym.get().strip().upper() or '^TWII'
             s['watch_trade_type'] = '指數'
-            s['watch_timeframe'] = '5分K'
+            # 【ADR-128】存真正的訊號週期 (日K)。舊版寫 '5分K' 是拿它當評估節拍器
+            # 用,語意錯誤 —— 詳見 chukuangren_band.default_strategy() 的說明。
+            # 真正的防線在 strategy_engine.DAY_SIGNAL_KINDS (覆寫存檔值),
+            # 這裡是讓舊策略「下次儲存時」資料本身也洗乾淨 (同 ADR-123 的做法)。
+            s['watch_timeframe'] = strategy_engine.DAY_SIGNAL_TIMEFRAME
             for k in chukuangren_band.PARAM_KEYS:
                 try:
                     s[f'ck_{k}'] = float(param_entries[k].get().strip())

@@ -93,6 +93,32 @@ KIND = 'chukuangren_band'
 STRATEGY_NAME = '終極波段策略'
 DIRECTIONS = ('做多', '做空')
 
+# 【ADR-128】「隔天中午 12:00 二次確認」的時間窗口。
+#
+# 這兩個數字原本以字面值寫在 stock_app_pro._quant_eval_pass 裡
+# (`now_dt.hour == 12 and now_dt.minute < 5`),而且**依賴 5 分K 的 K 棒邊界節拍
+# 才踩得進去** —— 為了讓節拍踩進來,策略的 watch_timeframe 被寫死成「5分K」,
+# 於是整個系統都以為這檔策略的訊號週期是 5 分K (實際上是日K)。ADR-128 把
+# 「窗口」收斂到這裡當唯一出處,節拍則交給獨立的確認通道,不再借用訊號週期。
+NOON_CONFIRM_HOUR = 12
+NOON_CONFIRM_END_MINUTE = 5      # 12:00:00 ~ 12:04:59 (含) 都算在窗口內
+
+
+def in_noon_confirm_window(dt):
+    """dt 是否落在「隔天中午 12:00 二次確認」的時間窗口內。
+
+    窗口刻意留 5 分鐘而不是「剛好 12:00 那一秒」:確認要抓加權指數的 5分K
+    收盤價,而資料可能還在背景補齊 (ADR-122) 或剛好逾時重試 (ADR-121),
+    需要一段可以重試的餘裕。真正的下單仍然由 on_execute_armed() 在確認後
+    約 60 秒 (12:01) 才發生,窗口放寬不會讓下單時間跑掉。
+    """
+    if dt is None:
+        return False
+    try:
+        return dt.hour == NOON_CONFIRM_HOUR and dt.minute < NOON_CONFIRM_END_MINUTE
+    except AttributeError:
+        return False
+
 
 def param_keys_for(direction):
     """依方向回傳該顯示/驗證的參數 key。"""
@@ -128,7 +154,20 @@ def default_strategy():
     s['watch_enabled'] = True
     s['watch_symbol'] = '^TWII'
     s['watch_trade_type'] = '指數'
-    s['watch_timeframe'] = '5分K'   # 驅動 _quant_eval_pass 每5分鐘評估一次 (隔日中午確認需要這個頻率)
+    # 【ADR-128】這裡**必須**是這檔策略真正的訊號週期 (日K),不可以再借用它
+    # 當「評估節拍器」。舊值是 '5分K',理由是「驅動 _quant_eval_pass 每5分鐘
+    # 評估一次,隔日中午確認需要這個頻率」—— 那是拿一個語意是「A 的訊號週期」
+    # 的欄位去控制一件完全不同的事 (迴圈多久醒一次),後果:
+    #   (a) 使用者設定的是日K、清單顯示的也是日K,系統內部卻跑 5分K 的節拍,
+    #       而終極波段編輯器裡沒有這個欄位 → 使用者看不到也改不了 (實機回報)。
+    #   (b) 每 5 分鐘整套重評一次,包含去抓 ^TWII 日K —— ADR-127 那個
+    #       「一天推播十幾次、白抓十幾次」的上游成因。
+    #   (c) watch_timeframe_of() 的語意是「A 的訊號週期」,任何照語意使用它的
+    #       新程式碼都會拿到 5分K 去判斷日K 策略的訊號 —— 埋著的真 bug。
+    # 12:00 二次確認改由獨立通道負責 (見 in_noon_confirm_window),不再靠節拍
+    # 碰巧命中。既有存檔的 '5分K' 由 strategy_engine.DAY_SIGNAL_KINDS 覆寫,
+    # 不必遷移策略檔。
+    s['watch_timeframe'] = '日K'
     for k in PARAM_KEYS:
         s[f'ck_{k}'] = 0.0
     # 【ADR-123】把 new_strategy() 帶進來的泛用停損/停利歸零。
