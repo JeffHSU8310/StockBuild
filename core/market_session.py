@@ -228,3 +228,52 @@ def just_opened(trade_type, dt=None, include_night=True, warmup_sec=None):
         return False
     elapsed = (_minutes(dt) - open_min) * 60 + dt.second
     return 0 <= elapsed < warmup_sec
+
+
+# ---------------------------------------------------------------------------
+# 【ADR-127】「日K 類的快取還新鮮嗎」—— 用『有沒有跨過開盤』判斷,不用牆上時鐘
+# ---------------------------------------------------------------------------
+# 背景:日K/周K/月K 的策略資料,呼叫端 (_qt_fetch_closed_bars) 會**丟掉最後
+# 一根**視為未完成,所以「已收盤」的集合**只在新的一盤開始時才會多一根**。
+# 盤中重抓一定拿到一模一樣的東西 —— 用牆上時鐘 (例如 30 分鐘 TTL) 去判斷
+# 新鮮度,結果就是整天每 30 分鐘白抓一次 300 天的資料、並且推播一次通知
+# (使用者實測:09:20 與 09:55 各收到一則「背景補齊中」)。
+#
+# 保守設計刻意寫在這裡講明白:
+#   * 開盤時刻取**所有商品的聯集**(整股/零股/期貨日盤/期貨夜盤)
+#   * **不看國定假日**
+# 兩者都讓快取「早一點過期」——那是安全方向 (多抓一次資料,無害);
+# 少列一個開盤時刻才危險 (拿舊資料去評估,會下錯單)。
+
+def session_open_minutes():
+    """所有可能的開盤時刻 (當日 0 點起算的分鐘數),取聯集後排序。"""
+    return sorted({STOCK_OPEN_MIN, ODD_LOT_OPEN_MIN,
+                   FUT_DAY_OPEN_MIN, FUT_NIGHT_OPEN_MIN})
+
+
+MAX_CACHE_SPAN_DAYS = 7          # 超過這麼久一律視為過期 (不必逐日枚舉)
+
+
+def any_session_opens_between(t0, t1):
+    """(t0, t1] 之間有沒有跨過任何一個交易時段的開盤時刻。
+
+    回傳 True = 期間內有開盤發生過 → 日K 類快取應視為過期。
+    參數顛倒 (t1 早於 t0) 或跨太久一律回 True (寧可過期,不可誤判新鮮)。
+    """
+    if t0 is None or t1 is None:
+        return True
+    if t1 <= t0:
+        return t1 < t0          # 時鐘倒退 (校時/夏令時) → 當成過期
+    if (t1 - t0).days > MAX_CACHE_SPAN_DAYS:
+        return True
+    opens = session_open_minutes()
+    day = t0.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_day = t1.replace(hour=0, minute=0, second=0, microsecond=0)
+    while day <= end_day:
+        if _is_weekday(day) and not _is_holiday(day):
+            for m in opens:
+                op = day + timedelta(minutes=m)
+                if t0 < op <= t1:
+                    return True
+        day += timedelta(days=1)
+    return False

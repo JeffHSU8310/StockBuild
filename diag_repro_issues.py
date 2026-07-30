@@ -4196,6 +4196,184 @@ run_case("ADR-126: 活K棒 blit 失效要有退路 + 報價上屏加速 (快照�
          _live_chart_refresh_126)
 
 
+
+def _day_cache_session_freshness_127():
+    """【ADR-127】重現使用者的 Telegram 截圖:同一則「背景補齊中」推播兩次。
+
+        09:20  【自動交易-資料】^TWII 日K 歷史資料分 4 段在背景補齊中...
+        09:55  【自動交易-資料】^TWII 日K 歷史資料分 4 段在背景補齊中...
+
+    35 分鐘 = ADR-122 的 30 分鐘 TTL 過期之後的下一個 5 分鐘評估點(終極波段
+    的看A 是 5分K,所以每 5 分鐘評估一次,但抓的是**日K**)。那段期間 ^TWII
+    的日K「已收盤」集合根本沒變 —— 白抓一次 300 天資料、白推播一次。
+
+    這裡走**完整的 GUI 路徑**,並用「把快取時間戳往前撥」模擬時間經過,
+    不依賴真實時鐘 (P-94/P-97)。
+    """
+    import pandas as _pd
+    from core import strategy_engine as _se7
+    from core import kbars_plan as _kp2
+
+    class FakeContract:
+        code = 'TSE'
+        symbol = '^TWII'
+
+    _idx, _rows = [], []
+    _px = 20000.0
+    for _d in _pd.bdate_range(end=stock_app_pro.datetime.now(), periods=600):
+        for _h in (9, 11, 13):
+            _px += 1.0
+            _idx.append(_d + _pd.Timedelta(hours=_h))
+            _rows.append({'Open': _px, 'High': _px + 5, 'Low': _px - 5,
+                          'Close': _px, 'Volume': 1000})
+    RAW = _pd.DataFrame(_rows, index=_pd.DatetimeIndex(_idx))
+
+    logs = []
+    orig_log = app.log_message
+    orig_dl = app._download_kbars_raw
+    orig_running, orig_login, orig_api = app._qt_running, app.api_logged_in, app.sj_api
+    orig_strats, orig_rts = app.strategies, app.strategy_runtimes
+    orig_sync = app.QT_PREFETCH_SYNC
+    calls = {'n': 0}
+
+    def _fake_dl(_c, s0, s1, *_a, **_k):
+        calls['n'] += 1
+        return RAW[(RAW.index >= s0) & (RAW.index <= s1)]
+
+    def _age_cache(seconds):
+        """把所有快取的時間戳往前撥,模擬「經過了這麼久」。"""
+        for _k in list(app._kbars_raw_cache):
+            app._kbars_raw_cache[_k]['t'] -= seconds
+
+    try:
+        app.log_message = lambda m: (logs.append(m), orig_log(m))[0]
+        app._download_kbars_raw = _fake_dl
+        app.sj_api = object(); app.api_logged_in = True; app._qt_running = True
+        # 「背景補齊中」那則通知只存在於**非同步預抓**那條路 (_qt_start_kbars_prefetch),
+        # 所以這個案例必須走真正的背景路徑 (第一版設成 SYNC=True,訊息根本不會
+        # 出現,斷言當場紅)。retries/pace 調 0 只是讓診斷快一點。
+        app.QT_PREFETCH_SYNC = False
+        app.QT_PREFETCH_RETRIES = 0
+        app.QT_PREFETCH_PACE_SEC = 0
+        app._kbars_raw_cache.clear()
+        app._qt_prefetch_noted = {}
+        app._qt_prefetch_inflight = set()
+        app._qt_prefetch_errors = {}
+
+        st = _se7.new_strategy()
+        st.update({'name': '診斷ADR127', 'symbol': '2330', 'market': '台股',
+                   'timeframe': '日K', 'qty': 1, 'enabled': True,
+                   'session_gate': False, 'mode': '模擬'})
+        contract = FakeContract()
+
+        def _fetch():
+            try:
+                return app._qt_fetch_closed_bars(st, contract, 'index_tw', tf='日K',
+                                                 cache_sym='^TWII', cache_market='台股')
+            except _se7.KBarsPending:
+                return None      # 預抓在途是預期中的,不是錯誤
+
+        def _fetch_and_wait():
+            r = _fetch()
+            t = getattr(app, '_qt_prefetch_thread', None)
+            if t is not None:
+                t.join(timeout=30)
+            app.flush_after()
+            return r
+
+        # --- 1. 第一次抓:起背景預抓、通知一次、分段下載 ---
+        logs.clear()
+        _fetch_and_wait()
+        n_first = calls['n']
+        plan = _kp2.chunk_plan('日K', app.QT_TF_DAYS['日K'])
+        assert n_first >= plan['segments'], f"應分 {plan['segments']} 段下載,實際 {n_first}"
+        assert sum(1 for m in logs if '背景補齊中' in m) == 1, \
+            f"第一次應通知一次,實際 {sum(1 for m in logs if '背景補齊中' in m)} 次"
+        df1 = _fetch()
+        assert df1 is not None and not df1.empty, "預抓完成後應該拿得到資料"
+        n_first = calls['n']
+
+        # --- 2. 重現截圖:35 分鐘後(沒有跨過任何開盤)不可以重抓、不可以再推播 ---
+        # ADR-122 的 30 分鐘 TTL 在這裡必定過期 → 舊行為會重抓 + 再推播一次。
+        _age_cache(35 * 60)
+        logs.clear()
+        _fetch_and_wait()
+        assert calls['n'] == n_first, \
+            f"35 分鐘內沒有跨過開盤,日K 資料不會變,不可以重抓 (實際多抓了 {calls['n'] - n_first} 次)"
+        assert not [m for m in logs if '背景補齊中' in m], \
+            f"不可以再推播一次「背景補齊中」(這就是使用者截圖的問題): {logs[:2]}"
+
+        # --- 3. 反向對照:跨過開盤就**必須**重抓 ---
+        # 少了這條,把新鮮度寫成「永遠新鮮」也會一片綠 —— 那是拿舊資料去評估。
+        orig_between = stock_app_pro.market_session.any_session_opens_between
+        try:
+            stock_app_pro.market_session.any_session_opens_between = lambda *a, **k: True
+            logs.clear()
+            _fetch_and_wait()
+            assert calls['n'] > n_first, "跨過開盤後必須重抓 (否則會拿舊資料評估)"
+            # 但通知仍然每天只一次 —— 重抓是必要的,重複推播不是
+            assert not [m for m in logs if '背景補齊中' in m], \
+                "同一天同一個 key 不可以重複推播,即使真的重抓了"
+        finally:
+            stock_app_pro.market_session.any_session_opens_between = orig_between
+
+        # --- 4. 絕對上限:週末沒有開盤,快取仍不可以無限期活著 ---
+        # 【第一版是空殼斷言,突變測試抓到的】原本只是「往前撥 24 小時 + 1 分鐘
+        # 然後斷言會重抓」—— 但往前撥 24 小時的區間**本來就跨過了好幾個真實
+        # 開盤** (昨天 15:00、今天 08:45...),`any_session_opens_between` 自己
+        # 就回 True 了。拿掉絕對上限那個突變因此一片綠:斷言成立的理由跟上限
+        # 完全無關 (同 P-28)。
+        #
+        # 要真的測到上限,必須先模擬「期間內沒有任何開盤」(= 週末),再看上限
+        # 有沒有把快取判成過期。而且要配一條**反向對照**:沒超過上限時
+        # 不可以重抓 —— 否則「永遠重抓」也會通過。
+        try:
+            stock_app_pro.market_session.any_session_opens_between = lambda *a, **k: False
+            # (a) 沒跨開盤 + 沒超過上限 → 不可以重抓 (反向對照)
+            n_before = calls['n']
+            _age_cache(20 * 3600)                 # 20 小時 < 24 小時上限
+            _fetch_and_wait()
+            assert calls['n'] == n_before, \
+                f"週末沒有開盤且未超過絕對上限,不該重抓 (實際多抓了 {calls['n'] - n_before} 次)"
+            # (b) 同樣沒跨開盤,但超過上限 → 必須重抓 (只有上限能造成這個差異)
+            _age_cache(app.QT_CACHE_MAX_AGE_SEC + 60 - 20 * 3600)
+            _fetch_and_wait()
+            assert calls['n'] > n_before, "超過絕對上限應重抓 (週末保險)"
+        finally:
+            stock_app_pro.market_session.any_session_opens_between = orig_between
+
+        # --- 5. 分K 類**不可以**改成 session 判斷 (資料每根K棒真的會變) ---
+        st5 = _se7.new_strategy()
+        st5.update({'name': '診斷ADR127分K', 'symbol': '2330', 'market': '台股',
+                    'timeframe': '5分K', 'qty': 1, 'enabled': True,
+                    'session_gate': False, 'mode': '模擬'})
+        app._kbars_raw_cache.clear()
+        app._qt_fetch_closed_bars(st5, contract, 'stock', tf='5分K',
+                                  cache_sym='2330', cache_market='台股')
+        n5 = calls['n']
+        _age_cache(60)                        # 60 秒 > 分K 的 30 秒 TTL
+        app._qt_fetch_closed_bars(st5, contract, 'stock', tf='5分K',
+                                  cache_sym='2330', cache_market='台股')
+        assert calls['n'] > n5, \
+            "分K 類必須維持短 TTL (每根K棒資料真的會變),不可以套用 session 判斷"
+    finally:
+        app.log_message = orig_log
+        app._download_kbars_raw = orig_dl
+        app.QT_PREFETCH_SYNC = orig_sync
+        app.__dict__.pop('QT_PREFETCH_RETRIES', None)
+        app.__dict__.pop('QT_PREFETCH_PACE_SEC', None)
+        app._qt_running, app.api_logged_in, app.sj_api = orig_running, orig_login, orig_api
+        app.strategies, app.strategy_runtimes = orig_strats, orig_rts
+        app._kbars_raw_cache.clear()
+        app._qt_prefetch_noted = {}
+        app._qt_prefetch_inflight = set()
+        app._qt_prefetch_errors = {}
+
+
+run_case("ADR-127: 日K快取用『有沒有跨過開盤』判斷 + 補資料通知每天只一次",
+         _day_cache_session_freshness_127)
+
+
 print(f"{'案例':60s} 結果")
 print("-" * 76)
 for name, st, msg in results:
