@@ -4713,20 +4713,22 @@ def _merged_stop_level_129():
         assert "param_entries[k].get()" not in _src, \
             "z/s2 沒有輸入框了,_collect() 不可以再用 param_entries[k] 直取 (會 KeyError)"
 
-        # ---- 5. 重現使用者截圖的驗證訊息 ----
+        # ---- 5. 【ADR-130】使用者截圖那組參數現在必須存得起來 ----
+        # ADR-129 時這裡斷言的是「應該被擋」;使用者接著指出那個限制本身是錯的
+        # (實際進場價不是 X,停損要貼著實際進場價),所以 ADR-130 拿掉了相對關係
+        # 的檢查。同一組數字、相反的期待 —— 這一行就是那次規則變更的紀錄。
         s5 = _ck9.default_strategy()
         s5.update({'symbol': 'TXF', 'trade_type': '期貨', 'market': '台期貨', 'qty': 5,
                    'direction': '做空', 'ck_x': 42500.0, 'ck_s1': 41701.0,
                    'ck_c': 1000.0, 'ck_f': 200.0})
-        _ok, _msg = _ck9.validate(s5)
-        assert not _ok, "做空的停損點位填在 X 之下,應該被擋下來"
-        assert '41701' in _msg and '42500' in _msg and '漲上去' in _msg, \
-            f"訊息要講出為什麼與實際數字,方便使用者自己修正: {_msg}"
-        # 反向對照:改成 X 之上就要存得起來 (只填一個 S1)
-        s5['ck_s1'] = 43000.0
         s5.pop('ck_s2', None)
+        _ok, _msg = _ck9.validate(s5)
+        assert _ok, f"停損點位與 X 的高低不該再被限制 (使用者要求自行設定): {_msg}"
+        # 反向對照:「有沒有填」還是要擋 —— S1=0 會讓系統每天誤判待確認停損
+        s5['ck_s1'] = 0.0
         _ok2, _msg2 = _ck9.validate(s5)
-        assert _ok2, f"只填一個 S1 (且大於 X) 必須存得起來,實際被擋: {_msg2}"
+        assert not _ok2 and 'S1' in _msg2, \
+            f"S1=0 等於壞資料,必須擋下來 (ok={_ok2}, msg={_msg2})"
     finally:
         app.log_message = orig_log
         app._qt_resolve = orig_resolve
@@ -4744,6 +4746,166 @@ def _merged_stop_level_129():
 
 run_case("ADR-129: 停損觸發/確認合併成一個點位 (舊檔殘留值不生效)",
          _merged_stop_level_129)
+
+
+def _stop_level_free_of_x_130():
+    """【ADR-130】停損點位與進出場分界 X 的相對關係不再限制。
+
+    使用者的要求:
+      「有時候停損點的位置不一定會高於進場點,因為實際進場的位置,已經離一開始
+        設定的進場位置太遠,導致虧損會很大。所以你說停損點必須大於進出場分界,
+        這一點不要被限制,是允許我自行設定,你只要依照我設定的停損位置去判斷
+        是否符合條件即可。」
+
+    情境 (做空):X=42500 設好之後,指數跌破 42500、隔天 12:00 確認時已經到
+    41800 才真正進場。停損若被迫設在 42500 之上,等於容忍 700 點以上的虧損;
+    使用者要設 42000 (在 X 之下、在實際進場價之上) 才貼著實際風險。
+
+    走**完整的 GUI 路徑**:核心單元測試只能證明狀態機照 S1 判斷,證明不了
+    「GUI 的啟用閘門會不會又擋一次」(P-64)。
+    """
+    import pandas as _pd
+    from core import strategy_engine as _se10
+    from core import chukuangren_band as _ck10
+
+    class FakeContract:
+        code = 'TXF'
+        symbol = 'TXFR1'
+
+    X_LEVEL, S1_LEVEL, ENTRY_IDX = 42500.0, 42000.0, 41800.0
+    confirm_px = {'v': 42100.0}
+    daily_close = {'v': 42100.0}
+
+    orig_log = app.log_message
+    orig_resolve = app._qt_resolve
+    orig_resolve_watch = app._qt_resolve_watch
+    orig_fetch = app._qt_fetch_closed_bars
+    orig_open = stock_app_pro.market_session.is_market_open
+    orig_just = stock_app_pro.market_session.just_opened
+    orig_window = _ck10.in_noon_confirm_window
+    orig_running, orig_login, orig_api = app._qt_running, app.api_logged_in, app.sj_api
+    orig_strats, orig_rts = app.strategies, app.strategy_runtimes
+
+    def _daily():
+        _n = 40
+        _c = [daily_close['v']] * _n
+        return _pd.DataFrame(
+            {'Open': _c, 'High': [c + 20 for c in _c], 'Low': [c - 20 for c in _c],
+             'Close': _c, 'Volume': [1000] * _n},
+            index=_pd.bdate_range(end=stock_app_pro.datetime.now().replace(
+                hour=0, minute=0, second=0, microsecond=0), periods=_n))
+
+    def _fake_fetch(_s, _c, _a, tf=None, cache_sym=None, cache_market=None, **_k):
+        if tf == '日K':
+            return _daily()
+        return _pd.DataFrame({'Close': [confirm_px['v']]},
+                             index=[stock_app_pro.datetime.now()])
+
+    def _mk(**over):
+        s = _ck10.default_strategy()
+        s.update({'name': '診斷ADR130', 'symbol': 'TXF', 'trade_type': '期貨',
+                  'market': '台期貨', 'qty': 5, 'direction': '做空', 'mode': '模擬',
+                  'enabled': True, 'session_gate': False,
+                  'ck_x': X_LEVEL, 'ck_s1': S1_LEVEL, 'ck_c': 1000.0, 'ck_f': 200.0})
+        s.update(over)
+        return s
+
+    def _mount(s):
+        rt = _se10.new_runtime()
+        rt.update({'state': 'SHORT', 'qty': 5, 'entry_price': ENTRY_IDX,
+                   'exec_entry_price': ENTRY_IDX, 'entry_index_price': ENTRY_IDX})
+        app.strategies = [s]
+        app.strategy_runtimes = {s['id']: rt}
+        app._qt_last_boundary = {}
+        app._qt_session_state = {}
+        return rt
+
+    try:
+        app.log_message = lambda m: (None, orig_log(m))[0]
+        app._qt_resolve = lambda _s: (FakeContract(), 'futures')
+        app._qt_resolve_watch = lambda _s: (FakeContract(), 'index_tw', '^TWII', '台股')
+        app._qt_fetch_closed_bars = _fake_fetch
+        app.sj_api = object(); app.api_logged_in = True; app._qt_running = True
+        stock_app_pro.market_session.is_market_open = lambda *a, **k: True
+        stock_app_pro.market_session.just_opened = lambda *a, **k: False
+        _ck10.in_noon_confirm_window = lambda _dt: True
+
+        # ---- 1. 存檔驗證:S1 在 X 之下不可以再被擋 ----
+        s1_ = _mk()
+        _ok, _msg = _ck10.validate(s1_)
+        assert _ok, f"S1({S1_LEVEL:g}) < X({X_LEVEL:g}) 不該再被擋: {_msg}"
+
+        # ---- 2. 啟用閘門 (含 Telegram /on 走的同一條) 也不可以再擋 ----
+        _mount(s1_)
+        _ok2, _why2, _pend2 = app._qt_enable_blockers(s1_)
+        assert _ok2, f"啟用閘門不該再擋這組參數: {_why2}"
+
+        # ---- 3. 停損判斷只看 S1:指數 42100 > S1=42000 → 停損 (不必漲過 X) ----
+        rt = _mount(_mk())
+        daily_close['v'] = 42100.0
+        confirm_px['v'] = 42100.0
+        eval_pass(); app.flush_after()
+        assert rt.get('pending_exit') and rt['pending_exit']['reason'] == 'SL', \
+            f"42100 已突破 S1={S1_LEVEL:g},要記待確認停損 (實際 {rt.get('pending_exit')})"
+        app._qt_chukuangren_confirm_pass(); app.flush_after()
+        assert rt.get('armed_intent'), "隔天12:00 仍高於 S1 → 應確認平倉"
+        assert rt['armed_intent']['action'] == '買進', "空單平倉是買進"
+
+        # ---- 4. 反向對照:還在 S1 之下就不可以停損 ----
+        # 少了這條,把停損寫成「永遠觸發」也會讓第 3 條綠 —— 那會每天亂平倉。
+        rt2 = _mount(_mk())
+        daily_close['v'] = 41900.0
+        confirm_px['v'] = 41900.0
+        eval_pass(); app.flush_after()
+        assert not rt2.get('pending_exit'), \
+            f"41900 還在 S1={S1_LEVEL:g} 之下,不該停損 (實際 {rt2.get('pending_exit')})"
+        assert rt2['state'] == 'SHORT'
+
+        # ---- 5. 進場仍然只看 X (這次只放寬停損,不可以連進場一起弄鬆) ----
+        s5 = _mk()
+        rt5 = _se10.new_runtime()          # FLAT
+        app.strategies = [s5]; app.strategy_runtimes = {s5['id']: rt5}
+        app._qt_last_boundary = {}; app._qt_session_state = {}
+        daily_close['v'] = 42600.0         # 在 X 之上 → 做空不該進場
+        eval_pass(); app.flush_after()
+        assert not rt5.get('pending_entry'), \
+            "42600 在 X 之上,做空不該記進場訊號 (進場條件不可以被一起放寬)"
+        rt5b = _se10.new_runtime()
+        app.strategy_runtimes = {s5['id']: rt5b}
+        app._qt_last_boundary = {}
+        daily_close['v'] = 42400.0         # 跌破 X → 該記進場
+        eval_pass(); app.flush_after()
+        assert rt5b.get('pending_entry'), "42400 跌破 X,做空應記進場訊號 (正控)"
+
+        # ---- 6. 「有沒有填」仍然要擋 (0 是壞資料,不是「不設停損」) ----
+        _ok6, _msg6 = _ck10.validate(_mk(ck_s1=0.0))
+        assert not _ok6 and 'S1' in _msg6, \
+            f"S1=0 會讓「收盤 > 0」永遠成立 → 每天誤判待確認停損,必須擋 ({_msg6})"
+        _ok7, _msg7 = _ck10.validate(_mk(direction='做多', ck_y=0.0, ck_s1=S1_LEVEL))
+        assert not _ok7 and 'Y' in _msg7, \
+            f"Y=0 等於完全沒有停損,必須擋 ({_msg7})"
+
+        # ---- 7. 原始碼層級:相對關係的檢查必須真的被拿掉 ----
+        _csrc = open('core/chukuangren_band.py', encoding='utf-8').read()
+        for _dead in ("p['y'] >= p['x']", "p['s1'] <= p['x']"):
+            assert _dead not in _csrc, f"停損與 X 的相對關係檢查應已移除,但還找得到 {_dead}"
+    finally:
+        app.log_message = orig_log
+        app._qt_resolve = orig_resolve
+        app._qt_resolve_watch = orig_resolve_watch
+        app._qt_fetch_closed_bars = orig_fetch
+        _ck10.in_noon_confirm_window = orig_window
+        stock_app_pro.market_session.is_market_open = orig_open
+        stock_app_pro.market_session.just_opened = orig_just
+        app._qt_running, app.api_logged_in, app.sj_api = orig_running, orig_login, orig_api
+        app.strategies, app.strategy_runtimes = orig_strats, orig_rts
+        app._qt_last_boundary = {}
+        app._qt_session_state = {}
+        app.__dict__.pop('_qt_confirm_err_noted', None)
+
+
+run_case("ADR-130: 停損點位不受進出場分界 X 限制 (但仍要真的填)",
+         _stop_level_free_of_x_130)
 
 
 print(f"{'案例':60s} 結果")
