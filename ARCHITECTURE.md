@@ -90,11 +90,14 @@ PITFALLS P-27）。它們存在的唯一理由就是「可離線單元測試」�
   `fetch_data_worker` 裡的字面值，策略路徑要用同一套規則時只能再抄一份 ——
   收斂到這裡，並由 diag 的原始碼層級斷言確保兩邊不會改岔。
   注意 `chunk_plan()` 以**切出來幾段**為準，不是以門檻為準（PITFALLS P-91）。
-- `market_session.py`（ADR-070/121）：「現在這個市場開盤了沒」的單一真相來源。
+- `market_session.py`（ADR-070/121/127）：「現在這個市場開盤了沒」的單一真相來源。
   `is_market_open()` 是自動交易的開/收盤閘門；`just_opened()`（ADR-121）另外
-  回答「是不是剛開盤 N 秒內」，讓策略不要在鐘響那一秒去打券商 API。
-  時刻常數（`STOCK_OPEN_MIN` / `FUT_DAY_OPEN_MIN` / `ODD_LOT_OPEN_MIN` …）
-  都在這裡，其他地方不可以另寫一份。
+  回答「是不是剛開盤 N 秒內」，讓策略不要在鐘響那一秒去打券商 API；
+  `any_session_opens_between(t0, t1)`（ADR-127）回答「這段期間有沒有跨過開盤」，
+  給日 K 類快取判斷新鮮度用 —— 日 K 的「已收盤」集合只在新的一盤開始時才會
+  多一根，所以該問的是「造成資料改變的事件發生了沒」，不是「快取放多久了」
+  （PITFALLS P-98）。時刻常數（`STOCK_OPEN_MIN` / `FUT_DAY_OPEN_MIN` /
+  `ODD_LOT_OPEN_MIN` …）都在這裡，其他地方不可以另寫一份。
 - `regime_panel.py`（ADR-120）：主圖【盤勢判斷】面板的純邏輯。
   `normalize(raw)` 把設定檔讀到的東西整理成一份值域安全的設定（設定檔壞掉
   絕不可以變成主圖畫不出來）；`should_evaluate(settings, symbol, timeframe)`
@@ -276,7 +279,7 @@ G:\StockBuild\
 │   ├─ market_pattern.py    加權指數盤勢/型態偵測 (只提醒,不下單)
 │   ├─ volume_profile.py    量價支撐壓力 (POC/價值區/高量節點, ADR-102)
 │   ├─ regime_panel.py      主圖【盤勢判斷】:設定正規化 + 通知去重 (ADR-120)
-│   ├─ market_session.py    交易時段/開盤暖機 (ADR-070/121)
+│   ├─ market_session.py    交易時段/開盤暖機/跨開盤判斷 (ADR-070/121/127)
 │   ├─ kbars_plan.py        kbars 分段門檻/段長的單一出處 (ADR-122)
 │   └─ order_rules.py
 ├─ data/

@@ -6066,5 +6066,84 @@ class TestStrategyLock(unittest.TestCase):
 
 
 
+
+class TestSessionOpensBetween(unittest.TestCase):
+    """【ADR-127】日K 類快取的新鮮度:改問「有沒有跨過開盤」而不是牆上時鐘。
+
+    使用者實測:同一則「^TWII 日K 歷史資料分 4 段在背景補齊中」在 09:20 與
+    09:55 各推播一次(相隔 35 分鐘 = ADR-122 的 30 分鐘 TTL 過期後的下一個
+    5 分鐘評估點)。而那段期間 ^TWII 的日K「已收盤」集合根本沒變 ——
+    整天每半小時白抓一次 300 天資料、白推播一次。
+    """
+
+    def _d(self, *a):
+        from datetime import datetime as _dt
+        return _dt(*a)
+
+    def test_within_one_session_is_fresh(self):
+        """重現使用者的情境:09:20 → 09:55 沒有跨過任何開盤 → 快取仍新鮮。"""
+        self.assertFalse(market_session.any_session_opens_between(
+            self._d(2026, 7, 30, 9, 20), self._d(2026, 7, 30, 9, 55)))
+        self.assertFalse(market_session.any_session_opens_between(
+            self._d(2026, 7, 30, 10, 0), self._d(2026, 7, 30, 14, 0)))
+
+    def test_crossing_an_open_is_stale(self):
+        """跨過開盤就一定要過期 —— 這個方向錯了會拿舊資料去評估、下錯單。"""
+        # 09:00 整股開盤
+        self.assertTrue(market_session.any_session_opens_between(
+            self._d(2026, 7, 30, 8, 50), self._d(2026, 7, 30, 9, 5)))
+        # 09:10 盤中零股開盤
+        self.assertTrue(market_session.any_session_opens_between(
+            self._d(2026, 7, 30, 9, 5), self._d(2026, 7, 30, 9, 20)))
+        # 08:45 期貨日盤
+        self.assertTrue(market_session.any_session_opens_between(
+            self._d(2026, 7, 30, 8, 0), self._d(2026, 7, 30, 8, 50)))
+        # 15:00 期貨夜盤
+        self.assertTrue(market_session.any_session_opens_between(
+            self._d(2026, 7, 30, 14, 0), self._d(2026, 7, 30, 15, 30)))
+
+    def test_boundary_is_left_open_right_closed(self):
+        """區間是 (t0, t1]:剛好等於 t0 的開盤不算「期間內發生」(那一刻的資料
+        已經反映在快取裡了);剛好等於 t1 的算。
+
+        用 09:10 (盤中零股開盤) 當 t0 而不是 09:00 —— 09:00 往後 30 分鐘內還
+        有 09:10 這個開盤,拿它當例子會測到別的東西 (第一版就是這樣寫錯的,
+        單元測試當場紅)。09:10 之後下一個開盤要等到 15:00。"""
+        op = self._d(2026, 7, 30, 9, 10)
+        self.assertFalse(market_session.any_session_opens_between(
+            op, self._d(2026, 7, 30, 9, 40)), "t0 就是開盤那一刻 → 不算期間內發生")
+        self.assertTrue(market_session.any_session_opens_between(
+            self._d(2026, 7, 30, 9, 9), op), "t1 剛好等於開盤 → 算")
+
+    def test_weekend_has_no_open(self):
+        """週末沒有開盤 → 期間內沒有新的日K 產生。"""
+        self.assertFalse(market_session.any_session_opens_between(
+            self._d(2026, 8, 1, 10, 0), self._d(2026, 8, 2, 20, 0)))   # 週六→週日
+
+    def test_crossing_into_next_weekday_is_stale(self):
+        self.assertTrue(market_session.any_session_opens_between(
+            self._d(2026, 7, 30, 20, 0), self._d(2026, 7, 31, 9, 30)))
+
+    def test_defensive_cases_err_toward_stale(self):
+        """判斷不出來一律當「過期」—— 多抓一次無害,誤判新鮮會下錯單。"""
+        self.assertTrue(market_session.any_session_opens_between(None, self._d(2026, 7, 30)))
+        self.assertTrue(market_session.any_session_opens_between(self._d(2026, 7, 30), None))
+        # 時鐘倒退 (校時/夏令時)
+        self.assertTrue(market_session.any_session_opens_between(
+            self._d(2026, 7, 30, 10, 0), self._d(2026, 7, 30, 9, 0)))
+        # 跨太久不逐日枚舉,直接當過期
+        self.assertTrue(market_session.any_session_opens_between(
+            self._d(2026, 1, 1), self._d(2026, 7, 30)))
+
+    def test_open_minutes_are_the_union(self):
+        """開盤時刻取聯集是刻意的:多列一個只會讓快取早一點過期(安全方向),
+        少列一個才危險。"""
+        mins = market_session.session_open_minutes()
+        for m in (market_session.STOCK_OPEN_MIN, market_session.ODD_LOT_OPEN_MIN,
+                  market_session.FUT_DAY_OPEN_MIN, market_session.FUT_NIGHT_OPEN_MIN):
+            self.assertIn(m, mins)
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

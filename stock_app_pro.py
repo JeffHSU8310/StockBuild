@@ -3615,7 +3615,7 @@ class StockTradingAppPro(tk.Tk):
             out.index = out.index + pd.Timedelta(minutes=mins)
         return out
 
-    def _kbars_cache_get(self, key, need_start, ttl=None):
+    def _kbars_cache_get(self, key, need_start, ttl=None, fresh_check=None):
         """取快取。回傳 (raw_df涵蓋need_start之後 或 None, 是否新鮮)。
 
         【ADR-122】ttl 可由呼叫端覆寫。不傳 = 沿用類別常數 (主圖行為不變);
@@ -3624,9 +3624,16 @@ class StockTradingAppPro(tk.Tk):
         c = self._kbars_raw_cache.get(key)
         if not c or c['start'] > need_start:
             return None, False
-        if ttl is None:
-            ttl = self.CACHE_TTL_DAY_TF if c.get('tf_class') == 'day' else self.CACHE_TTL_MIN_TF
-        fresh = (time.time() - c['t']) <= ttl
+        if fresh_check is not None:
+            # 【ADR-127】呼叫端自己決定新鮮度 (日K 類改用「有沒有跨過開盤」)
+            try:
+                fresh = bool(fresh_check(c['t']))
+            except Exception:
+                fresh = False        # 判斷不出來一律當過期 (寧可重抓)
+        else:
+            if ttl is None:
+                ttl = self.CACHE_TTL_DAY_TF if c.get('tf_class') == 'day' else self.CACHE_TTL_MIN_TF
+            fresh = (time.time() - c['t']) <= ttl
         try:
             return c['df'].loc[c['df'].index >= need_start], fresh
         except Exception:
@@ -7692,12 +7699,21 @@ class StockTradingAppPro(tk.Tk):
         _sym = (cache_sym or str(strategy.get('symbol'))).upper()
         _mkt = cache_market or strategy.get('market')
         key = f"QT|{_mkt}|{_sym}|{tf}"
-        # 【ADR-122】日K 類的快取放長:_qt_fetch_closed_bars 本來就會丟掉最後
-        # 一根,所以日K 策略盤中整段時間「評估用的資料」完全不變,重抓沒有
-        # 任何意義 (詳見 QT_CACHE_TTL_DAY_TF 的說明)。分K 類維持原本的 30 秒
-        # —— 那個資料每根K棒真的會變,拉長會漏訊號。
-        _ttl = None if kbars_plan.is_min_timeframe(tf) else self.QT_CACHE_TTL_DAY_TF
-        raw, fresh = self._kbars_cache_get(key, start_dt, ttl=_ttl)
+        # 【ADR-122 → ADR-127】日K 類的新鮮度**不用牆上時鐘判斷**。
+        #
+        # ADR-122 已經論證過:_qt_fetch_closed_bars 會丟掉最後一根,所以日K 類
+        # 「已收盤」的集合只在新的一盤開始時才會多一根。當時用 30 分鐘 TTL 當
+        # 「90% 的近似」,結果就是整天每 30 分鐘白抓一次 300 天的資料 + 推播一次
+        # (使用者實測 09:20 與 09:55 各收到一則,間隔 35 分鐘正好是 TTL 過期後
+        #  的下一個 5 分鐘評估點)。ADR-127 改成問對的問題:「這段期間有沒有跨過
+        # 任何一次開盤?」沒有就一定拿到一樣的資料,不必重抓。
+        #
+        # 分K 類維持原本的 30 秒 TTL —— 那個資料每根K棒真的會變,拉長會漏訊號。
+        if kbars_plan.is_min_timeframe(tf):
+            raw, fresh = self._kbars_cache_get(key, start_dt)
+        else:
+            raw, fresh = self._kbars_cache_get(key, start_dt,
+                                               fresh_check=self._qt_day_cache_fresh)
         if raw is None or not fresh:
             plan = kbars_plan.chunk_plan(tf, days)
             if plan is not None and (allow_blocking or self.QT_PREFETCH_SYNC):
@@ -7972,7 +7988,8 @@ class StockTradingAppPro(tk.Tk):
     # 舊值 300 秒 < 日K 類 10 分鐘的評估間隔,等於「快取必定過期、完全沒作用」,
     # 每次評估都重打一次 300 天的大請求。
     # 分K 類不適用這個推論 (資料每根K棒真的會變),維持 CACHE_TTL_MIN_TF。
-    QT_CACHE_TTL_DAY_TF = 1800
+    QT_CACHE_TTL_DAY_TF = 1800   # 【ADR-127 起不再用於策略路徑】保留給其他呼叫端/相容
+    QT_CACHE_MAX_AGE_SEC = 24 * 3600   # 【ADR-127】日K 類快取的絕對上限 (週末保險)
 
     # 【ADR-122 測試接縫】True = 大範圍分段下載改成「原地做完」而不是丟背景
     # 執行緒。production 永遠是 False;診斷腳本設 True,好讓既有的同步斷言
@@ -7984,6 +8001,23 @@ class StockTradingAppPro(tk.Tk):
     # (睡多久都只影響它自己);拉出來當常數是為了讓診斷能調快。
     QT_PREFETCH_RETRIES = 2
     QT_PREFETCH_PACE_SEC = 0.35
+
+    def _qt_day_cache_fresh(self, cached_ts):
+        """【ADR-127】日K 類快取還新鮮嗎:期間內沒有跨過任何開盤就算新鮮。
+
+        另外加一道**絕對上限** (QT_CACHE_MAX_AGE_SEC) 當保險:週末沒有開盤,
+        單靠 session 規則可以讓快取活過整個週末;雖然那期間確實不會有新的
+        日K,但「記憶體裡的資料放了三天沒重新確認過」風險報酬不划算,寧可
+        週一早上多抓一次。
+        """
+        try:
+            age = time.time() - float(cached_ts)
+        except (TypeError, ValueError):
+            return False
+        if age < 0 or age > self.QT_CACHE_MAX_AGE_SEC:
+            return False
+        t0 = datetime.fromtimestamp(float(cached_ts))
+        return not market_session.any_session_opens_between(t0, datetime.now())
 
     def _qt_prefetch_init(self):
         """三個欄位各自獨立檢查,不可以用「第一個沒有就三個一起建」的寫法。
@@ -8027,9 +8061,18 @@ class StockTradingAppPro(tk.Tk):
                 return False
             self._qt_prefetch_inflight.add(key)
 
-        self.safe_after(0, self.log_message,
-                        f"【自動交易-資料】{key.split('|')[-2]} {tf} 歷史資料分 "
-                        f"{plan['segments']} 段在背景補齊中,補完後策略會自動開始評估。")
+        # 【ADR-127】同一個 key 每天只通知一次。這則訊息的前綴會被
+        # telegram_notify.is_quant_message() 抓到 → 每次都推播,而 ADR-122 的
+        # 30 分鐘 TTL 讓它整天每半小時響一次 (使用者實測 09:20 / 09:55)。
+        # 資訊價值只有「第一次補資料要等一下」,重複的純粹是噪音。
+        _today = f"{datetime.now():%Y-%m-%d}"
+        if not hasattr(self, '_qt_prefetch_noted'):
+            self._qt_prefetch_noted = {}
+        if self._qt_prefetch_noted.get(key) != _today:
+            self._qt_prefetch_noted[key] = _today
+            self.safe_after(0, self.log_message,
+                            f"【自動交易-資料】{key.split('|')[-2]} {tf} 歷史資料分 "
+                            f"{plan['segments']} 段在背景補齊中,補完後策略會自動開始評估。")
 
         def _worker():
             try:
