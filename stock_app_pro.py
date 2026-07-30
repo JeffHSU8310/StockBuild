@@ -429,6 +429,8 @@ class StockTradingAppPro(tk.Tk):
         threading.Thread(target=self.watchlist_quote_worker, daemon=True).start()
         # 【ADR-035】量化 runner:總開關關閉時完全閒置
         threading.Thread(target=self.quant_runner_worker, daemon=True).start()
+        # 【ADR-132】每日收盤後的盤勢判斷推播 (不受自動交易總開關影響)
+        threading.Thread(target=self.regime_daily_notify_worker, daemon=True).start()
         # 【第十六輪 第6項】主圖K棒自動更新:分K跨收盤邊界自動長新K棒,免手動重載
         self.current_timeframe = None
         threading.Thread(target=self.chart_auto_refresh_worker, daemon=True).start()
@@ -7743,7 +7745,7 @@ class StockTradingAppPro(tk.Tk):
             return (None, None, sym, '台股')
 
     def _qt_fetch_closed_bars(self, strategy, contract, asset_type, tf=None, cache_sym=None,
-                              cache_market=None, allow_blocking=False):
+                              cache_market=None, allow_blocking=False, drop_last=True):
         """
         取策略用的「已收盤」K棒:下載(或快取)原始分K → 依週期重採樣 →
         剔除最後一根 (可能未完成)。回傳 df (可能為空)。
@@ -7838,7 +7840,13 @@ class StockTradingAppPro(tk.Tk):
         if df is None or len(df) < 2:
             return pd.DataFrame()
         # 最後一根視為未完成 (盤中一定是,收盤後犧牲一根換取絕不用未完成K棒的保證)
-        df = df.iloc[:-1]
+        #
+        # 【ADR-132】drop_last=False 是給「收盤後的盤勢判斷推播」用的:那條路徑
+        # 在 13:30 收盤之後才跑,當天的日K 已經定案,丟掉它等於**永遠看不到
+        # 今天的型態** —— 對「每天收盤後告訴我今天出現什麼」這個需求是致命的。
+        # 下單路徑一律維持 True (預設值),絕不可以拿未完成K棒去產生委託。
+        if drop_last:
+            df = df.iloc[:-1]
         # 【ADR-101】策略若用到籌碼條件,在這裡把籌碼併成 Chip* 欄位。
         # 放在資料準備階段的好處:條件函式簽名不變,實盤與回測共用同一條路。
         if strategy_engine.strategy_uses_chips(strategy):
@@ -12453,6 +12461,98 @@ class StockTradingAppPro(tk.Tk):
         except Exception as e:
             self.log_message(f"【盤勢判斷】型態偵測失敗 ({type(e).__name__}: {e}),本次略過。")
 
+    # 【ADR-132】每日收盤後的盤勢推播:多久檢查一次「時間到了沒」。
+    # 60 秒足夠 (推播時刻的解析度是分鐘),而且這是自己的執行緒,
+    # sleep 不會拖到任何東西 (跟量化 runner 不同,見 P-90)。
+    REGIME_NOTIFY_POLL_SEC = 60
+
+    def regime_daily_notify_worker(self):
+        """每天收盤後對加權指數做一次盤勢判斷,結果推播到手機 (ADR-132)。
+
+        **刻意不掛在量化 runner 上**:那條迴圈由「自動交易總開關」控制,
+        而盤勢推播是看盤輔助,使用者沒開自動交易時一樣該收到。
+        自己一條 daemon thread,總開關關著也照跑。
+        """
+        import time as _time
+        while True:
+            if getattr(self, '_closing', False):
+                return
+            try:
+                self._regime_daily_notify_pass()
+            except Exception as e:
+                self.safe_after(0, self.log_message,
+                                f"【盤勢判斷】每日推播檢查失敗 ({type(e).__name__}: {e})")
+            _time.sleep(self.REGIME_NOTIFY_POLL_SEC)
+
+    def _regime_notify_fetch(self, tf):
+        """抓加權指數某個週期的 K 棒給推播用。抓不到回 None。
+
+        用 drop_last=False:這條路徑在收盤後才跑,當天的 K 棒已經定案,
+        丟掉它就永遠看不到今天的型態 (見 _qt_fetch_closed_bars 的說明)。
+        allow_blocking=True:這是自己的 worker 執行緒,慢一點沒關係 (ADR-122)。
+        """
+        probe = {'watch_enabled': True, 'watch_symbol': regime_panel.DEFAULT_INDEX_SYMBOL,
+                 'watch_trade_type': '指數', 'symbol': regime_panel.DEFAULT_INDEX_SYMBOL,
+                 'market': '台股', 'timeframe': tf}
+        contract, asset, sym, mkt = self._qt_resolve_watch(probe)
+        if contract is None:
+            return None
+        df = self._qt_fetch_closed_bars(probe, contract, asset, tf=tf,
+                                        cache_sym=sym, cache_market=mkt,
+                                        allow_blocking=True, drop_last=False)
+        return df if (df is not None and not df.empty) else None
+
+    def _regime_daily_notify_pass(self, now_dt=None, force=False):
+        """收盤後的每日盤勢推播。時間沒到 / 今天發過了 → 直接返回。
+
+        now_dt / force 是測試接縫:production 兩者都不傳。
+        """
+        s = regime_panel.normalize(self.regime_settings)
+        now_dt = now_dt or datetime.now()
+        if not hasattr(self, '_regime_notify_last_date'):
+            self._regime_notify_last_date = None
+        if not force and not regime_panel.should_notify_now(
+                s, now_dt, self._regime_notify_last_date):
+            return
+        if not (self.api_logged_in and getattr(self, 'sj_api', None)):
+            return   # 還沒登入就抓不到指數資料;下一分鐘再試 (不記日誌,免得洗版)
+
+        today = now_dt.strftime('%Y-%m-%d')
+        sections = []
+        for tf in regime_panel.notify_timeframes(s):
+            try:
+                df = self._regime_notify_fetch(tf)
+                if df is None or len(df) < 20:
+                    continue
+                signals = []
+                if s['pattern_enabled']:
+                    signals = market_pattern.evaluate_all(df, regime_panel.pattern_params(s))
+                sr_summary = None
+                if s['sr_enabled']:
+                    r = volume_profile.find_levels(
+                        df, asset_type='index_tw',
+                        raw_symbol=regime_panel.DEFAULT_INDEX_SYMBOL,
+                        max_levels=int(s.get('sr_max_levels', 6) or 6))
+                    if r and r.get('levels'):
+                        sr_summary = volume_profile.summarize(r)
+                sections.append((tf, signals, sr_summary))
+            except Exception as e:
+                # 單一週期失敗不可以讓另一個週期也不發 —— 各自 try (鐵則8 的精神)
+                self.safe_after(0, self.log_message,
+                                f"【盤勢判斷】{tf} 每日推播計算失敗 ({type(e).__name__}: {e})")
+
+        # **不論有沒有內容都記今天已處理**:否則沒有訊號的那幾天,這個 pass 會
+        # 每 60 秒重跑一次 (含兩次資料抓取) 直到收盤,白白打 API。
+        self._regime_notify_last_date = today
+        text = regime_panel.format_daily_report(today, sections)
+        if not text:
+            return   # 沒東西講就不發 —— 一天一次的通知變成噪音就沒人看了 (P-99)
+        self.log_message(text)
+        if telegram_notify.config_ready(getattr(self, 'telegram_cfg', None)):
+            # 直接送,**不經過 log_message 的推播閘門** —— 那道閘門要求
+            # 「自動交易總開關開啟」,而盤勢推播是看盤輔助,不該綁在自動交易上。
+            self._send_telegram_async(text)
+
     def open_regime_settings(self):
         """【盤勢判斷】設定:支撐壓力與盤勢/型態兩個子項各自可勾選。"""
         dlg = tk.Toplevel(self)
@@ -12519,8 +12619,10 @@ class StockTradingAppPro(tk.Tk):
                        variable=v_idx, bg="#12181F", fg="white", selectcolor="#2A323D",
                        activebackground="#12181F", font=('微軟正黑體', 9)).grid(
                        row=1, column=0, columnspan=6, sticky='w', padx=6)
-        tk.Label(pat_fr, text="※ 型態的定義以「一天一根」為前提,因此只在日K評估;"
-                             "偵測到新型態會寫進下方系統日誌。",
+        tk.Label(pat_fr, text="※ 型態的定義以「一天一根」為前提,因此只在 "
+                             + " / ".join(regime_panel.PATTERN_TIMEFRAMES)
+                             + " 評估 (60分K 一天只有 4~5 根,語意與日K 同量級);"
+                               "偵測到新型態會寫進下方系統日誌。",
                  bg="#12181F", fg="#8A99AD", font=('微軟正黑體', 8)).grid(
                  row=2, column=0, columnspan=6, sticky='w', padx=6, pady=(2, 4))
 
@@ -12535,6 +12637,35 @@ class StockTradingAppPro(tk.Tk):
                            selectcolor="#2A323D", activebackground="#12181F",
                            font=('微軟正黑體', 8)).grid(row=i // 2, column=i % 2,
                                                         sticky='w', padx=6, pady=1)
+
+        # 【ADR-132】每日收盤後推播到手機
+        ntf_fr = tk.LabelFrame(dlg, text=" 每日推播 (Telegram) ", bg="#12181F", fg="#00E5FF",
+                               font=('微軟正黑體', 9, 'bold'))
+        ntf_fr.pack(fill=tk.X, padx=12, pady=(6, 4))
+        v_ntf = tk.BooleanVar(value=s['notify_enabled'])
+        tk.Checkbutton(ntf_fr, text="每天收盤後把盤勢/型態與支撐壓力推播到手機",
+                       variable=v_ntf, bg="#12181F", fg="white", selectcolor="#2A323D",
+                       activebackground="#12181F", font=('微軟正黑體', 9)).grid(
+                       row=0, column=0, columnspan=4, sticky='w', padx=6, pady=(4, 0))
+        tk.Label(ntf_fr, text="推播時刻", bg="#12181F", fg="white",
+                 font=('微軟正黑體', 9)).grid(row=1, column=0, sticky='e', padx=(6, 2))
+        e_ntf_t = tk.Entry(ntf_fr, width=7, bg="#2A323D", fg="white", justify="center")
+        e_ntf_t.insert(0, s['notify_hhmm']); e_ntf_t.grid(row=1, column=1, padx=2, sticky='w')
+        ntf_tf_vars = {}
+        _tf_fr = tk.Frame(ntf_fr, bg="#12181F"); _tf_fr.grid(row=1, column=2, sticky='w', padx=(12, 0))
+        tk.Label(_tf_fr, text="週期", bg="#12181F", fg="white",
+                 font=('微軟正黑體', 9)).pack(side=tk.LEFT, padx=(0, 4))
+        _on_tf = set(s['notify_timeframes'])
+        for _tf in regime_panel.PATTERN_TIMEFRAMES:
+            _v = tk.BooleanVar(value=_tf in _on_tf)
+            ntf_tf_vars[_tf] = _v
+            tk.Checkbutton(_tf_fr, text=_tf, variable=_v, bg="#12181F", fg="white",
+                           selectcolor="#2A323D", activebackground="#12181F",
+                           font=('微軟正黑體', 9)).pack(side=tk.LEFT)
+        tk.Label(ntf_fr, text="※ 一天只發一則 (含所有勾選的週期,每段都會標明週期);"
+                             "沒有偵測到任何內容的那天不發。需要先在「Telegram」設定好 bot。",
+                 bg="#12181F", fg="#8A99AD", font=('微軟正黑體', 8)).grid(
+                 row=2, column=0, columnspan=4, sticky='w', padx=6, pady=(2, 6))
 
         status = tk.Label(dlg, text="", bg="#1A2026", fg="#FFCA28", font=('微軟正黑體', 9))
         status.pack(anchor='w', padx=12)
@@ -12551,6 +12682,9 @@ class StockTradingAppPro(tk.Tk):
                 'pattern_near_pct': e_near.get().strip(),
                 'pattern_list': [pid for pid, v in pat_vars.items() if v.get()],
                 'index_only': bool(v_idx.get()),
+                'notify_enabled': bool(v_ntf.get()),
+                'notify_hhmm': e_ntf_t.get().strip(),
+                'notify_timeframes': [tf for tf, v in ntf_tf_vars.items() if v.get()],
             })
             self.sr_enabled_var.set(self.regime_settings['sr_enabled'])
             self._save_regime_settings()

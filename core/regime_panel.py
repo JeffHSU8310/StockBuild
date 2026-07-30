@@ -40,9 +40,21 @@ PERSISTENT_PATTERN_IDS = frozenset({
 # 盤勢判斷也預設只對它做 (避免翻閱自選股時被一堆個股型態通知洗版)。
 DEFAULT_INDEX_SYMBOL = '^TWII'
 
-# 型態判斷只在日 K 上成立 —— 這些型態的定義 (頸線/缺口/區間) 都是以「一天
-# 一根」為前提,套到 5 分 K 上算出來的東西沒有意義。
-PATTERN_TIMEFRAME = '日K'
+# 型態判斷成立的週期。
+#
+# ADR-120 當時只允許日K,理由是「這些型態的定義 (頸線/缺口/區間) 都是以
+# 一天一根為前提,套到 5 分 K 上算出來的東西沒有意義」。這個理由對**分鐘級**
+# 的短週期仍然成立,但 60分K 不一樣:一天只有 4~5 根,一個型態要好幾天才走完,
+# 型態的語意跟日K 是同一個量級的。
+#
+# 【ADR-132】使用者要求「額外增加對 60分K 的盤勢判斷」,所以改成一組允許清單。
+# **不要**直接開放成「任何週期都能跑」—— 5分K/15分K 會產生大量沒有意義的型態
+# 訊號,而這些訊號現在會推播到使用者手機上。
+PATTERN_TIMEFRAME = '日K'                     # 保留:舊呼叫端與預設值
+PATTERN_TIMEFRAMES = ('日K', '60分K')          # 順序即通知訊息裡的排列順序
+
+# 每日推播的預設時刻。台股 13:30 收盤,留半小時讓當天的日K 落定再發。
+DEFAULT_NOTIFY_HHMM = '14:00'
 
 PANEL_DEFAULTS = {
     'enabled': False,            # 【盤勢判斷】總開關 (主圖那顆勾選鈕)
@@ -55,6 +67,10 @@ PANEL_DEFAULTS = {
     'pattern_near_pct': market_pattern.DEFAULT_PARAMS['near_pct'],
     'pattern_list': list(market_pattern.DEFAULT_PARAMS['enabled_patterns']),
     'index_only': True,          # 只在加權指數上做型態判斷
+    # 【ADR-132】每日收盤後把盤勢判斷結果推播到手機
+    'notify_enabled': True,      # 使用者主動要求的功能,預設開
+    'notify_hhmm': DEFAULT_NOTIFY_HHMM,
+    'notify_timeframes': list(PATTERN_TIMEFRAMES),
 }
 
 PATTERN_IDS = frozenset(item['id'] for item in market_pattern.PATTERN_CATALOG)
@@ -66,6 +82,18 @@ def _int_in(v, lo, hi, default):
     except (TypeError, ValueError):
         return default
     return max(lo, min(hi, n))
+
+
+def _hhmm_or(v, default):
+    """把 'HH:MM' 正規化;格式/範圍不對回 default。"""
+    try:
+        hh, mm = str(v).strip().split(':')
+        h, m = int(hh), int(mm)
+    except (TypeError, ValueError, AttributeError):
+        return default
+    if 0 <= h < 24 and 0 <= m < 60:
+        return f"{h:02d}:{m:02d}"
+    return default
 
 
 def _float_in(v, lo, hi, default):
@@ -89,9 +117,21 @@ def normalize(raw):
     out = dict(PANEL_DEFAULTS)
     out['pattern_list'] = list(PANEL_DEFAULTS['pattern_list'])
 
-    for key in ('enabled', 'sr_enabled', 'pattern_enabled', 'index_only'):
+    for key in ('enabled', 'sr_enabled', 'pattern_enabled', 'index_only',
+                'notify_enabled'):
         if key in src:
             out[key] = bool(src[key])
+
+    # 【ADR-132】推播時刻:'HH:MM';格式不對就退回預設 (不可以讓壞設定變成
+    # 「整天不停推播」或「永遠不推播」)。
+    out['notify_hhmm'] = _hhmm_or(src.get('notify_hhmm'), PANEL_DEFAULTS['notify_hhmm'])
+    # 同 pattern_list 的區分:沒有這個欄位 → 全部週期;有但是空的 → 尊重使用者
+    # 真的把週期全取消了 (等於關掉推播內容,但保留開關語意)。
+    out['notify_timeframes'] = list(PATTERN_TIMEFRAMES)
+    if 'notify_timeframes' in src:
+        got = src.get('notify_timeframes')
+        if isinstance(got, (list, tuple, set)):
+            out['notify_timeframes'] = [tf for tf in PATTERN_TIMEFRAMES if tf in set(got)]
 
     mode = src.get('sr_range_mode')
     if mode in volume_profile.RANGE_MODES:
@@ -136,7 +176,8 @@ def should_evaluate(settings, symbol, timeframe):
     s = normalize(settings)
     if not (s['enabled'] and s['pattern_enabled']):
         return False
-    if str(timeframe or '') != PATTERN_TIMEFRAME:
+    # 【ADR-132】原本只認日K,現在多了 60分K (見 PATTERN_TIMEFRAMES 的說明)。
+    if str(timeframe or '') not in PATTERN_TIMEFRAMES:
         return False
     if s['index_only'] and not is_index_symbol(symbol):
         return False
@@ -198,3 +239,79 @@ def plan_notifications(signals, state, bar_date):
             msgs.append(text)
     return msgs, {'date': bar_date, 'oneshot': sorted(new_oneshot),
                   'persistent': new_persistent}
+
+
+# ---------------------------------------------------------------------------
+# 【ADR-132】每日收盤後的推播
+# ---------------------------------------------------------------------------
+# 使用者要求:「如果有出現相關盤勢,要用傳訊息到我的手機通知我,跟我說是什麼
+# 型態或是支撐壓力。每天一次,收盤後通知即可。」
+#
+# 為什麼判斷邏輯要放在 core:
+#   * 「現在該不該發」牽涉時刻與「今天發過沒」,是最容易寫出「一天發十次」或
+#     「永遠不發」的地方,而那兩種錯誤在 GUI 裡都很難測 —— 純函式才驗得動。
+#   * 訊息內容的組裝 (哪些週期、每個週期寫什麼) 同理。
+
+def notify_minute(settings):
+    """推播時刻換算成「距當日 0 點的分鐘數」。"""
+    s = normalize(settings)
+    hh, mm = s['notify_hhmm'].split(':')
+    return int(hh) * 60 + int(mm)
+
+
+def should_notify_now(settings, dt, last_notify_date):
+    """現在該不該送出每日推播。
+
+    三個條件:總開關與推播開關都開、已經過了設定的時刻、今天還沒送過。
+
+    **刻意用「過了時刻就送」而不是「剛好等於那一分鐘才送」**:程式可能在
+    14:00 當下沒開、或正在忙別的事而錯過那一分鐘。錯過就整天不發,對一天只發
+    一次的通知來說是最糟的失敗模式 (使用者不會知道自己漏掉了)。
+    配合 last_notify_date 的每日去重,「過了就送」不會變成重複轟炸。
+
+    dt 由呼叫端傳入 (不在這裡讀時鐘),測試才能驗邊界 (P-94)。
+    """
+    s = normalize(settings)
+    if not (s['enabled'] and s['notify_enabled']):
+        return False
+    if dt is None:
+        return False
+    try:
+        today = dt.strftime('%Y-%m-%d')
+        cur_min = dt.hour * 60 + dt.minute
+    except AttributeError:
+        return False
+    if str(last_notify_date or '') == today:
+        return False
+    return cur_min >= notify_minute(s)
+
+
+def notify_timeframes(settings):
+    """要納入每日推播的週期 (依 PATTERN_TIMEFRAMES 的順序)。"""
+    return list(normalize(settings)['notify_timeframes'])
+
+
+def format_daily_report(date_str, sections, symbol_name='加權指數'):
+    """把各週期的判斷結果組成一則推播訊息;完全沒有內容時回 None。
+
+    sections:[(timeframe, [signal dict, ...], sr_summary 或 None), ...]
+
+    **每一段一定標明週期** —— 使用者明確要求「要註明是 60分K 出現」。
+    沒有任何型態、也沒有支撐壓力摘要時回 None:一天一次的通知,沒東西講就
+    不要發,否則使用者會開始忽略它 (通知一旦變成噪音就失去意義,見 P-99)。
+    """
+    lines = []
+    for tf, signals, sr_summary in (sections or []):
+        body = []
+        for sig in (signals or []):
+            text = format_signal(sig)
+            if text:
+                body.append(text)
+        if body:
+            lines.append(f"[{tf}] 盤勢/型態:" + "；".join(body))
+        if sr_summary:
+            lines.append(f"[{tf}] 支撐壓力:{sr_summary}")
+    if not lines:
+        return None
+    head = f"【自動交易-盤勢】{symbol_name} {date_str} 收盤後盤勢判斷"
+    return head + "\n" + "\n".join(lines)
