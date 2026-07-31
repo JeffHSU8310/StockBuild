@@ -49,6 +49,7 @@ from core import market_pattern
 from core import kbars_plan
 from core import fibonacci
 from core import jae
+from core import palette
 from core import regime_panel
 from core import chips_parser
 from core import chips_features
@@ -2230,6 +2231,143 @@ class TestIndicatorSettingsPersistence(unittest.TestCase):
                 f.write("{not valid json")
             d = config_store.load_indicator_settings(path)
             self.assertEqual(d['bb_period'], 20)  # 沒有因為壞檔就整個爆掉
+
+    # ---------- 【ADR-138】新增的 key 也要真的存得起來 ----------
+
+    def test_keys_added_after_adr056_survive_a_roundtrip(self):
+        """原本 load/save 都只認 DEFAULT_INDICATOR_SETTINGS 列到的 key,於是
+        ADR-131 (布林中線類型/第2組)、ADR-133 (黃金切割)、ADR-134 (KDJ 超買賣線
+        /JAE) 的設定「存檔時被濾掉、讀檔時也被濾掉」—— 使用者每次重開都回到
+        程式碼預設值。這條測試就是釘死這件事不可以再發生。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'ind.json')
+            d = config_store.load_indicator_settings(path)
+            d.update({'bb_type': 'EMA', 'bb2_show': True, 'bb2_period': 60,
+                      'bb2_std_up': 1.5, 'bb2_std_dn': 2.5,
+                      'fib_show': True, 'fib_lookback': 77,
+                      'fib_ratios': [0.382, 0.618],
+                      'kd_ob': '85', 'var_jae': True,
+                      'jae_params': {'rsi_p': 14, 'trend_p': 60}})
+            config_store.save_indicator_settings(path, d)
+            back = config_store.load_indicator_settings(path)
+            for k in ('bb_type', 'bb2_show', 'bb2_period', 'bb2_std_up', 'bb2_std_dn',
+                      'fib_show', 'fib_lookback', 'fib_ratios', 'kd_ob', 'var_jae',
+                      'jae_params'):
+                self.assertIn(k, back, f"{k} 存了卻讀不回來")
+            self.assertEqual(back['bb_type'], 'EMA')
+            self.assertEqual(back['fib_lookback'], 77)
+            self.assertEqual(back['jae_params'], {'rsi_p': 14, 'trend_p': 60})
+
+    def test_missing_keys_still_get_defaults(self):
+        """反向對照:不能因為「什麼都保留」就把預設值機制弄丟。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'ind.json')
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump({'rsi_p': '21'}, f)
+            back = config_store.load_indicator_settings(path)
+            self.assertEqual(back['rsi_p'], '21')
+            self.assertEqual(back['bb_period'], 20)      # 預設值仍在
+            self.assertEqual(back['var_macd'], True)
+
+
+class TestBollingerSigmaMigration(unittest.TestCase):
+    """【ADR-138】布林 σ 由「內圈那對 / 外圈那對」改成「上線 σ / 下線 σ」,
+    舊設定檔要能平順遷移 (使用者手上就有一份 bb_std1=2.0 / bb_std2=3.0)。"""
+
+    def test_legacy_std1_becomes_both_sides(self):
+        out = config_store.migrate_indicator_settings(
+            {'bb_std1': 2.0, 'bb_std2': 3.0, 'bb2_std1': 1.5, 'bb2_std2': 0.0})
+        self.assertEqual(out['bb_std_up'], 2.0)
+        self.assertEqual(out['bb_std_dn'], 2.0)
+        self.assertEqual(out['bb2_std_up'], 1.5)
+        self.assertEqual(out['bb2_std_dn'], 1.5)
+
+    def test_outer_sigma_is_discarded_not_used_as_lower(self):
+        """關鍵斷言:舊的 σ2 (外圈) **不可以**被拿去當下線的 σ ——
+        那會讓使用者看到一條他從沒設定過的歪斜通道 (上 2σ、下 3σ)。"""
+        out = config_store.migrate_indicator_settings({'bb_std1': 2.0, 'bb_std2': 3.0})
+        self.assertNotEqual(out['bb_std_dn'], 3.0)
+        self.assertEqual(out['bb_std_dn'], out['bb_std_up'])
+
+    def test_new_keys_win_and_migration_is_idempotent(self):
+        src = {'bb_std1': 2.0, 'bb_std2': 3.0, 'bb_std_up': 1.0, 'bb_std_dn': 4.0}
+        out = config_store.migrate_indicator_settings(src)
+        self.assertEqual((out['bb_std_up'], out['bb_std_dn']), (1.0, 4.0))
+        again = config_store.migrate_indicator_settings(out)
+        self.assertEqual((again['bb_std_up'], again['bb_std_dn']), (1.0, 4.0))
+
+    def test_bad_or_absent_legacy_leaves_it_to_the_defaults(self):
+        for src in ({}, {'bb_std1': 'abc'}, {'bb_std1': 0}, {'bb_std1': -1}):
+            out = config_store.migrate_indicator_settings(src)
+            self.assertNotIn('bb_std_up', out, f"{src} 不該硬塞一個值進去")
+
+    def test_does_not_mutate_the_input(self):
+        src = {'bb_std1': 2.0}
+        config_store.migrate_indicator_settings(src)
+        self.assertEqual(src, {'bb_std1': 2.0})
+
+    def test_load_applies_the_migration(self):
+        """走完整讀檔路徑 —— 純函式對了但沒被呼叫是常見的空殼 (P-64)。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'old.json')
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump({'bb_show': True, 'bb_period': 10,
+                           'bb_std1': 1.5, 'bb_std2': 2.5}, f)
+            d = config_store.load_indicator_settings(path)
+            self.assertEqual(d['bb_std_up'], 1.5)
+            self.assertEqual(d['bb_std_dn'], 1.5)
+            self.assertEqual(d['bb_period'], 10)   # 其他欄位沒被弄壞
+
+
+class TestPalette255(unittest.TestCase):
+    """【ADR-138】指標線色盤:使用者要求「所有指標線的顏色可以更多選擇,
+    最好有 255 種」。"""
+
+    def test_generated_palette_has_exactly_255_colors(self):
+        self.assertEqual(len(palette.GENERATED_COLORS), 255)
+
+    def test_the_255_are_actually_in_the_palette_the_ui_uses(self):
+        """光是「產生了 255 色」沒有用,要真的接到 PALETTE / color_map ——
+        少了這條,把 PALETTE 改回只剩舊 8 色也是綠的。"""
+        cmap = palette.color_map()
+        self.assertGreaterEqual(len(palette.PALETTE), 255 + 8)
+        for label, hx in palette.GENERATED_COLORS:
+            self.assertEqual(cmap.get(label), hx, f"{label} 沒有進到下拉選單")
+
+    def test_legacy_eight_come_first_and_unchanged(self):
+        """設定檔存的是**標籤字串**,標籤一改使用者存過的顏色就全部對不上而
+        靜默退回預設色。這條測試釘死舊標籤不可以動,而且要排在最前面
+        (`list(color_map)[:6]` 是 MA1~MA6 的預設色)。"""
+        want = ["黃 (#FFCA28)", "白 (#FFFFFF)", "藍 (#29B6F6)", "紫 (#E040FB)",
+                "橘 (#FF9100)", "紅 (#FF1744)", "青 (#00E5FF)", "綠 (#00E676)"]
+        self.assertEqual(palette.labels()[:8], want)
+        self.assertEqual(list(palette.color_map())[:8], want)
+
+    def test_labels_and_hexes_are_unique(self):
+        labels = palette.labels()
+        self.assertEqual(len(labels), len(set(labels)))
+        hexes = [h for _, h in palette.PALETTE]
+        self.assertEqual(len(hexes), len(set(hexes)), "同色重複出現等於選單裡有廢選項")
+
+    def test_every_hex_is_well_formed_and_matches_its_label(self):
+        for label, hx in palette.PALETTE:
+            self.assertRegex(hx, r'^#[0-9A-F]{6}$')
+            self.assertIn(hx, label, f"{label} 的標籤與色碼對不上")
+
+    def test_no_color_is_too_dark_to_see_on_the_dark_chart(self):
+        """主圖背景是深色,亮度太低的線等於隱形 —— 那種顏色放進選單是騙人的。"""
+        for label, hx in palette.PALETTE:
+            r, g, b = (int(hx[i:i + 2], 16) for i in (1, 3, 5))
+            self.assertGreaterEqual(max(r, g, b), 0x20, f"{label} 在深色背景幾乎看不見")
+
+    def test_resolve_falls_back_to_the_embedded_hex(self):
+        """色盤日後再調整時,舊設定檔的標籤仍要還原成當初那個顏色,
+        不可以靜默變色。"""
+        self.assertEqual(palette.resolve("黃 (#FFCA28)"), "#FFCA28")
+        self.assertEqual(palette.resolve("我亂取的名字 (#123456)"), "#123456")
+        self.assertEqual(palette.resolve("完全沒有色碼", "#ABCDEF"), "#ABCDEF")
+        self.assertEqual(palette.resolve(None, "#ABCDEF"), "#ABCDEF")
+        self.assertEqual(palette.resolve("", "#ABCDEF"), "#ABCDEF")
 
 
 class TestTaifexExtendExplicitContract(unittest.TestCase):
@@ -6522,7 +6660,7 @@ class TestStopLevelIndependentOfX(unittest.TestCase):
 
 class TestBollingerTwoSets(unittest.TestCase):
     """【ADR-131】布林改成「兩組完整通道」:每組有自己的中線 (類型+期間) 與
-    自己的兩條上下線。
+    自己的上下線 (ADR-138 起,上線/下線各一個 σ)。
 
     背景:使用者實機截圖顯示主圖指標設定裡**布林那一整列不見了** (被說明文字
     蓋掉,見 diag 的 grid 版面檢查),同時要求「可以自己設定中線&上下線各2組
@@ -6570,7 +6708,9 @@ class TestBollingerTwoSets(unittest.TestCase):
 
     # ---------- bollinger_set 的數學 ----------
 
-    def test_bollinger_math(self):
+    def test_bollinger_math_upper_and_lower_use_their_own_sigma(self):
+        """【ADR-138】上線用 std_up、下線用 std_dn —— 兩個完全分開。
+        刻意用**不對稱**的 2.0/3.0：兩邊一樣的話，把 std_dn 接錯邊也不會被拓到。"""
         df = self._ohlc()
         indicators.bollinger_set(df, 20, 2.0, 3.0, ma_type='SMA', prefix='BB',
                                  with_width=True)
@@ -6578,15 +6718,28 @@ class TestBollingerTwoSets(unittest.TestCase):
         std = df['Close'].rolling(window=20).std()
         pd.testing.assert_series_equal(df['BB_MID'], mid, check_names=False)
         pd.testing.assert_series_equal(df['BB_UPPER'], mid + 2.0 * std, check_names=False)
-        pd.testing.assert_series_equal(df['BB_LOWER'], mid - 2.0 * std, check_names=False)
-        pd.testing.assert_series_equal(df['BB_UPPER2'], mid + 3.0 * std, check_names=False)
-        pd.testing.assert_series_equal(df['BB_LOWER2'], mid - 3.0 * std, check_names=False)
+        pd.testing.assert_series_equal(df['BB_LOWER'], mid - 3.0 * std, check_names=False)
+        # 寬度跟著兩邊各自的 σ 走
+        pd.testing.assert_series_equal(df['BB_WIDTH'], (5.0 * std) / mid * 100,
+                                       check_names=False)
 
-    def test_second_band_omitted_when_zero_or_same_as_first(self):
-        for sb in (0.0, 2.0):
-            df = self._ohlc()
-            indicators.bollinger_set(df, 20, 2.0, sb, prefix='BB')
-            self.assertNotIn('BB_UPPER2', df.columns, f"σb={sb} 不該畫第二條")
+    def test_no_second_pair_of_bands_anymore(self):
+        """【ADR-138】不再有「第二對上下線」—— 要第二條通道請開「第2組」。
+        舊欄位名殘留在 df 裡的話，繪圖那邊會默默多畫兩條點線。"""
+        df = self._ohlc()
+        indicators.bollinger_set(df, 20, 2.0, 3.0, prefix='BB')
+        self.assertNotIn('BB_UPPER2', df.columns)
+        self.assertNotIn('BB_LOWER2', df.columns)
+
+    def test_sigma_zero_or_bad_falls_back_to_two_not_to_a_flat_line(self):
+        """σ 填 0 / 負數 / 亂打一通 → 退回 2.0。
+        不可以照單全部用 0：那會讓上下線跟中線重疊，看起來像「布林壞了」。"""
+        df = self._ohlc()
+        indicators.bollinger_set(df, 20, 0.0, 'abc', prefix='BB')
+        mid = df['Close'].rolling(window=20).mean()
+        std = df['Close'].rolling(window=20).std()
+        pd.testing.assert_series_equal(df['BB_UPPER'], mid + 2.0 * std, check_names=False)
+        pd.testing.assert_series_equal(df['BB_LOWER'], mid - 2.0 * std, check_names=False)
 
     def test_std_always_from_close_regardless_of_middle_type(self):
         """中線可以是 EMA/WMA,但標準差一律取收盤價的 rolling std ——
@@ -6619,9 +6772,8 @@ class TestBollingerTwoSets(unittest.TestCase):
         """第1組**必須**沿用原本的欄位名 —— 繪圖/十字線/BBW 副圖都靠它們,
         改名等於一次弄壞三個地方。這條是本次改動的迴歸防線。"""
         df = self._calc(self._ohlc(), bb_show=True, bbw_show=True,
-                        bb_period=20, bb_std1=2.0, bb_std2=3.0)
-        for c in ('BB_MID', 'BB_STD', 'BB_UPPER', 'BB_LOWER', 'BB_WIDTH',
-                  'BB_UPPER2', 'BB_LOWER2'):
+                        bb_period=20, bb_std_up=2.0, bb_std_dn=3.0)
+        for c in ('BB_MID', 'BB_STD', 'BB_UPPER', 'BB_LOWER', 'BB_WIDTH'):
             self.assertIn(c, df.columns)
 
     def test_second_set_off_by_default(self):
@@ -6631,9 +6783,9 @@ class TestBollingerTwoSets(unittest.TestCase):
 
     def test_second_set_on_produces_its_own_columns(self):
         df = self._calc(self._ohlc(), bb_show=True, bb_period=20,
-                        bb2_show=True, bb2_period=60, bb2_std1=1.5, bb2_std2=2.5,
+                        bb2_show=True, bb2_period=60, bb2_std_up=1.5, bb2_std_dn=2.5,
                         bb2_type='EMA')
-        for c in ('BB2_MID', 'BB2_UPPER', 'BB2_LOWER', 'BB2_UPPER2', 'BB2_LOWER2'):
+        for c in ('BB2_MID', 'BB2_UPPER', 'BB2_LOWER'):
             self.assertIn(c, df.columns)
         # 第2組的中線是 EMA(60),跟第1組 SMA(20) 必須不同
         self.assertFalse(df['BB_MID'].equals(df['BB2_MID']))
