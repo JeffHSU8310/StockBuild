@@ -44,8 +44,13 @@ def _module_public_names(tree):
             names.add(node.name)
         elif isinstance(node, ast.Assign):
             for t in node.targets:
-                if isinstance(t, ast.Name):
-                    names.add(t.id)
+                # 【ADR-134】原本只認 `NAME = ...`,漏掉**元組拆解賦值**
+                # (`A, B, C = 1, 2, 3`) —— core/jae.py 的 COL_A/COL_J/COL_E 就是
+                # 這樣定義的,結果被誤報成「jae 沒有 COL_A 這個名稱」。
+                # 誤報比漏報更糟:它會讓人以為真的斷鏈了而去亂改程式。
+                for sub in ast.walk(t):
+                    if isinstance(sub, ast.Name):
+                        names.add(sub.id)
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             names.add(node.target.id)
         elif isinstance(node, (ast.Import, ast.ImportFrom)):

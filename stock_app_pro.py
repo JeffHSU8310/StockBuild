@@ -54,6 +54,7 @@ from core import market_pattern
 from core import kbars_plan
 # 【ADR-120】主圖【盤勢判斷】面板的純邏輯 (設定正規化 + 通知去重)。
 from core import fibonacci
+from core import jae
 from core import regime_panel
 # 【ADR-100】籌碼資料:解析純邏輯在 core/,本地 CSV 存取在 data/。
 from core import chips_parser
@@ -396,6 +397,14 @@ class StockTradingAppPro(tk.Tk):
         self.kd_n, self.kd_m1, self.kd_m2 = tk.StringVar(value="9"), tk.StringVar(value="3"), tk.StringVar(value="3")
         self.var_dmi = tk.BooleanVar(value=False)
         self.dmi_n = tk.StringVar(value="14")
+        # 【ADR-134】KDJ 的超買/超賣參考線 —— 隔壁 RSI 副圖有 80/20 兩條虛線,
+        # KDJ 一直沒有,是兩個面板之間唯一客觀的落差。
+        self.kd_ob = tk.StringVar(value="80")
+        self.kd_os = tk.StringVar(value="20")
+        # 【ADR-134】JAE 指標 (使用者自創:A=RSI、J=KDJ的J、E=長期趨勢線)
+        self.var_jae = tk.BooleanVar(value=False)
+        self.jae_params = {k: tk.StringVar(value=str(v))
+                           for k, v in jae.DEFAULT_PARAMS.items()}
         self.var_bbw = tk.BooleanVar(value=False)
         # 【ADR-011】var_inst/var_margin (法人/資券) 已移除:
         # 這兩個指標原本的資料來源是 FinMind,FinMind 已停用，故一併移除。
@@ -1363,19 +1372,17 @@ class StockTradingAppPro(tk.Tk):
                        bg="#12161A", fg="#FFCA28", selectcolor="#2A323D",
                        command=self._fib_toggle).pack(side=tk.LEFT, padx=(4, 0))
 
+        # 【ADR-134】副圖指標整合成一顆按鈕。原本工具列上一字排開 5 個勾選鈕
+        # + 4 個 ⚙,佔掉整條工具列,而且要調參數得先認得哪顆 ⚙ 是哪個指標。
+        # 使用者要求「全部整合到一個【副圖技術指標】中,要用哪一個就到這裡選」。
+        # **只有搬位置,計算與繪圖邏輯一個字都沒改** (使用者明確交代)。
         tk.Label(row_frame, text=" || 副圖:", bg="#12161A", fg="#FFCA28", font=('微軟正黑體', 9, 'bold')).pack(side=tk.LEFT, padx=(10,2))
-        indicators = [
-            ("MACD", self.var_macd, lambda: self.open_sub_settings("MACD")),
-            ("RSI", self.var_rsi, lambda: self.open_sub_settings("RSI")),
-            ("KDJ", self.var_kdj, lambda: self.open_sub_settings("KDJ")),
-            ("DMI", self.var_dmi, lambda: self.open_sub_settings("DMI")),
-            ("布林", self.var_bbw, lambda: self.trigger_redraw()), 
-        ]
-        
-        for name, var, cmd in indicators:
-            tk.Checkbutton(row_frame, text=name, variable=var, bg="#12161A", fg="white", selectcolor="#2A323D", command=self.trigger_redraw).pack(side=tk.LEFT, padx=(3,0))
-            if name in ["MACD", "RSI", "KDJ", "DMI"]:
-                tk.Button(row_frame, text="⚙", bg="#2A323D", fg="white", relief="flat", padx=2, pady=0, command=cmd).pack(side=tk.LEFT)
+        tk.Button(row_frame, text="⚙ 副圖技術指標", bg="#2A323D", fg="white", relief="flat",
+                  command=self.open_sub_indicators).pack(side=tk.LEFT, padx=2)
+        self.lbl_sub_active = tk.Label(row_frame, text="", bg="#12161A", fg="#00E676",
+                                       font=('微軟正黑體', 8))
+        self.lbl_sub_active.pack(side=tk.LEFT, padx=(4, 0))
+        self._refresh_sub_active_label()
 
         # 【ADR-120】主圖【盤勢判斷】:把原本分散兩處的「盤勢/型態偵測」
         # (原本在終極波段策略編輯器裡) 與「量價支撐壓力」(ADR-102) 合成
@@ -2630,6 +2637,10 @@ class StockTradingAppPro(tk.Tk):
             'var_kdj': self.var_kdj.get(), 'kd_n': self.kd_n.get(),
             'kd_m1': self.kd_m1.get(), 'kd_m2': self.kd_m2.get(),
             'var_dmi': self.var_dmi.get(), 'dmi_n': self.dmi_n.get(),
+            # 【ADR-134】KDJ 超買/超賣線 + JAE 指標
+            'kd_ob': self.kd_ob.get(), 'kd_os': self.kd_os.get(),
+            'var_jae': self.var_jae.get(),
+            'jae_params': {k: v.get() for k, v in self.jae_params.items()},
         }
 
     def _apply_indicator_settings(self, d):
@@ -2678,6 +2689,15 @@ class StockTradingAppPro(tk.Tk):
             self.kd_m2.set(d.get('kd_m2', self.kd_m2.get()))
             self.var_dmi.set(d.get('var_dmi', self.var_dmi.get()))
             self.dmi_n.set(d.get('dmi_n', self.dmi_n.get()))
+            # 【ADR-134】舊設定檔沒有這幾個 key → 沿用預設 (JAE 預設關閉)
+            self.kd_ob.set(d.get('kd_ob', self.kd_ob.get()))
+            self.kd_os.set(d.get('kd_os', self.kd_os.get()))
+            self.var_jae.set(d.get('var_jae', self.var_jae.get()))
+            _jp = d.get('jae_params')
+            if isinstance(_jp, dict):
+                for _k, _v in jae.normalize_params(_jp).items():
+                    if _k in self.jae_params:
+                        self.jae_params[_k].set(str(_v))
         except Exception:
             pass  # 讀檔壞掉不影響已經是程式碼預設值的變數,圖表照樣畫得出來
 
@@ -2787,7 +2807,129 @@ class StockTradingAppPro(tk.Tk):
 
         tk.Button(dlg, text="確認並套用 (並記住此設定)", bg="#29B6F6", fg="black", font=('微軟正黑體', 10, 'bold'), command=_apply_main).grid(row=19, column=0, columnspan=4, pady=15)
 
+    # 【ADR-134】副圖指標清單:(顯示名, 開關變數名, [(標籤, 變數名), ...])。
+    # 這一份同時決定「整合對話框裡有哪幾列」與「工具列旁邊顯示哪幾個已開啟」,
+    # 新增副圖指標時只要動這裡 —— 兩份各自維護遲早分歧 (P-67)。
+    SUB_INDICATORS = (
+        ('MACD', 'var_macd', (('快線', 'macd_f'), ('慢線', 'macd_s'), ('訊號', 'macd_sig'))),
+        ('RSI', 'var_rsi', (('天數', 'rsi_p'),)),
+        ('KDJ', 'var_kdj', (('N 天', 'kd_n'), ('M1 (K)', 'kd_m1'), ('M2 (D)', 'kd_m2'),
+                            ('超買', 'kd_ob'), ('超賣', 'kd_os'))),
+        ('DMI', 'var_dmi', (('週期 (N)', 'dmi_n'),)),
+        ('布林通道寬', 'var_bbw', ()),
+    )
+
+    def _refresh_sub_active_label(self):
+        """工具列上顯示目前開了哪幾個副圖 —— 勾選鈕收進對話框之後,
+        不顯示的話使用者得開對話框才知道自己開了什麼。"""
+        try:
+            on = [name for name, var, _ in self.SUB_INDICATORS
+                  if getattr(self, var).get()]
+            if self.var_jae.get():
+                on.append('JAE')
+            self.lbl_sub_active.config(text=("：" + "、".join(on)) if on else "：(未選)")
+        except Exception:
+            pass
+
+    def open_sub_indicators(self):
+        """【ADR-134】副圖技術指標整合視窗:開關 + 參數都在這裡。
+
+        使用者要求「全部整合到一個【副圖技術指標】中,要使用哪一個就到這裡面
+        去選擇」,並且明確交代「**只有移動整合,沒有改其他的功能**」——
+        所以這裡用的是**原本那些 tk 變數**,計算與繪圖一個字都沒改;
+        新增的只有 JAE 這個新指標,以及 KDJ 的超買/超賣參考線。
+        """
+        dlg = tk.Toplevel(self)
+        dlg.title("副圖技術指標")
+        dlg.configure(bg="#1A2026")
+        self.center_window(dlg, 620, 560)
+        dlg.transient(self); dlg.grab_set()
+
+        tk.Label(dlg, text="勾選要顯示的副圖指標,右邊直接調參數", bg="#1A2026",
+                 fg="#FFCA28", font=('微軟正黑體', 10, 'bold')).pack(anchor='w', padx=14, pady=(10, 6))
+
+        body = tk.Frame(dlg, bg="#1A2026"); body.pack(fill=tk.X, padx=14)
+        for r, (name, var_name, fields) in enumerate(self.SUB_INDICATORS):
+            fr = tk.Frame(body, bg="#1A2026")
+            fr.grid(row=r, column=0, sticky='w', pady=3)
+            tk.Checkbutton(fr, text=name, variable=getattr(self, var_name),
+                           bg="#1A2026", fg="white", selectcolor="#2A323D",
+                           font=('微軟正黑體', 9, 'bold'), width=11, anchor='w').pack(side=tk.LEFT)
+            for lbl, v_name in fields:
+                tk.Label(fr, text=lbl, bg="#1A2026", fg="#8A99AD",
+                         font=('微軟正黑體', 8)).pack(side=tk.LEFT, padx=(6, 2))
+                tk.Entry(fr, textvariable=getattr(self, v_name), width=5, bg="#2A323D",
+                         fg="white", justify="center").pack(side=tk.LEFT)
+            if not fields:
+                tk.Label(fr, text="(無參數;寬度取主圖第1組布林)", bg="#1A2026", fg="#8A99AD",
+                         font=('微軟正黑體', 8)).pack(side=tk.LEFT, padx=(6, 0))
+
+        # ---- JAE (新指標) ----
+        ttk.Separator(dlg, orient='horizontal').pack(fill=tk.X, padx=14, pady=(10, 6))
+        jae_fr = tk.LabelFrame(dlg, text=" JAE 指標 (A=RSI／J=KDJ的J／E=長期趨勢線) ",
+                               bg="#12181F", fg="#00E5FF", font=('微軟正黑體', 9, 'bold'))
+        jae_fr.pack(fill=tk.X, padx=14)
+        tk.Checkbutton(jae_fr, text="顯示 JAE 副圖", variable=self.var_jae,
+                       bg="#12181F", fg="white", selectcolor="#2A323D",
+                       font=('微軟正黑體', 9, 'bold')).grid(row=0, column=0, columnspan=4,
+                                                            sticky='w', padx=6, pady=(4, 2))
+        _keys = list(jae.DEFAULT_PARAMS.keys())
+        for i, k in enumerate(_keys):
+            tk.Label(jae_fr, text=jae.PARAM_LABELS[k], bg="#12181F", fg="white",
+                     font=('微軟正黑體', 8)).grid(row=1 + i // 2, column=(i % 2) * 2,
+                                                  sticky='e', padx=(6, 2), pady=1)
+            tk.Entry(jae_fr, textvariable=self.jae_params[k], width=6, bg="#2A323D",
+                     fg="white", justify="center").grid(row=1 + i // 2, column=(i % 2) * 2 + 1,
+                                                        sticky='w', padx=(0, 10), pady=1)
+        tk.Label(jae_fr, text="※ E = A(RSI) 的長期 EMA,跟 A/J 同尺度才交叉得起來;"
+                             "趨勢要「E 在中線之上」且「E 這幾根在上升」兩個都成立才算向上。\n"
+                             "　 交叉:J×A 短線、A×E 中期、J×E 極短線;"
+                             "快線由下往上穿慢線=黃金交叉。判讀用,不會自動下單。",
+                 bg="#12181F", fg="#8A99AD", font=('微軟正黑體', 8), justify='left').grid(
+                 row=1 + (len(_keys) + 1) // 2, column=0, columnspan=4, sticky='w',
+                 padx=6, pady=(4, 6))
+
+        status = tk.Label(dlg, text="", bg="#1A2026", fg="#FFCA28", font=('微軟正黑體', 9))
+        status.pack(anchor='w', padx=14, pady=(6, 0))
+
+        def _apply(close=False):
+            self._save_indicator_settings()
+            self._refresh_sub_active_label()
+            self.trigger_redraw()
+            if self.var_jae.get():
+                self.safe_after(300, self._jae_log_summary)
+            if close:
+                dlg.destroy()
+            else:
+                status.config(text="✓ 已套用並儲存", fg="#00E676")
+
+        btns = tk.Frame(dlg, bg="#1A2026"); btns.pack(fill=tk.X, padx=14, pady=10)
+        tk.Button(btns, text="套用", bg="#2A323D", fg="white", relief="flat",
+                  font=('微軟正黑體', 10), padx=16, pady=3,
+                  command=lambda: _apply(False)).pack(side=tk.LEFT)
+        tk.Button(btns, text="確認並套用 (並記住此設定)", bg="#29B6F6", fg="black", relief="flat",
+                  font=('微軟正黑體', 10, 'bold'), padx=14, pady=3,
+                  command=lambda: _apply(True)).pack(side=tk.LEFT, padx=6)
+        tk.Button(btns, text="關閉", bg="#2A323D", fg="white", relief="flat",
+                  font=('微軟正黑體', 10), padx=16, pady=3,
+                  command=dlg.destroy).pack(side=tk.RIGHT)
+
+    def _jae_params_now(self):
+        """從 tk 變數讀出 JAE 參數 (值域由 core 夾)。"""
+        return jae.normalize_params({k: v.get() for k, v in self.jae_params.items()})
+
+    def _jae_log_summary(self):
+        """把 JAE 的現值、趨勢與最近的交叉寫進系統日誌。"""
+        df = getattr(self, 'full_calculated_df', None)
+        if df is None or jae.COL_A not in getattr(df, 'columns', []):
+            return
+        r = jae.evaluate(df, self._jae_params_now(), lookback=3)
+        if r:
+            self.log_message(f"【JAE】{jae.summarize(r)}")
+
     def open_sub_settings(self, ind):
+        """【ADR-134 起不再由工具列呼叫】保留單一指標的參數視窗:
+        整合視窗才是入口,但這個函式沒有壞掉的理由,留著給日後需要時用。"""
         dlg = tk.Toplevel(self); dlg.title(f"{ind} 參數設定"); dlg.configure(bg="#1A2026"); self.center_window(dlg, 250, 180); dlg.transient(self); dlg.grab_set()
         frame = tk.Frame(dlg, bg="#1A2026"); frame.pack(expand=True, pady=10)
         if ind == "MACD":
@@ -2829,7 +2971,7 @@ class StockTradingAppPro(tk.Tk):
         QUICK_DAYS = {"日K": 45, "周K": 240, "月K": 600}   # 快取第一段小範圍
 
         try:
-            return core_indicators.calculate_indicators(
+            out = core_indicators.calculate_indicators(
                 df, ma_flags, ma_types, ma_periods,
                 bb_period=self.bb_period.get(), bb_std1=self.bb_std1.get(), bb_std2=self.bb_std2.get(),
                 bb_type=self.bb_type.get(),
@@ -2837,6 +2979,7 @@ class StockTradingAppPro(tk.Tk):
                 bb2_std1=self.bb2_std1.get(), bb2_std2=self.bb2_std2.get(),
                 bb2_type=self.bb2_type.get(),
                 **common_kwargs)
+            return self._attach_jae(out)
         except TypeError:
             # 【第十輪修正 問題1】使用者機器上的 core/indicators.py 若還是舊版
             # (沒有 bb_period 等新參數),新主程式傳新參數會 TypeError,導致
@@ -2847,8 +2990,22 @@ class StockTradingAppPro(tk.Tk):
                 self._bb_param_warned = True
                 self.log_message("【版本提示】core/indicators.py 是舊版:布林自訂參數暫不生效 (固定20,2)。"
                                  "請把新版 indicators.py 覆蓋到 G:/StockBuild/core/indicators.py 後重啟。")
-            return core_indicators.calculate_indicators(
-                df, ma_flags, ma_types, ma_periods, **common_kwargs)
+            return self._attach_jae(core_indicators.calculate_indicators(
+                df, ma_flags, ma_types, ma_periods, **common_kwargs))
+
+    def _attach_jae(self, df):
+        """【ADR-134】JAE 沒開就完全不算 (省時間,也不會在 df 裡多塞欄位)。
+
+        算不出來只記一次日誌就放過 —— 一個副圖指標壞掉不可以害整張 K 線圖
+        畫不出來 (同支撐壓力/黃金切割的處理)。"""
+        try:
+            if self.var_jae.get():
+                jae.compute(df, self._jae_params_now())
+        except Exception as e:
+            if not getattr(self, '_jae_warned', False):
+                self._jae_warned = True
+                self.log_message(f"【JAE】計算失敗 ({type(e).__name__}: {e}),本次略過。")
+        return df
 
     # ================= 🚀 大盤與櫃買指數 API 數據滿載化 =================
     def fetch_market_indices_worker(self):
@@ -5517,7 +5674,28 @@ class StockTradingAppPro(tk.Tk):
                 apds.append(mpf.make_addplot(df['K'], panel=current_panel, color='#FFFFFF', ylabel='KDJ'))
                 apds.append(mpf.make_addplot(df['D'], panel=current_panel, color='#FFCA28'))
                 apds.append(mpf.make_addplot(df['J'], panel=current_panel, color='#E040FB'))
+                # 【ADR-134】超買/超賣參考線。隔壁 RSI 副圖一直有 80/20 兩條虛線,
+                # KDJ 沒有 —— 那是兩個面板之間唯一客觀的落差,補上。
+                for _lvl_var in (self.kd_ob, self.kd_os):
+                    try:
+                        _lvl = float(_lvl_var.get())
+                    except (TypeError, ValueError):
+                        continue
+                    apds.append(mpf.make_addplot([_lvl] * len(df), panel=current_panel,
+                                                 color='#333333', linestyle='--'))
                 active_panels['KDJ'] = current_panel; panel_ratios.append(1.2); current_panel += 1
+
+            # 【ADR-134】JAE:A(RSI) / J(KDJ的J) / E(長期趨勢線) 三條 + 中性基準線
+            if self.var_jae.get() and jae.COL_A in df.columns:
+                apds.append(mpf.make_addplot(df[jae.COL_A], panel=current_panel,
+                                             color='#FFCA28', ylabel='JAE'))
+                apds.append(mpf.make_addplot(df[jae.COL_J], panel=current_panel, color='#E040FB'))
+                apds.append(mpf.make_addplot(df[jae.COL_E], panel=current_panel,
+                                             color='#00E5FF', width=1.6))
+                _mid = self._jae_params_now()['midline']
+                apds.append(mpf.make_addplot([_mid] * len(df), panel=current_panel,
+                                             color='#333333', linestyle='--'))
+                active_panels['JAE'] = current_panel; panel_ratios.append(1.2); current_panel += 1
 
             if self.var_dmi.get() and 'ADX' in df.columns:
                 apds.append(mpf.make_addplot(df['+DI'], panel=current_panel, color='#FF1744', ylabel='DMI'))
@@ -5587,6 +5765,7 @@ class StockTradingAppPro(tk.Tk):
                 'KDJ': ['K', 'D', 'J'],
                 'DMI': ['+DI', '-DI', 'ADX'],
                 'BBW': ['BB_WIDTH'],
+                'JAE': [jae.COL_A, jae.COL_J, jae.COL_E],
             }
             
             adj_str = "(還原)" if self.var_adjusted.get() and self.asset_type == "stock" else ""
@@ -5689,6 +5868,16 @@ class StockTradingAppPro(tk.Tk):
                     segs.append({'obj': o, 'fmt': lambda row: (f"D: {row['D']:.2f}" if 'D' in row and not np.isnan(row['D']) else None)})
                     o = ax.text(0.25, 0.90, '', transform=ax.transAxes, color='#E040FB', **sub_text_props)
                     segs.append({'obj': o, 'fmt': lambda row: (f"J: {row['J']:.2f}" if 'J' in row and not np.isnan(row['J']) else None)})
+                elif name == 'JAE':
+                    # 【ADR-134】三條線各一段,顏色跟線一致 (A黃 / J紫 / E青)
+                    for _x, _col, _c, _nm in ((0.01, jae.COL_A, '#FFCA28', 'A'),
+                                              (0.11, jae.COL_J, '#E040FB', 'J'),
+                                              (0.21, jae.COL_E, '#00E5FF', 'E')):
+                        o = ax.text(_x, 0.90, '', transform=ax.transAxes, color=_c, **sub_text_props)
+                        segs.append({'obj': o,
+                                     'fmt': (lambda row, _cc=_col, _n=_nm:
+                                             (f"{_n}: {row[_cc]:.2f}"
+                                              if _cc in row and not np.isnan(row[_cc]) else None))})
                 elif name == 'DMI':
                     o = ax.text(0.01, 0.90, '', transform=ax.transAxes, color='#FF1744', **sub_text_props)
                     segs.append({'obj': o, 'fmt': lambda row: (f"+DI: {row['+DI']:.2f}" if '+DI' in row and not np.isnan(row['+DI']) else None)})

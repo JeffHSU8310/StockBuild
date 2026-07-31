@@ -92,6 +92,30 @@ def bollinger_set(df: pd.DataFrame, period, std_a, std_b, ma_type='SMA',
     return df
 
 
+def rsi(close: pd.Series, period) -> pd.Series:
+    """【ADR-134】RSI。算式與 calculate_indicators 內原本那段**逐字相同**
+    (Wilder 平滑 = ewm(com=p-1)),抽出來是為了讓 JAE 指標共用同一份 ——
+    兩份各自維護遲早分歧 (P-67)。"""
+    p = int(period)
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(com=p - 1, adjust=False).mean()
+    loss = (-1 * delta.clip(upper=0)).ewm(com=p - 1, adjust=False).mean()
+    return 100 - (100 / (1 + (gain / loss)))
+
+
+def kdj(df: pd.DataFrame, n, m1, m2):
+    """【ADR-134】KDJ,回傳 (rsv, k, d, j)。算式與原本那段逐字相同:
+    RSV = (C - Ln) / (Hn - Ln) * 100;K/D 用 ewm(com=m-1)(m=3 時 α=1/3,
+    即 K = (1/3)RSV + (2/3)K_prev,標準 KDJ);J = 3K - 2D。"""
+    n, m1, m2 = int(n), int(m1), int(m2)
+    low_min = df['Low'].rolling(window=n).min()
+    high_max = df['High'].rolling(window=n).max()
+    rsv = 100 * (df['Close'] - low_min) / (high_max - low_min)
+    k = rsv.ewm(com=m1 - 1, adjust=False).mean()
+    d = k.ewm(com=m2 - 1, adjust=False).mean()
+    return rsv, k, d, 3 * k - 2 * d
+
+
 def calculate_indicators(
     df: pd.DataFrame,
     ma_flags,        # list[bool] 長度6, 對應 MA1~MA6 是否啟用
@@ -143,19 +167,11 @@ def calculate_indicators(
             df['Signal'] = df['MACD'].ewm(span=sig, adjust=False).mean()
             df['Hist'] = df['MACD'] - df['Signal']
         if rsi_show:
-            p = int(rsi_p)
-            delta = df['Close'].diff()
-            gain = delta.clip(lower=0).ewm(com=p - 1, adjust=False).mean()
-            loss = (-1 * delta.clip(upper=0)).ewm(com=p - 1, adjust=False).mean()
-            df['RSI'] = 100 - (100 / (1 + (gain / loss)))
+            # 【ADR-134】改呼叫抽出來的 rsi()/kdj();算式一字未改,
+            # 仍然待在原本這個共用的 try/except 裡 (P-29 刻意保留的既有耦合)。
+            df['RSI'] = rsi(df['Close'], rsi_p)
         if kdj_show:
-            n, m1, m2 = int(kd_n), int(kd_m1), int(kd_m2)
-            low_min = df['Low'].rolling(window=n).min()
-            high_max = df['High'].rolling(window=n).max()
-            df['RSV'] = 100 * (df['Close'] - low_min) / (high_max - low_min)
-            df['K'] = df['RSV'].ewm(com=m1 - 1, adjust=False).mean()
-            df['D'] = df['K'].ewm(com=m2 - 1, adjust=False).mean()
-            df['J'] = 3 * df['K'] - 2 * df['D']
+            df['RSV'], df['K'], df['D'], df['J'] = kdj(df, kd_n, kd_m1, kd_m2)
         if dmi_show:
             n = int(dmi_n)
             up_m = df['High'].diff()
