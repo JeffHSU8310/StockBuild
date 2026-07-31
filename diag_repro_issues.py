@@ -5210,6 +5210,198 @@ run_case("ADR-132: 盤勢判斷每日收盤後推播到手機 (含60分K,標明�
          _regime_daily_notify_132)
 
 
+def _fib_and_auto_regime_133():
+    """【ADR-133】(1) 主圖黃金切割律 (2) 盤勢判斷不必人工切換週期就自動判斷。
+
+    使用者要求:
+      「1.主圖指標,再增加黃金切割律(費波南係數)這個功能。
+        2.主圖切到 60分K 時系統日誌才出現盤勢判斷 —— 我要不需要我人工切換,
+          你就可以自動判斷。(日K也是希望可以做到這一點)」
+
+    走**完整的 GUI 路徑**:純函式測不到「畫圖有沒有真的呼叫」與「背景掃描
+    有沒有真的不看主圖現在顯示什麼」(P-64)。
+    """
+    import pandas as _pd
+    from core import fibonacci as _fib
+    from core import regime_panel as _rp
+
+    class FakeContract:
+        code = 'TSE'
+        symbol = '^TWII'
+
+    # ---------- A. 黃金切割:畫圖路徑 ----------
+    _n = 160
+    _closes = [20000.0 + i * 30 for i in range(_n)]          # 明確的上升段
+    DF = _pd.DataFrame(
+        {'Open': _closes, 'High': [c + 40 for c in _closes],
+         'Low': [c - 40 for c in _closes], 'Close': _closes,
+         'Volume': [10000] * _n},
+        index=_pd.date_range('2026-01-01', periods=_n, freq='D'))
+
+    drawn = []
+
+    class FakeAx:
+        def axhline(self, y=None, **k):
+            drawn.append(float(y))
+        def text(self, *a, **k):
+            pass
+        def get_yaxis_transform(self):
+            return None
+
+    orig_show = app.fib_show.get()
+    orig_ratios = list(app.fib_ratios)
+    orig_lb = app.fib_lookback.get()
+    orig_log = app.log_message
+    logs = []
+    try:
+        app.log_message = lambda m: (logs.append(str(m)), orig_log(m))[0]
+
+        # 1. 沒勾就什麼都不畫 (反向對照 —— 否則「永遠畫」也會讓下一條綠)
+        app.fib_show.set(False)
+        drawn.clear()
+        app._draw_fib_levels(FakeAx(), DF)
+        assert not drawn, f"沒勾黃金切割不該畫任何線,實際畫了 {len(drawn)} 條"
+        assert app._fib_last_result is None
+
+        # 2. 勾了要畫出每一條選取的比率
+        app.fib_show.set(True)
+        app.fib_ratios = list(_fib.DEFAULT_LEVELS)
+        app.fib_lookback.set(120)
+        drawn.clear()
+        app._draw_fib_levels(FakeAx(), DF)
+        assert len(drawn) == len(_fib.DEFAULT_LEVELS), \
+            f"應該畫 {len(_fib.DEFAULT_LEVELS)} 條,實際 {len(drawn)}"
+        r = app._fib_last_result
+        assert r and r['swing']['trend'] == _fib.TREND_UP, \
+            f"這段資料是上升段,實際判成 {r and r['swing']['trend']}"
+        # 價位必須落在區間內,而且 0.618 的位置要對
+        hi, lo = r['swing']['high'], r['swing']['low']
+        for y in drawn:
+            assert lo - 1e-6 <= y <= hi + 1e-6, f"回撤價位 {y} 落在高低點之外"
+        _g = [lv for lv in r['levels'] if abs(lv['ratio'] - 0.618) < 1e-9][0]
+        assert abs(_g['price'] - (hi - (hi - lo) * 0.618)) < 1e-6, "0.618 的價位算錯"
+
+        # 3. 只勾兩條就只畫兩條 (設定真的有生效)
+        app.fib_ratios = [0.382, 0.618]
+        drawn.clear()
+        app._draw_fib_levels(FakeAx(), DF)
+        assert len(drawn) == 2, f"只勾兩條就該只畫兩條,實際 {len(drawn)}"
+
+        # 4. 摘要要講得出關鍵價位
+        logs.clear()
+        app._fib_log_summary()
+        assert [m for m in logs if m.startswith('【黃金切割】')], "應寫入系統日誌"
+        assert any('0.618' in m for m in logs), f"摘要要含 0.618: {logs[:2]}"
+
+        # 5. 壞資料不可以害整張圖畫不出來
+        #
+        # 【注意語意】黃金切割沿用支撐壓力的 _sr_source_df():「可見範圍」模式下
+        # 它回傳的是 self.plot_df (使用者縮放後看得到的那一段),**不是**傳進來的
+        # raw_df —— 這是刻意的,切割線要跟著畫面上的區間走。所以要驗「資料不足」
+        # 必須把 plot_df 也一起清掉,否則測到的是上一個案例殘留的資料
+        # (第一版就是這樣紅的)。
+        app.fib_ratios = list(_fib.DEFAULT_LEVELS)
+        _orig_plot = getattr(app, 'plot_df', None)
+        try:
+            drawn.clear()
+            app._draw_fib_levels(FakeAx(), None)     # 不可以拋例外
+            assert not drawn, "raw_df=None 不該畫線"
+            app.plot_df = None
+            app._draw_fib_levels(FakeAx(), DF.iloc[:3])
+            assert not drawn, "資料不足時不該畫線,但也不該爆炸"
+        finally:
+            app.plot_df = _orig_plot
+    finally:
+        app.fib_show.set(orig_show)
+        app.fib_ratios = orig_ratios
+        app.fib_lookback.set(orig_lb)
+        app.log_message = orig_log
+
+    # ---------- B. 盤勢判斷自動掃描 (不看主圖現在顯示什麼) ----------
+    scanned = []
+    logs2 = []
+    orig_log2 = app.log_message
+    orig_fetch = app._qt_fetch_closed_bars
+    orig_resolve_watch = app._qt_resolve_watch
+    orig_login, orig_api = app.api_logged_in, app.sj_api
+    orig_settings = app.regime_settings
+    orig_state = app._regime_notify_state
+    orig_tf = app.timeframe_var.get()
+    orig_sym = app.current_symbol
+    orig_slots = getattr(app, '_regime_scan_slots', None)
+    _msess = stock_app_pro.market_session
+    orig_stock_open = _msess.is_stock_open
+
+    def _fake_fetch(_s, _c, _a, tf=None, **_k):
+        scanned.append(tf)
+        return DF
+
+    try:
+        app.log_message = lambda m: (logs2.append(str(m)), orig_log2(m))[0]
+        app._qt_resolve_watch = lambda _s: (FakeContract(), 'index_tw', '^TWII', '台股')
+        app._qt_fetch_closed_bars = _fake_fetch
+        app.api_logged_in = True; app.sj_api = object()
+        app.regime_settings = _rp.normalize({'enabled': True, 'pattern_enabled': True})
+        app._regime_notify_state = {}
+        app._regime_scan_slots = {}
+        _msess.is_stock_open = lambda *a, **k: True
+        # 【關鍵】主圖刻意停在一個**完全無關**的商品與週期上 ——
+        # 自動掃描不該受它影響,這正是使用者要的「不用人工切換」。
+        app.timeframe_var.set('5分K')
+        app.current_symbol = '2330'
+
+        _t1 = stock_app_pro.datetime(2026, 3, 10, 10, 5)
+        scanned.clear(); logs2.clear()
+        app._regime_auto_scan_pass(now_dt=_t1)
+        app.flush_after()
+        assert set(scanned) == set(_rp.PATTERN_TIMEFRAMES), \
+            f"日K 與 60分K 都要自動掃,實際掃了 {scanned}"
+        _hits = [m for m in logs2 if m.startswith('【盤勢判斷】')]
+        assert _hits, "自動掃描到型態要寫進系統日誌"
+        assert any('日K' in m for m in _hits) or any('60分K' in m for m in _hits), \
+            f"日誌要標明週期: {_hits[:2]}"
+
+        # 同一根K棒內不可以重掃 (省 API,同 ADR-127 的教訓)
+        scanned.clear()
+        app._regime_auto_scan_pass(now_dt=_t1)
+        assert not scanned, f"同一格不該重抓,實際又抓了 {scanned}"
+
+        # 跨到下一根 60分K 就要重掃 (反向對照:不可以掃一次就再也不掃)
+        scanned.clear()
+        app._regime_auto_scan_pass(now_dt=stock_app_pro.datetime(2026, 3, 10, 11, 5))
+        assert '60分K' in scanned, f"跨到新的一根 60分K 要重掃,實際 {scanned}"
+
+        # 收盤後不掃 (資料不再變動;收盤那一輪由每日推播收尾)
+        _msess.is_stock_open = lambda *a, **k: False
+        app._regime_scan_slots = {}
+        scanned.clear()
+        app._regime_auto_scan_pass(now_dt=stock_app_pro.datetime(2026, 3, 10, 15, 5))
+        assert not scanned, f"收盤後不該持續掃,實際 {scanned}"
+
+        # 總開關關掉就完全不掃
+        _msess.is_stock_open = lambda *a, **k: True
+        app.regime_settings = _rp.normalize({'enabled': False, 'pattern_enabled': True})
+        app._regime_scan_slots = {}
+        scanned.clear()
+        app._regime_auto_scan_pass(now_dt=_t1)
+        assert not scanned, "盤勢判斷總開關關著就不該掃"
+    finally:
+        app.log_message = orig_log2
+        app._qt_fetch_closed_bars = orig_fetch
+        app._qt_resolve_watch = orig_resolve_watch
+        app.api_logged_in, app.sj_api = orig_login, orig_api
+        app.regime_settings = orig_settings
+        app._regime_notify_state = orig_state
+        app.timeframe_var.set(orig_tf)
+        app.current_symbol = orig_sym
+        app._regime_scan_slots = orig_slots or {}
+        _msess.is_stock_open = orig_stock_open
+
+
+run_case("ADR-133: 主圖黃金切割律 + 盤勢判斷自動掃描 (不必人工切換週期)",
+         _fib_and_auto_regime_133)
+
+
 print(f"{'案例':60s} 結果")
 print("-" * 76)
 for name, st, msg in results:
