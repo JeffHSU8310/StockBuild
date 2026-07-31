@@ -999,13 +999,33 @@ class TestTradeTypeAndAbsStops(unittest.TestCase):
         intent = strategy_engine.check_intrabar_futures_stop(s, rt, 44350.0)  # 跌52點<70點
         self.assertIsNone(intent)
 
-    def test_intrabar_futures_stop_ignored_for_stocks(self):
+    def test_intrabar_stop_now_applies_to_stocks(self):
+        """【ADR-135】原本這條測「股票不適用即時停損」。使用者要求
+        「停損停利點數到了,就立即執行,不需要等待到收盤」且沒有限定商品別,
+        所以規則反過來了:**股票也要即時觸發**。同一組數字、相反的期待。"""
         s = strategy_engine.new_strategy()
         s.update({'name': 'ST', 'symbol': '2330', 'trade_type': '股票', 'stop_loss_abs': 5.0})
         rt = strategy_engine.new_runtime()
         rt.update({'state': 'LONG', 'qty': 1, 'exec_entry_price': 600.0})
-        intent = strategy_engine.check_intrabar_futures_stop(s, rt, 500.0)  # 跌100元遠超5元
-        self.assertIsNone(intent)  # 股票不受此新機制影響,維持K棒收盤才判定
+        intent = strategy_engine.check_intrabar_stop(s, rt, 500.0)   # 跌100元遠超5元
+        self.assertIsNotNone(intent, "股票也要即時停損 (ADR-135)")
+        self.assertEqual(intent['kind'], 'CLOSE')
+        # 反向對照:沒到停損點就不可以出場 (否則等於一有部位就砍)
+        self.assertIsNone(strategy_engine.check_intrabar_stop(s, rt, 597.0))
+
+    def test_intrabar_stop_applies_to_odd_lot_too(self):
+        s = strategy_engine.new_strategy()
+        s.update({'name': 'ODD', 'symbol': '2330', 'trade_type': '零股',
+                  'take_profit_abs': 10.0})
+        rt = strategy_engine.new_runtime()
+        rt.update({'state': 'LONG', 'qty': 100, 'exec_entry_price': 600.0})
+        self.assertIsNotNone(strategy_engine.check_intrabar_stop(s, rt, 615.0))
+        self.assertIsNone(strategy_engine.check_intrabar_stop(s, rt, 605.0))
+
+    def test_legacy_alias_still_points_at_the_same_function(self):
+        """舊名 check_intrabar_futures_stop 留成別名,既有呼叫端不必一次全改。"""
+        self.assertIs(strategy_engine.check_intrabar_futures_stop,
+                      strategy_engine.check_intrabar_stop)
 
     def test_intrabar_futures_stop_ignored_when_flat(self):
         s = strategy_engine.new_strategy()
@@ -7116,6 +7136,57 @@ class TestJAE(unittest.TestCase):
     def test_evaluate_returns_none_without_columns(self):
         self.assertIsNone(jae.evaluate(self._rising()))
         self.assertIsNone(jae.evaluate(None))
+
+
+
+class TestPriceTypeSharedRule(unittest.TestCase):
+    """【ADR-135】委託方式的規則抽成 validate_price_type(),內建與自訂策略共用。
+
+    這一份的依據是**交易所規則**(範圍市價僅期貨、零股只能限價/鐵則6),
+    分歧的後果是送出去會被券商退的委託 —— 所以只能有一份。
+    """
+
+    def _s(self, tt, pt):
+        s = strategy_engine.new_strategy()
+        s.update({'trade_type': tt, 'price_type': pt})
+        return s
+
+    def test_futures_can_use_all_three(self):
+        for pt in strategy_engine.PRICE_TYPES:
+            ok, why = strategy_engine.validate_price_type(self._s('期貨', pt))
+            self.assertTrue(ok, f"期貨 {pt} 應該可以: {why}")
+
+    def test_range_market_is_futures_only(self):
+        for tt in ('股票', '零股'):
+            ok, why = strategy_engine.validate_price_type(self._s(tt, '範圍市價'))
+            self.assertFalse(ok, f"{tt} 不該允許範圍市價")
+            self.assertIn('範圍市價', why)
+
+    def test_odd_lot_is_limit_only(self):
+        """鐵則6:零股依交易所規則只能限價。"""
+        for pt in ('市價', '範圍市價'):
+            ok, why = strategy_engine.validate_price_type(self._s('零股', pt))
+            self.assertFalse(ok, f"零股不該允許 {pt}")
+        ok, _ = strategy_engine.validate_price_type(self._s('零股', '限價'))
+        self.assertTrue(ok)
+
+    def test_stock_allows_limit_and_market(self):
+        for pt in ('限價', '市價'):
+            ok, why = strategy_engine.validate_price_type(self._s('股票', pt))
+            self.assertTrue(ok, f"股票 {pt} 應該可以: {why}")
+
+    def test_unknown_price_type_rejected(self):
+        ok, why = strategy_engine.validate_price_type(self._s('股票', '亂填'))
+        self.assertFalse(ok)
+
+    def test_validate_strategy_still_uses_the_same_rule(self):
+        """反向對照:抽出去之後,內建策略的驗證不可以就此失效。"""
+        s = self._s('零股', '市價')
+        s.update({'name': 'X', 'symbol': '2330', 'qty': 1, 'timeframe': '5分K',
+                  'direction': '做多', 'stop_loss_pct': 2.0})
+        ok, why = strategy_engine.validate_strategy(s)
+        self.assertFalse(ok)
+        self.assertIn('零股', why)
 
 
 

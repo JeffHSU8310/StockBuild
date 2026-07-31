@@ -754,6 +754,24 @@ def price_type_of(strategy):
     return pt
 
 
+def validate_price_type(strategy):
+    """【ADR-135】委託方式的規則,回傳 (ok, 原因)。
+
+    抽出來的理由:自訂策略的編輯器也要用同一套規則檢查 (ADR-135 讓自訂策略
+    可以選委託方式)。兩份各自維護遲早分歧,而這一份的依據是**交易所規則**
+    (範圍市價僅期貨、零股只能限價/鐵則6) —— 分歧的後果是送出會被退的委託。
+    """
+    tt = trade_type_of(strategy)
+    pt = (strategy or {}).get('price_type', '限價')
+    if pt not in PRICE_TYPES:
+        return False, f"委託方式僅支援 {'/'.join(PRICE_TYPES)}"
+    if pt in FUTURES_ONLY_PRICE_TYPES and tt != '期貨':
+        return False, "範圍市價僅期貨支援 (股票/零股交易所規則沒有這個委託方式)"
+    if tt == '零股' and pt != '限價':
+        return False, "零股依交易所規則只能限價 (鐵則6,不可用市價/範圍市價)"
+    return True, ""
+
+
 # 【ADR-074 看A做B】A (訊號來源) 可選的種類:比交易種類多一個「指數」。
 WATCH_TRADE_TYPES = ('股票', '期貨', '指數')
 
@@ -859,13 +877,9 @@ def validate_strategy(s):
     tt = trade_type_of(s)
     if tt not in TRADE_TYPES:
         return False, "交易種類僅支援 股票 / 零股 / 期貨"
-    pt = s.get('price_type', '限價')
-    if pt not in PRICE_TYPES:
-        return False, f"委託方式僅支援 {'/'.join(PRICE_TYPES)}"
-    if pt in FUTURES_ONLY_PRICE_TYPES and tt != '期貨':
-        return False, "範圍市價僅期貨支援 (股票/零股交易所規則沒有這個委託方式)"
-    if tt == '零股' and pt != '限價':
-        return False, "零股依交易所規則只能限價 (鐵則6,不可用市價/範圍市價)"
+    ok, why = validate_price_type(s)
+    if not ok:
+        return False, why
     if not is_valid_timeframe(s.get('timeframe')):
         return False, f"週期格式不正確 (可選 {'/'.join(VALID_TIMEFRAMES)},或自訂 N分K/N時K,例如 45分K、3時K)"
     if s.get('direction') not in ('做多', '做空'):
@@ -1415,8 +1429,8 @@ def include_night_of(strategy):
     return s.get('futures_session', 'day_night') != 'day'
 
 
-def check_intrabar_futures_stop(strategy, runtime, live_price):
-    """【新ADR】期貨即時停損/停利:不等K棒收盤,即時價 (呼叫端傳入下單商品B的
+def check_intrabar_stop(strategy, runtime, live_price):
+    """【新ADR / ADR-135】即時停損停利:不等K棒收盤,即時價 (呼叫端傳入下單商品B的
     最新市價快照) 一觸及使用者設定的停損%/停利%/停損點數/停利點數,立刻回傳
     CLOSE intent (不等下一根K棒)。
 
@@ -1426,18 +1440,22 @@ def check_intrabar_futures_stop(strategy, runtime, live_price):
     runtime['exec_entry_price'] (B的實際成交均價,apply_fill 寫入) 對比 B 的
     即時價,基準與畫面上的損益完全一致,且不受K棒收盤節奏限制。
 
-    只在期貨 (trade_type_of=='期貨') 且目前有部位時檢查;股票/零股維持原有
-    「K棒收盤才判定」的行為不變 (使用者這次只要求期貨即時,原本設計並非缺陷,
-    是另一種取捨,不擴大改動範圍)。與 evaluate_strategy() 內建的K棒收盤停損/
-    停利 (以A為準) 各自獨立、互不影響——不管哪一邊先觸發,觸發後 state 變
-    FLAT,另一邊下次評估時 state!=LONG/SHORT 自然是 no-op。
+    【ADR-135】原本只對**期貨**生效,股票/零股維持「K棒收盤才判定」。
+    使用者要求:「停損停利點數到了,就立即執行,不需要等待到收盤。」——
+    沒有限定商品別,所以這裡拿掉交易種類的限制,**股票/零股/期貨一律適用**。
+
+    > 這是刻意的行為變更:既有的股票策略若設了停損%/停利%/停損元/停利元,
+    > 從此會在盤中觸價就出場,而不是等該週期K棒收盤。這正是使用者要的,
+    > 但它會改變既有股票策略的成交時點,所以在 ADR-135 明確記錄。
+
+    與 evaluate_strategy() 內建的K棒收盤停損/停利 (以A為準) 各自獨立、
+    互不影響——不管哪一邊先觸發,觸發後 state 變 FLAT,另一邊下次評估時
+    state!=LONG/SHORT 自然是 no-op。
 
     回傳 intent dict 或 None (未觸發/不適用)。"""
     # 【ADR-123】自己管出場的策略種類一律不適用 —— 見 OWN_EXIT_KINDS 的說明。
     # 放在最前面:這是「這條規則對這檔策略根本不適用」,不是「條件沒觸發」。
     if has_own_exit_logic(strategy):
-        return None
-    if trade_type_of(strategy) != '期貨':
         return None
     state = runtime.get('state', 'FLAT')
     if state not in ('LONG', 'SHORT'):
@@ -1462,3 +1480,9 @@ def check_intrabar_futures_stop(strategy, runtime, live_price):
     if tp_abs > 0 and move_abs >= tp_abs:
         return _close_intent(runtime, live_price, f"即時停利出場 (損益 {move_abs:+.2f}點 ≥ {tp_abs}點)")
     return None
+
+
+# 【ADR-135】舊名保留成別名:這個函式從「只做期貨」變成「所有商品別」之後,
+# 名字裡的 futures 已經名不副實 (P-100 講過的坑)。新程式碼請用
+# check_intrabar_stop;舊名留著讓既有呼叫端不必一次全改。
+check_intrabar_futures_stop = check_intrabar_stop
