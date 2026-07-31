@@ -6839,10 +6839,20 @@ class StockTradingAppPro(tk.Tk):
                     bool(self.api_logged_in), bool(self._qt_running), self.strategies))
             if cmd == '/list':
                 return self._tg_reply(telegram_control.list_text(self.strategies))
+            # 【ADR-137】查詢類支援「只看某個帳戶」——使用者的原話是
+            # 「我要看目前 XX 帳號的損益」。不帶參數時維持原本的全部列出。
             if cmd == '/positions':
-                return self._tg_reply(self._tg_positions_text())
+                return self._tg_reply(self._tg_positions_text(arg))
             if cmd == '/pnl':
-                return self._tg_reply(self._tg_pnl_text())
+                return self._tg_reply(self._tg_pnl_text(arg))
+            if cmd == '/accounts':
+                return self._tg_reply(self._tg_accounts_text())
+            if cmd == '/strategy':
+                st, why = telegram_control.match_strategy(self.strategies, arg)
+                if st is None:
+                    return self._tg_reply(f'❌ {why}')
+                return self._tg_reply(telegram_control.strategy_detail_text(
+                    st, self._qt_runtime(st['id'])))
             if cmd == '/yes':
                 return self._tg_confirm(arg)
 
@@ -6961,18 +6971,45 @@ class StockTradingAppPro(tk.Tk):
                      '\n提醒:自動交易總開關目前是關閉的,策略不會實際運作。')
             return self._tg_reply(f'🟢 已啟用策略「{name}」({mode})。{tail}{extra}')
 
-    def _tg_positions_text(self):
+    def _tg_pick_account(self, arg):
+        """【ADR-137】把指令參數解析成單一帳戶。回傳 (帳戶 或 None, 錯誤訊息 或 None)。
+
+        沒帶參數 → (None, None) 代表「全部帳戶」,不是錯誤。
+        """
+        if not str(arg or '').strip():
+            return None, None
+        accts = getattr(self, 'paper_accts', None) or {}
+        acct, why = telegram_control.match_account(accts, arg)
+        if acct is None:
+            return None, f'❌ {why}'
+        return acct, None
+
+    def _tg_positions_text(self, arg=''):
         try:
-            return telegram_control.positions_text(getattr(self, 'paper_accts', None) or {})
+            acct, err = self._tg_pick_account(arg)
+            if err:
+                return err
+            return telegram_control.positions_text(
+                getattr(self, 'paper_accts', None) or {}, only=acct)
         except Exception as e:
             return f'❌ 查詢持倉失敗:{type(e).__name__}'
 
-    def _tg_pnl_text(self):
+    def _tg_pnl_text(self, arg=''):
         try:
+            acct, err = self._tg_pick_account(arg)
+            if err:
+                return err
             return telegram_control.pnl_text(getattr(self, 'paper_accts', None) or {},
-                                             datetime.now().strftime('%Y-%m-%d'))
+                                             datetime.now().strftime('%Y-%m-%d'),
+                                             only=acct)
         except Exception as e:
             return f'❌ 查詢損益失敗:{type(e).__name__}'
+
+    def _tg_accounts_text(self):
+        try:
+            return telegram_control.accounts_text(getattr(self, 'paper_accts', None) or {})
+        except Exception as e:
+            return f'❌ 查詢帳戶失敗:{type(e).__name__}'
 
     def _telegram_test_send(self, bot_token, chat_id, text, status_cb):
         """設定視窗的「測試發送」用:直接用畫面上目前 (可能還沒存檔) 的

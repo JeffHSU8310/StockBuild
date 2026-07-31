@@ -7418,5 +7418,136 @@ class TestCustomStrategyStopsInBacktest(unittest.TestCase):
 
 
 
+class TestTelegramQueryCommands(unittest.TestCase):
+    """【ADR-137】手機問「我要看目前 XX 帳號的損益」——雙向查詢。
+
+    ADR-108 已經有雙向的骨架 (getUpdates 輪詢 + 白名單 + /status /pnl …),
+    這一輪補的是「**指定對象**」:帳戶要能挑、策略要能看細節。
+    """
+
+    def _acct(self, aid, name, realized=0.0, with_pos=False):
+        """帳戶一律用 paper_account 的正式建構子與 apply_fill 產生。
+
+        第一版自己拼 dict:先是參數順序傳錯,改好之後又因為手拼的持倉少了
+        `market`/`share_per_unit` 等欄位,`equity()` 直接 KeyError。
+        **測試資料的形狀要由產生它的正式程式碼決定**,不要自己捏。
+        """
+        a = paper_account.new_account(name=name, account_id=aid)
+        a['realized_pnl'] = realized
+        if with_pos:
+            paper_account.apply_fill(a, '2026-07-31', '台股', '2330',
+                                     '買進', 'OPEN', 1, 600.0, trade_type='股票')
+        return a
+
+    def _accts(self):
+        return {'a1': self._acct('a1', '主帳戶', 1000.0),
+                'a2': self._acct('a2', '測試帳戶', -500.0, with_pos=True)}
+
+    # ---------- 帳戶比對 ----------
+
+    def test_match_by_index_and_name(self):
+        accts = self._accts()
+        a, why = telegram_control.match_account(accts, '2')
+        self.assertIsNotNone(a, why)
+        self.assertEqual(a['name'], '測試帳戶')
+        a2, _ = telegram_control.match_account(accts, '主帳戶')
+        self.assertEqual(a2['id'], 'a1')
+
+    def test_partial_name_works(self):
+        a, why = telegram_control.match_account(self._accts(), '測試')
+        self.assertIsNotNone(a, why)
+        self.assertEqual(a['id'], 'a2')
+
+    def test_ambiguous_name_is_rejected(self):
+        """多個符合時要求講清楚 —— 回錯帳戶的損益會直接誤導決策。"""
+        accts = {'a1': self._acct('a1', '測試A'), 'a2': self._acct('a2', '測試B')}
+        a, why = telegram_control.match_account(accts, '測試')
+        self.assertIsNone(a)
+        self.assertIn('請用編號', why)
+
+    def test_unknown_and_empty(self):
+        self.assertIsNone(telegram_control.match_account(self._accts(), '不存在')[0])
+        self.assertIsNone(telegram_control.match_account(self._accts(), '')[0])
+        self.assertIsNone(telegram_control.match_account({}, '1')[0])
+        self.assertIsNone(telegram_control.match_account(self._accts(), '99')[0])
+
+    def test_index_order_is_stable(self):
+        """編號要穩定 —— 每次問同一個編號必須是同一個帳戶,否則遠端指令會指錯。"""
+        accts = self._accts()
+        first = [telegram_control.match_account(accts, '1')[0]['id'] for _ in range(5)]
+        self.assertEqual(set(first), {first[0]})
+
+    # ---------- 只看一個帳戶 ----------
+
+    def test_pnl_filters_to_one_account(self):
+        accts = self._accts()
+        acct, _ = telegram_control.match_account(accts, '測試帳戶')
+        one = telegram_control.pnl_text(accts, '2026-07-31', only=acct)
+        self.assertIn('測試帳戶', one)
+        self.assertNotIn('主帳戶', one)
+        # 反向對照:不帶 only 要列出全部 (原本的行為不可以被弄壞)
+        allt = telegram_control.pnl_text(accts, '2026-07-31')
+        self.assertIn('主帳戶', allt)
+        self.assertIn('測試帳戶', allt)
+
+    def test_positions_filters_to_one_account(self):
+        accts = self._accts()
+        acct, _ = telegram_control.match_account(accts, '1')      # 主帳戶,無持倉
+        self.assertIn('無持倉', telegram_control.positions_text(accts, only=acct))
+        acct2, _ = telegram_control.match_account(accts, '2')
+        self.assertIn('2330', telegram_control.positions_text(accts, only=acct2))
+
+    def test_accounts_text_lists_numbers(self):
+        txt = telegram_control.accounts_text(self._accts())
+        self.assertIn('1.', txt)
+        self.assertIn('主帳戶', txt)
+        self.assertIn('/pnl', txt, '要告訴使用者查詢時可以怎麼打')
+        self.assertIn('沒有任何模擬帳戶', telegram_control.accounts_text({}))
+
+    # ---------- 策略詳情 ----------
+
+    def test_strategy_detail_has_settings_and_state(self):
+        """設定決定它會做什麼、狀態決定它現在在做什麼 —— 少一半都要再問一次。"""
+        s = strategy_engine.new_strategy()
+        s.update({'name': '測試策略', 'symbol': '2330', 'trade_type': '股票',
+                  'timeframe': '15分K', 'qty': 2, 'enabled': True, 'mode': '模擬',
+                  'price_type': '市價', 'stop_loss_pct': 2.0, 'intrabar_stop': True})
+        rt = strategy_engine.new_runtime()
+        rt.update({'state': 'LONG', 'qty': 2, 'exec_entry_price': 600.0})
+        txt = telegram_control.strategy_detail_text(s, rt)
+        for need in ('測試策略', '2330', '15分K', '市價', '停損 2.0%', 'LONG', '即時觸發'):
+            self.assertIn(need, txt, f'策略詳情缺少「{need}」')
+
+    def test_strategy_detail_is_safe_without_runtime(self):
+        s = strategy_engine.new_strategy()
+        s['name'] = 'X'
+        self.assertIn('無', telegram_control.strategy_detail_text(s, None))
+        self.assertIn('找不到', telegram_control.strategy_detail_text(None))
+
+    # ---------- 指令表 ----------
+
+    def test_new_commands_are_registered_and_readonly(self):
+        """新增的查詢指令一律 readonly —— 查詢絕不可以變成會動錢的指令。"""
+        for c in ('/accounts', '/strategy'):
+            self.assertIn(c, telegram_control.COMMANDS)
+            self.assertEqual(telegram_control.command_kind(c),
+                             telegram_control.CMD_READONLY, c)
+            self.assertFalse(telegram_control.needs_confirm(c))
+        self.assertIn('/accounts', telegram_control.help_text())
+
+    def test_parse_command_accepts_args_for_queries(self):
+        self.assertEqual(telegram_control.parse_command('/pnl 主帳戶'), ('/pnl', '主帳戶'))
+        self.assertEqual(telegram_control.parse_command('/strategy 2'), ('/strategy', '2'))
+        # 未授權/非指令仍然不理會
+        self.assertEqual(telegram_control.parse_command('我要看損益')[0], None)
+
+    def test_still_no_order_command(self):
+        """反向對照:雙向查詢擴充之後,**仍然不可以有下單指令**
+        (ADR-108 的安全設計:遠端只能控制策略要不要跑,不能直接動錢)。"""
+        for bad in ('/buy', '/sell', '/order', '/close'):
+            self.assertNotIn(bad, telegram_control.COMMANDS)
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

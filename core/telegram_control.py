@@ -47,8 +47,10 @@ CONFIRM_CODE_LEN = 4
 COMMANDS = {
     '/status':    (CMD_READONLY, '查詢系統狀態 (登入/總開關/啟用中策略數)'),
     '/list':      (CMD_READONLY, '列出所有策略與其啟用狀態'),
-    '/positions': (CMD_READONLY, '查詢目前持倉'),
-    '/pnl':       (CMD_READONLY, '查詢今日損益'),
+    '/positions': (CMD_READONLY, '/positions [帳號] 查詢持倉 (不帶=全部帳戶)'),
+    '/pnl':       (CMD_READONLY, '/pnl [帳號] 查詢今日損益 (不帶=全部帳戶)'),
+    '/accounts':  (CMD_READONLY, '列出所有模擬帳戶 (查詢時可用編號或名稱)'),
+    '/strategy':  (CMD_READONLY, '/strategy <策略名或編號> 查該策略的完整設定與狀態'),
     '/off':       (CMD_SAFE_WRITE, '/off <策略名或編號> 停用某策略'),
     '/stop_all':  (CMD_SAFE_WRITE, '緊急停止:關閉自動交易總開關'),
     '/on':        (CMD_RISKY, '/on <策略名或編號> 啟用某策略 (需確認)'),
@@ -192,14 +194,14 @@ def list_text(strategies):
     return '\n'.join(lines)
 
 
-def positions_text(accounts):
+def positions_text(accounts, only=None):
     """模擬帳戶持倉清單。accounts 是 {account_id: 帳戶dict} 或帳戶 list。
 
     刻意**只報模擬帳戶**:實單庫存要打券商 API,那是 GUI 層的事,而且遠端
     查詢不該觸發券商流量 (鐵則 5 的精神)。文末明講這件事,免得使用者誤以為
     「Telegram 顯示無持倉」等於「實單也沒有持倉」。
     """
-    accts = list((accounts or {}).values()) if isinstance(accounts, dict) else list(accounts or [])
+    accts = [only] if only is not None else _acct_list(accounts)
     lines = ['📦 模擬帳戶持倉']
     any_pos = False
     for acct in accts:
@@ -218,9 +220,16 @@ def positions_text(accounts):
     return '\n'.join(lines)
 
 
-def pnl_text(accounts, day):
-    """模擬帳戶損益。day 形如 '2026-07-26',由呼叫端給 (純函式不看時鐘)。"""
-    accts = list((accounts or {}).values()) if isinstance(accounts, dict) else list(accounts or [])
+def pnl_text(accounts, day, only=None):
+    """模擬帳戶損益。day 形如 '2026-07-26',由呼叫端給 (純函式不看時鐘)。
+
+    【ADR-137】only 帶入單一帳戶 dict 時只報那一個 —— 使用者的原話是
+    「我要看目前**XX帳號**的損益」,帳戶多的時候全部列出來反而要自己找。
+    """
+    if only is not None:
+        accts = [only]
+    else:
+        accts = _acct_list(accounts)
     if not accts:
         return '目前沒有任何模擬帳戶'
     lines = [f'💰 模擬帳戶損益 ({day})']
@@ -234,6 +243,104 @@ def pnl_text(accounts, day):
             f"累計已實現 {float(acct.get('realized_pnl', 0.0)):+,.0f}")
     lines.append('')
     lines.append('※ 未實現以最後一次標記價計算,非即時報價。')
+    return '\n'.join(lines)
+
+
+def _acct_list(accounts):
+    """把 {id: 帳戶} 或 list 統一成 list,順序穩定 (編號才不會每次都變)。"""
+    if isinstance(accounts, dict):
+        return [accounts[k] for k in sorted(accounts.keys(), key=str)]
+    return list(accounts or [])
+
+
+def match_account(accounts, arg):
+    """【ADR-137】依「編號」或「名稱」找模擬帳戶。回傳 (帳戶 dict 或 None, 說明)。
+
+    比對規則刻意與 match_strategy 一致 (編號 / 完全符合 / 唯一部分符合),
+    使用者只要學一套。多個符合時要求講清楚 —— 遠端沒有畫面可以確認,
+    回錯帳戶的損益會直接誤導決策。
+    """
+    items = _acct_list(accounts)
+    if not items:
+        return None, '目前沒有任何模擬帳戶'
+    key = str(arg or '').strip()
+    if not key:
+        return None, '請指定帳戶編號或名稱 (先用 /accounts 查看)'
+    if key.isdigit():
+        i = int(key)
+        if 1 <= i <= len(items):
+            return items[i - 1], ''
+        return None, f'編號超出範圍 (目前有 {len(items)} 個帳戶)'
+    def _nm(a):
+        return str((a or {}).get('name', '') or '').strip()
+    exact = [a for a in items if _nm(a) == key]
+    if len(exact) == 1:
+        return exact[0], ''
+    partial = [a for a in items if key in _nm(a) or key == str((a or {}).get('id', ''))]
+    if len(partial) == 1:
+        return partial[0], ''
+    if len(partial) > 1:
+        names = '、'.join(_nm(a) for a in partial[:5])
+        return None, f'有多個帳戶符合「{key}」:{names};請用編號指定'
+    return None, f'找不到帳戶「{key}」(先用 /accounts 查看)'
+
+
+def accounts_text(accounts):
+    """【ADR-137】列出模擬帳戶與編號,讓使用者知道 /pnl 後面可以打什麼。"""
+    items = _acct_list(accounts)
+    if not items:
+        return '目前沒有任何模擬帳戶'
+    lines = ['🏦 模擬帳戶']
+    for i, a in enumerate(items, 1):
+        lines.append(f"{i}. {a.get('name', a.get('id', '?'))}"
+                     f"  權益 {paper_account.equity(a):,.0f}")
+    lines.append('')
+    lines.append('用法:/pnl 1 或 /pnl 帳戶名稱;/positions 同理。')
+    return '\n'.join(lines)
+
+
+def strategy_detail_text(strategy, runtime=None):
+    """【ADR-137】單一策略的完整設定與目前狀態。
+
+    使用者在手機上問「這檔策略現在怎麼樣」時,需要的是**設定 + 狀態**兩塊:
+    設定決定它會做什麼,狀態決定它現在在做什麼。只給其中一半都要再問一次。
+    """
+    if not strategy:
+        return '❌ 找不到策略'
+    s = strategy
+    rt = runtime or {}
+    tf = s.get('timeframe', '?')
+    lines = [f"📋 {s.get('name', '?')}"]
+    lines.append(f"狀態:{'✅ 啟用' if s.get('enabled') else '⬜ 停用'}"
+                 f"｜模式:{s.get('mode', '模擬')}")
+    lines.append(f"商品:{s.get('symbol', '?')} ({s.get('trade_type', '?')}) "
+                 f"{tf} x{s.get('qty', 0)}")
+    if s.get('watch_enabled'):
+        lines.append(f"看A做B:訊號看 {s.get('watch_symbol', '?')} "
+                     f"{s.get('watch_timeframe', tf)}")
+    lines.append(f"委託方式:{s.get('price_type', '限價')}"
+                 f"｜讓價 {s.get('slippage_ticks', 0)} 檔")
+    _sl, _tp = s.get('stop_loss_pct', 0), s.get('take_profit_pct', 0)
+    _sla, _tpa = s.get('stop_loss_abs', 0), s.get('take_profit_abs', 0)
+    _risk = []
+    if _sl:
+        _risk.append(f'停損 {_sl}%')
+    if _sla:
+        _risk.append(f'停損 {_sla}')
+    if _tp:
+        _risk.append(f'停利 {_tp}%')
+    if _tpa:
+        _risk.append(f'停利 {_tpa}')
+    lines.append('風控:' + ('、'.join(_risk) if _risk else '(未設,由出場訊號/程式碼決定)'))
+    lines.append(f"即時觸發:{'是 (盤中觸價就出場)' if s.get('intrabar_stop') else '否 (等K棒收盤)'}")
+    lines.append(f"每日上限 {s.get('max_trades_per_day', '?')} 次"
+                 f"｜冷卻 {s.get('cooldown_sec', '?')} 秒")
+    st = rt.get('state', 'FLAT')
+    if st in ('LONG', 'SHORT'):
+        lines.append(f"目前部位:{st} {rt.get('qty', 0)} @ {rt.get('exec_entry_price', 0)}")
+    else:
+        lines.append('目前部位:無')
+    lines.append(f"今日進場 {int(rt.get('trades_today', 0) or 0)} 次")
     return '\n'.join(lines)
 
 
