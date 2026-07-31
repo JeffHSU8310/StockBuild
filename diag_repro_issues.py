@@ -5402,6 +5402,157 @@ run_case("ADR-133: 主圖黃金切割律 + 盤勢判斷自動掃描 (不必人�
          _fib_and_auto_regime_133)
 
 
+def _sub_indicators_and_jae_134():
+    """【ADR-134】(1) 副圖指標整合成一個入口 (2) JAE 新指標 (3) KDJ 超買超賣線。
+
+    使用者要求:
+      「1.把主圖上方列的各種技術指數全部整合到一個【副圖技術指標】中。
+        **切記,只有移動整合,沒有改其他的功能。**
+        2.再新增一個 KDJ 指標 & JAE 指標。」
+
+    「只有移動整合」是這個案例最重要的守門:**整合前後,同一組設定畫出來的
+    副圖必須一模一樣**。所以第一段是拿整合前的行為當基準去比對。
+    """
+    import pandas as _pd
+    from core import jae as _jae
+    from core import indicators as _ind
+
+    _n = 200
+    _c = [100.0 + i * 0.5 + (3.0 if i % 4 == 0 else -2.0) for i in range(_n)]
+    DF = _pd.DataFrame(
+        {'Open': _c, 'High': [x + 2 for x in _c], 'Low': [x - 2 for x in _c],
+         'Close': _c, 'Volume': [1000 + (i % 7) * 50 for i in range(_n)]},
+        index=_pd.date_range('2026-01-01', periods=_n, freq='D'))
+
+    _saved = {}
+    for _v in ('var_macd', 'var_rsi', 'var_kdj', 'var_dmi', 'var_bbw', 'var_jae'):
+        _saved[_v] = getattr(app, _v).get()
+    _saved_jae = {k: v.get() for k, v in app.jae_params.items()}
+    orig_log = app.log_message
+    logs = []
+
+    try:
+        app.log_message = lambda m: (logs.append(str(m)), orig_log(m))[0]
+
+        # ---- 1. 【只有移動整合】既有指標的計算結果不可以變 ----
+        # 用同一組設定,拿 core 的算式當基準逐欄比對。
+        for _v in ('var_macd', 'var_rsi', 'var_kdj', 'var_dmi', 'var_bbw'):
+            getattr(app, _v).set(True)
+        app.var_jae.set(False)
+        out = app.calculate_custom_indicators(DF)
+        for _col in ('MACD', 'Signal', 'Hist', 'RSI', 'K', 'D', 'J',
+                     '+DI', '-DI', 'ADX', 'BB_WIDTH'):
+            assert _col in out.columns, f"整合後 {_col} 不見了 (只該搬位置,不該改功能)"
+        # 【基準必須獨立】不可以拿 _ind.rsi() 當基準去比 out['RSI'] ——
+        # 兩邊都是同一個函式,把那個函式改壞這條斷言照樣綠 (突變測試抓到的)。
+        # 這裡把算式**原地重寫一遍**,才是真的「整合前後結果一樣」的證據。
+        _p_rsi = int(app.rsi_p.get())
+        _delta = DF['Close'].diff()
+        _gain = _delta.clip(lower=0).ewm(com=_p_rsi - 1, adjust=False).mean()
+        _loss = (-1 * _delta.clip(upper=0)).ewm(com=_p_rsi - 1, adjust=False).mean()
+        _pd.testing.assert_series_equal(
+            out['RSI'], 100 - (100 / (1 + (_gain / _loss))), check_names=False)
+        _kn, _km1, _km2 = int(app.kd_n.get()), int(app.kd_m1.get()), int(app.kd_m2.get())
+        _lo = DF['Low'].rolling(window=_kn).min()
+        _hi = DF['High'].rolling(window=_kn).max()
+        _rsv = 100 * (DF['Close'] - _lo) / (_hi - _lo)
+        _k = _rsv.ewm(com=_km1 - 1, adjust=False).mean()
+        _d = _k.ewm(com=_km2 - 1, adjust=False).mean()
+        _pd.testing.assert_series_equal(out['K'], _k, check_names=False)
+        _pd.testing.assert_series_equal(out['D'], _d, check_names=False)
+        _pd.testing.assert_series_equal(out['J'], 3 * _k - 2 * _d, check_names=False)
+        # JAE 沒開就不可以在 df 裡多塞欄位
+        assert _jae.COL_A not in out.columns, "沒開 JAE 就不該算它 (省時間也不留垃圾欄位)"
+
+        # ---- 2. 整合入口存在,而且涵蓋每一個既有指標 ----
+        _names = [n for n, _v, _f in app.SUB_INDICATORS]
+        for _need in ('MACD', 'RSI', 'KDJ', 'DMI'):
+            assert _need in _names, f"整合清單漏了 {_need}"
+        assert any('布林' in n for n in _names), "整合清單漏了布林通道寬"
+        # 清單裡的變數/欄位名都要真的存在 (打錯字會在開視窗時才爆炸)
+        for _n2, _var, _fields in app.SUB_INDICATORS:
+            assert hasattr(app, _var), f"{_n2} 的開關變數 {_var} 不存在"
+            for _lbl, _fv in _fields:
+                assert hasattr(app, _fv), f"{_n2} 的參數變數 {_fv} 不存在"
+        assert hasattr(app, 'open_sub_indicators'), "缺少整合視窗的入口"
+
+        # ---- 3. 工具列不可以再有各自的勾選鈕 (那就是「整合」的定義) ----
+        _src = open('stock_app_pro.py', encoding='utf-8').read()
+        assert 'open_sub_indicators' in _src
+        assert '("MACD", self.var_macd, lambda: self.open_sub_settings("MACD"))' not in _src, \
+            "工具列的舊指標清單應已移除 (整合到【副圖技術指標】)"
+
+        # ---- 4. KDJ 超買/超賣線:設定存在且可調 ----
+        assert hasattr(app, 'kd_ob') and hasattr(app, 'kd_os'), "KDJ 應有超買/超賣設定"
+        assert ('KDJ', 'var_kdj') == tuple(
+            [x[:2] for x in app.SUB_INDICATORS if x[0] == 'KDJ'][0][:2])
+        _kdj_fields = [f for n, v, fs in app.SUB_INDICATORS if n == 'KDJ' for f in fs]
+        assert any(fv == 'kd_ob' for _l, fv in _kdj_fields), "超買線要能在整合視窗調"
+        assert any(fv == 'kd_os' for _l, fv in _kdj_fields), "超賣線要能在整合視窗調"
+
+        # ---- 5. JAE:打開才算,三條線都要有 ----
+        app.var_jae.set(True)
+        out2 = app.calculate_custom_indicators(DF)
+        for _col in (_jae.COL_A, _jae.COL_J, _jae.COL_E):
+            assert _col in out2.columns, f"JAE 缺 {_col}"
+        # A 必須就是 RSI、J 必須就是 KDJ 的 J (使用者的定義,不可以自己另算一份)
+        _p = app._jae_params_now()
+        _pd.testing.assert_series_equal(
+            out2[_jae.COL_A], _ind.rsi(DF['Close'], _p['a_period']), check_names=False)
+        _, _, _, _j2 = _ind.kdj(DF, _p['j_n'], _p['j_m1'], _p['j_m2'])
+        _pd.testing.assert_series_equal(out2[_jae.COL_J], _j2, check_names=False)
+
+        # ---- 6. JAE 參數真的有作用 (否則「可自行設定」是假的) ----
+        app.jae_params['a_period'].set('5')
+        out3 = app.calculate_custom_indicators(DF)
+        # 先把欄位名取成區域變數再用 —— 直接寫 out3[_jae.COL_A].equals(...) 會被
+        # diag_crossref 的啟發式誤判成「呼叫 _jae.COL_A()」而誤報跨模組斷鏈。
+        _ca = _jae.COL_A
+        assert not out3[_ca].equals(out2[_ca]), "改了 A 的期數,A 這條線必須跟著變"
+        app.jae_params['a_period'].set(str(_jae.DEFAULT_PARAMS['a_period']))
+
+        # ---- 7. 壞參數不可以害整張 K 線圖畫不出來 ----
+        app.jae_params['a_period'].set('abc')
+        out4 = app.calculate_custom_indicators(DF)
+        assert 'RSI' in out4.columns and 'MACD' in out4.columns, \
+            "JAE 參數打錯字,其他指標仍然要算得出來"
+        app.jae_params['a_period'].set(str(_jae.DEFAULT_PARAMS['a_period']))
+
+        # ---- 8. JAE 摘要寫進系統日誌 ----
+        app.full_calculated_df = app.calculate_custom_indicators(DF)
+        logs.clear()
+        app._jae_log_summary()
+        _hit = [m for m in logs if m.startswith('【JAE】')]
+        assert _hit, "JAE 應該寫一行摘要到系統日誌"
+        assert '趨勢' in _hit[0], f"摘要要講出趨勢: {_hit[0]}"
+
+        # ---- 9. 工具列的「目前開了哪些」標籤要跟著更新 ----
+        app._refresh_sub_active_label()
+        _txt = app.lbl_sub_active.cget('text')
+        assert 'JAE' in _txt and 'MACD' in _txt, f"標籤要列出已開啟的副圖: {_txt}"
+        app.var_jae.set(False); app.var_macd.set(False)
+        for _v in ('var_rsi', 'var_kdj', 'var_dmi', 'var_bbw'):
+            getattr(app, _v).set(False)
+        app._refresh_sub_active_label()
+        assert '未選' in app.lbl_sub_active.cget('text'), \
+            f"全部關掉要顯示未選: {app.lbl_sub_active.cget('text')}"
+    finally:
+        app.log_message = orig_log
+        for _v, _val in _saved.items():
+            getattr(app, _v).set(_val)
+        for _k, _val in _saved_jae.items():
+            app.jae_params[_k].set(_val)
+        app.__dict__.pop('_jae_warned', None)
+        try:
+            app._refresh_sub_active_label()
+        except Exception:
+            pass
+
+
+run_case("ADR-134: 副圖指標整合入口 + JAE 新指標 + KDJ 超買超賣線",
+         _sub_indicators_and_jae_134)
+
+
 print(f"{'案例':60s} 結果")
 print("-" * 76)
 for name, st, msg in results:

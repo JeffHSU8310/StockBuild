@@ -48,6 +48,7 @@ from core import telegram_control
 from core import market_pattern
 from core import kbars_plan
 from core import fibonacci
+from core import jae
 from core import regime_panel
 from core import chips_parser
 from core import chips_features
@@ -6887,6 +6888,234 @@ class TestFibonacci(unittest.TestCase):
         self.assertEqual(fibonacci.ratio_label(0.618), '0.618')
         self.assertEqual(fibonacci.ratio_label(1.0), '1')
         self.assertEqual(fibonacci.ratio_label(0.0), '0')
+
+
+
+class TestIndicatorHelpersExtracted(unittest.TestCase):
+    """【ADR-134】RSI/KDJ 抽成可重用函式後,結果必須與抽出前**逐位元相同**。
+
+    這是純重構的迴歸防線:JAE 要共用同一份算式,但不可以順手改動既有指標。
+    """
+
+    def _ohlc(self, n=120):
+        idx = pd.date_range('2026-01-01', periods=n, freq='D')
+        rng = np.random.default_rng(11)
+        close = 100 + np.cumsum(rng.normal(0, 1, n))
+        return pd.DataFrame({'Open': close, 'High': close + 1.5,
+                             'Low': close - 1.5, 'Close': close}, index=idx)
+
+    def test_rsi_matches_the_inline_formula(self):
+        df = self._ohlc()
+        p = 14
+        delta = df['Close'].diff()
+        gain = delta.clip(lower=0).ewm(com=p - 1, adjust=False).mean()
+        loss = (-1 * delta.clip(upper=0)).ewm(com=p - 1, adjust=False).mean()
+        expect = 100 - (100 / (1 + (gain / loss)))
+        pd.testing.assert_series_equal(indicators.rsi(df['Close'], p), expect,
+                                       check_names=False)
+
+    def test_kdj_matches_the_standard_formula(self):
+        """標準 KDJ:K = (1/3)RSV + (2/3)K_prev (m1=3 → ewm(com=2));J = 3K - 2D。"""
+        df = self._ohlc()
+        n, m1, m2 = 9, 3, 3
+        low_min = df['Low'].rolling(window=n).min()
+        high_max = df['High'].rolling(window=n).max()
+        rsv = 100 * (df['Close'] - low_min) / (high_max - low_min)
+        k = rsv.ewm(com=m1 - 1, adjust=False).mean()
+        d = k.ewm(com=m2 - 1, adjust=False).mean()
+        got_rsv, got_k, got_d, got_j = indicators.kdj(df, n, m1, m2)
+        pd.testing.assert_series_equal(got_rsv, rsv, check_names=False)
+        pd.testing.assert_series_equal(got_k, k, check_names=False)
+        pd.testing.assert_series_equal(got_d, d, check_names=False)
+        pd.testing.assert_series_equal(got_j, 3 * k - 2 * d, check_names=False)
+
+    def test_calculate_indicators_still_produces_the_same_columns(self):
+        df = self._ohlc()
+        out = indicators.calculate_indicators(
+            df, [False] * 6, ['SMA'] * 6, ['5'] * 6,
+            bb_show=False, bbw_show=False,
+            macd_show=False, macd_f='12', macd_s='26', macd_sig='9',
+            rsi_show=True, rsi_p='14',
+            kdj_show=True, kd_n='9', kd_m1='3', kd_m2='3',
+            dmi_show=False, dmi_n='14')
+        for c in ('RSI', 'RSV', 'K', 'D', 'J'):
+            self.assertIn(c, out.columns)
+        pd.testing.assert_series_equal(out['RSI'], indicators.rsi(df['Close'], 14),
+                                       check_names=False)
+
+
+class TestJAE(unittest.TestCase):
+    """【ADR-134】JAE 指標 (使用者自創:A=RSI、J=KDJ的J、E=長期趨勢線)。"""
+
+    def _df(self, closes):
+        return pd.DataFrame({'Open': closes, 'High': [c + 1 for c in closes],
+                             'Low': [c - 1 for c in closes], 'Close': closes},
+                            index=pd.date_range('2026-01-01', periods=len(closes), freq='D'))
+
+    def _rising(self, n=200):
+        """上升趨勢,但**要有回檔**。
+
+        一條完全筆直的上升線會讓 RSI 恆等於 100 (一天都沒有下跌),
+        E 跟著貼在 100、斜率變 0 → 判成「盤整」。那是測試資料退化,
+        不是程式錯 —— 第一版就是這樣紅的。真實行情一定有回檔,
+        所以固定用「上升 + 小幅震盪」當素材。"""
+        return self._df([100.0 + i * 0.8 + (2.0 if i % 3 == 0 else -1.5)
+                         for i in range(n)])
+
+    def _falling(self, n=200):
+        return self._df([300.0 - i * 0.8 + (2.0 if i % 3 == 0 else -1.5)
+                         for i in range(n)])
+
+    # ---------- 三條線的來源 ----------
+
+    def test_a_is_rsi_and_j_is_kdj_j(self):
+        """A 與 J **必須**就是既有的 RSI 與 KDJ 的 J —— 使用者的定義。
+        自己另算一份 (哪怕只差一點) 就違反定義。"""
+        df = self._rising()
+        p = dict(jae.DEFAULT_PARAMS)
+        jae.compute(df, p)
+        pd.testing.assert_series_equal(
+            df[jae.COL_A], indicators.rsi(df['Close'], p['a_period']), check_names=False)
+        _, _, _, j = indicators.kdj(df, p['j_n'], p['j_m1'], p['j_m2'])
+        pd.testing.assert_series_equal(df[jae.COL_J], j, check_names=False)
+
+    def test_e_is_a_slow_version_of_a_on_the_same_scale(self):
+        """E 要跟 A/J 同尺度才交叉得起來,而且要比 A **平滑/慢**。
+
+        「慢」用「每根的變動幅度」來測,不是用「最後一根誰比較高」——
+        後者只在單調趨勢的最後一根成立,遇到回檔就會翻面 (第一版就是這樣紅的)。"""
+        df = self._rising()
+        jae.compute(df)
+        a, e = df[jae.COL_A].dropna(), df[jae.COL_E].dropna()
+        self.assertTrue((e.between(0, 100)).all(), "E 應與 RSI 同尺度 (0~100)")
+        self.assertLess(float(e.diff().abs().mean()), float(a.diff().abs().mean()),
+                        "E 每根的變動應該明顯小於 A (E 才叫長期線)")
+
+    # ---------- 趨勢判斷 ----------
+
+    def test_trend_up_needs_both_position_and_slope(self):
+        df = self._rising()
+        jae.compute(df)
+        trend, e_now, slope = jae.trend_of(df[jae.COL_E])
+        self.assertEqual(trend, jae.TREND_UP)
+        self.assertGreater(e_now, 50.0)
+        self.assertGreater(slope, 0)
+
+    def test_trend_down(self):
+        df = self._falling()
+        jae.compute(df)
+        trend, e_now, slope = jae.trend_of(df[jae.COL_E])
+        self.assertEqual(trend, jae.TREND_DOWN)
+
+    def test_steady_trend_is_not_mistaken_for_flat(self):
+        """**這條是設計被改掉的原因。**
+
+        RSI 量的是動能不是價格方向,所以一段「等速下跌」會讓 RSI 穩定在低點、
+        E 收斂成一條水平線 —— 斜率趨近 0。第一版要求「位置與斜率兩個都成立」,
+        於是最典型的持續下跌反而被判成「盤整」。改成位置為主之後才正確。"""
+        e = pd.Series([34.5, 34.6, 34.5, 34.5, 34.6, 34.5])   # 遠低於中線、幾乎不動
+        trend, _, slope = jae.trend_of(e, {'e_slope_bars': 3})
+        self.assertLess(abs(slope), 0.5, "前提:斜率確實幾乎是 0")
+        self.assertEqual(trend, jae.TREND_DOWN, "遠離中線本身就是趨勢的證據")
+        e_up = pd.Series([70.0, 70.1, 70.0, 70.0, 70.1, 70.0])
+        self.assertEqual(jae.trend_of(e_up, {'e_slope_bars': 3})[0], jae.TREND_UP)
+
+    def test_near_midline_falls_back_to_slope(self):
+        """中線附近位置說不準,才由斜率決定偏哪一邊。"""
+        near_up = pd.Series([48.0, 48.5, 49.0, 49.5, 50.0, 50.5])
+        self.assertEqual(jae.trend_of(near_up, {'e_slope_bars': 3})[0], jae.TREND_UP)
+        near_dn = pd.Series([52.0, 51.5, 51.0, 50.5, 50.0, 49.5])
+        self.assertEqual(jae.trend_of(near_dn, {'e_slope_bars': 3})[0], jae.TREND_DOWN)
+
+    def test_flat_near_midline_is_the_only_way_to_get_flat(self):
+        """反向對照:「盤整」不可以消失 —— 中線附近又幾乎不動才是真的盤整。"""
+        e = pd.Series([50.0, 50.01, 50.0, 50.0, 50.01, 50.0])
+        self.assertEqual(jae.trend_of(e, {'e_slope_bars': 3})[0], jae.TREND_FLAT)
+
+    def test_band_and_eps_are_configurable(self):
+        e = pd.Series([53.0] * 6)          # 中線 +3
+        self.assertEqual(jae.trend_of(e, {'neutral_band': 5.0})[0], jae.TREND_FLAT)
+        self.assertEqual(jae.trend_of(e, {'neutral_band': 2.0})[0], jae.TREND_UP)
+
+    def test_trend_is_safe_on_bad_input(self):
+        self.assertEqual(jae.trend_of(None)[0], jae.TREND_FLAT)
+        self.assertEqual(jae.trend_of(pd.Series([], dtype=float))[0], jae.TREND_FLAT)
+
+    # ---------- 交叉 ----------
+
+    def test_golden_cross_is_fast_crossing_up(self):
+        """黃金交叉的定義:**比較快的那條由下往上穿過比較慢的那條**。
+        三組配對都照這個定義,不會有的組別反過來。"""
+        fast = pd.Series([10.0, 20.0])
+        slow = pd.Series([15.0, 15.0])
+        self.assertEqual(jae._cross_at(fast, slow, 1), jae.CROSS_GOLDEN)
+        self.assertEqual(jae._cross_at(slow, fast, 1), jae.CROSS_DEATH)
+
+    def test_no_cross_when_lines_do_not_meet(self):
+        fast = pd.Series([10.0, 12.0])
+        slow = pd.Series([20.0, 21.0])
+        self.assertIsNone(jae._cross_at(fast, slow, 1))
+
+    def test_nan_never_counts_as_a_cross(self):
+        """暖機期一堆 NaN,不可以被當成交叉 (那會在圖表最左邊噴一串假訊號)。"""
+        fast = pd.Series([float('nan'), 20.0])
+        slow = pd.Series([15.0, 15.0])
+        self.assertIsNone(jae._cross_at(fast, slow, 1))
+
+    def test_cross_pairs_are_ordered_fast_then_slow(self):
+        """配對一律 (快, 慢);寫反的話「黃金交叉」的意義就整個顛倒。"""
+        self.assertEqual(jae.CROSS_PAIRS[0][:2], (jae.COL_J, jae.COL_A))
+        self.assertEqual(jae.CROSS_PAIRS[1][:2], (jae.COL_A, jae.COL_E))
+        self.assertEqual(jae.CROSS_PAIRS[2][:2], (jae.COL_J, jae.COL_E))
+
+    def test_crosses_found_over_a_lookback(self):
+        df = self._df([100.0 + 10 * ((-1) ** (i // 7)) + i * 0.05 for i in range(200)])
+        jae.compute(df)
+        found = jae.crosses(df, lookback=80)
+        self.assertTrue(found, "震盪的資料應該找得到交叉")
+        for c in found:
+            self.assertIn(c['kind'], (jae.CROSS_GOLDEN, jae.CROSS_DEATH))
+            self.assertIn('×', c['pair'])
+
+    # ---------- 參數 ----------
+
+    def test_params_are_clamped_not_crashed(self):
+        p = jae.normalize_params({'a_period': -5, 'e_period': 99999,
+                                  'midline': 'abc', 'j_n': None})
+        self.assertGreaterEqual(p['a_period'], jae.PARAM_RANGES['a_period'][0])
+        self.assertLessEqual(p['e_period'], jae.PARAM_RANGES['e_period'][1])
+        self.assertEqual(p['midline'], jae.DEFAULT_PARAMS['midline'])
+        self.assertEqual(p['j_n'], jae.DEFAULT_PARAMS['j_n'])
+
+    def test_params_actually_change_the_lines(self):
+        """反向對照:參數要真的有作用,不然「可自行設定」是假的。"""
+        d1, d2 = self._rising(), self._rising()
+        jae.compute(d1, {'a_period': 14, 'e_period': 60})
+        jae.compute(d2, {'a_period': 5, 'e_period': 200})
+        self.assertFalse(d1[jae.COL_A].equals(d2[jae.COL_A]))
+        self.assertFalse(d1[jae.COL_E].equals(d2[jae.COL_E]))
+
+    def test_every_param_has_a_label_and_a_range(self):
+        for k in jae.DEFAULT_PARAMS:
+            self.assertIn(k, jae.PARAM_LABELS)
+            self.assertIn(k, jae.PARAM_RANGES)
+
+    # ---------- 摘要 ----------
+
+    def test_evaluate_and_summarize(self):
+        df = self._rising()
+        jae.compute(df)
+        r = jae.evaluate(df, lookback=5)
+        self.assertIsNotNone(r)
+        self.assertEqual(r['trend'], jae.TREND_UP)
+        txt = jae.summarize(r)
+        self.assertIn('趨勢', txt)
+        self.assertIn('A ', txt)
+        self.assertIn('資料不足', jae.summarize(None))
+
+    def test_evaluate_returns_none_without_columns(self):
+        self.assertIsNone(jae.evaluate(self._rising()))
+        self.assertIsNone(jae.evaluate(None))
 
 
 
