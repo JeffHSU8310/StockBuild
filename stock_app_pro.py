@@ -56,6 +56,8 @@ from core import kbars_plan
 from core import fibonacci
 from core import jae
 from core import regime_panel
+# 【ADR-138】指標線色盤 (舊 8 色 + 255 系統色)
+from core import palette
 # 【ADR-100】籌碼資料:解析純邏輯在 core/,本地 CSV 存取在 data/。
 from core import chips_parser
 # 【ADR-101】籌碼併進策略 df (含未來函數防護)。
@@ -357,30 +359,32 @@ class StockTradingAppPro(tk.Tk):
         self.current_canvas = None
         
         # ================= 指標參數狀態 =================
-        self.color_map = {
-            "黃 (#FFCA28)": "#FFCA28", "白 (#FFFFFF)": "#FFFFFF", "藍 (#29B6F6)": "#29B6F6",
-            "紫 (#E040FB)": "#E040FB", "橘 (#FF9100)": "#FF9100", "紅 (#FF1744)": "#FF1744",
-            "青 (#00E5FF)": "#00E5FF", "綠 (#00E676)": "#00E676"
-        }
+        # 【ADR-138】色盤搬到 core/palette.py:舊有 8 色原封不動排最前面
+        # (標籤字串一字未改,使用者存過的顏色設定照樣對得上),後面接
+        # 20 色相 × 12 階 + 15 灰 = 255 色。使用者要求「最好有 255 種」。
+        self.color_map = palette.color_map()
         self.ma_shows = [tk.BooleanVar(value=True if i < 2 else False) for i in range(6)]
         self.ma_types = [tk.StringVar(value="SMA") for i in range(6)]
         self.ma_periods = [tk.StringVar(value=p) for p in ["5", "10", "20", "60", "120", "240"]]
         self.ma_colors = [tk.StringVar(value=c) for c in list(self.color_map.keys())[:6]]
         self.bb_show, self.bb_color = tk.BooleanVar(value=False), tk.StringVar(value="青 (#00E5FF)")
-        # 【第九輪 圖3需求】布林通道自訂參數:期間 + 兩組標準差 (上下限各兩組)。
-        # 第二組標準差設 0 = 不顯示第二組。
+        # 【ADR-138】布林通道:期間 + **上線 σ / 下線 σ 各一個,兩者分開**。
+        # ADR-029~131 這兩個參數是「內圈那一對 / 外圈那一對」,使用者要的是
+        # 「上線一個參數、下線一個參數」,所以語意在 ADR-138 整個換掉:
+        #   UPPER = 中線 + bb_std_up × STD;LOWER = 中線 − bb_std_dn × STD
+        # 要第二條通道請開「第2組」—— 它本來就是完整獨立的一組。
         self.bb_period = tk.IntVar(value=20)
-        self.bb_std1 = tk.DoubleVar(value=2.0)
-        self.bb_std2 = tk.DoubleVar(value=3.0)
+        self.bb_std_up = tk.DoubleVar(value=2.0)
+        self.bb_std_dn = tk.DoubleVar(value=2.0)
         # 【ADR-131】布林改成「兩組完整通道」:每組有自己的中線 (類型+期間) 與
-        # 自己的兩條上下線。第1組沿用上面既有的變數與欄位名 (零迴歸),
+        # 自己的上下線。第1組沿用上面既有的變數與欄位名 (零迴歸),
         # 這裡只新增「中線類型」與整個第2組。
         self.bb_type = tk.StringVar(value="SMA")
         self.bb2_show, self.bb2_color = tk.BooleanVar(value=False), tk.StringVar(value="紫 (#E040FB)")
         self.bb2_type = tk.StringVar(value="SMA")
         self.bb2_period = tk.IntVar(value=60)
-        self.bb2_std1 = tk.DoubleVar(value=2.0)
-        self.bb2_std2 = tk.DoubleVar(value=0.0)
+        self.bb2_std_up = tk.DoubleVar(value=2.0)
+        self.bb2_std_dn = tk.DoubleVar(value=2.0)
         # 【ADR-133】黃金切割律 (費波南希回撤)。擺盪高低點由最近 N 根自動抓,
         # 不必手動拉線;比率清單可勾選 (含台股常用的次級分割律 0.191/0.809)。
         self.fib_show = tk.BooleanVar(value=False)
@@ -438,6 +442,12 @@ class StockTradingAppPro(tk.Tk):
         # 【ADR-108】手機遠端控制:設定檔有開才真的啟動輪詢執行緒。沒開就
         # 完全不建立執行緒 (不是建立後閒置),讓「沒開這個功能的人」的行為
         # 與加這個功能之前一模一樣。
+        #
+        # 【ADR-138】但**狀態一定要說出口**。使用者回報「手機打 /help 完全沒
+        # 反應,可是系統傳給我的訊息收得到」—— 原因是通知與遠端控制是兩個
+        # 獨立的勾選框,他只勾了通知。當時這裡沒開就靜悄悄什麼都不做,
+        # 連一行日誌都沒有,使用者無從得知自己少勾一個框。
+        self._tg_log_control_state()
         if (self.telegram_cfg or {}).get('remote_control'):
             self.start_telegram_control()
         threading.Thread(target=self.fetch_market_indices_worker, daemon=True).start()
@@ -2621,12 +2631,14 @@ class StockTradingAppPro(tk.Tk):
             'ma_periods': [v.get() for v in self.ma_periods],
             'ma_colors': [v.get() for v in self.ma_colors],
             'bb_show': self.bb_show.get(), 'bb_color': self.bb_color.get(),
-            'bb_period': self.bb_period.get(), 'bb_std1': self.bb_std1.get(), 'bb_std2': self.bb_std2.get(),
+            # 【ADR-138】上線 σ / 下線 σ 分開兩個 key
+            'bb_period': self.bb_period.get(),
+            'bb_std_up': self.bb_std_up.get(), 'bb_std_dn': self.bb_std_dn.get(),
             # 【ADR-131】中線類型 + 第2組完整布林
             'bb_type': self.bb_type.get(),
             'bb2_show': self.bb2_show.get(), 'bb2_color': self.bb2_color.get(),
             'bb2_type': self.bb2_type.get(), 'bb2_period': self.bb2_period.get(),
-            'bb2_std1': self.bb2_std1.get(), 'bb2_std2': self.bb2_std2.get(),
+            'bb2_std_up': self.bb2_std_up.get(), 'bb2_std_dn': self.bb2_std_dn.get(),
             # 【ADR-133】黃金切割律
             'fib_show': self.fib_show.get(), 'fib_lookback': self.fib_lookback.get(),
             'fib_color': self.fib_color.get(), 'fib_ratios': list(self.fib_ratios),
@@ -2659,8 +2671,10 @@ class StockTradingAppPro(tk.Tk):
             self.bb_show.set(d.get('bb_show', self.bb_show.get()))
             self.bb_color.set(d.get('bb_color', self.bb_color.get()))
             self.bb_period.set(d.get('bb_period', self.bb_period.get()))
-            self.bb_std1.set(d.get('bb_std1', self.bb_std1.get()))
-            self.bb_std2.set(d.get('bb_std2', self.bb_std2.get()))
+            # 【ADR-138】舊檔的 bb_std1/bb_std2 由 config_store.migrate_indicator_settings()
+            # 在讀檔時就換成 bb_std_up/bb_std_dn,這裡只認新 key。
+            self.bb_std_up.set(d.get('bb_std_up', self.bb_std_up.get()))
+            self.bb_std_dn.set(d.get('bb_std_dn', self.bb_std_dn.get()))
             # 【ADR-131】舊設定檔沒有這幾個 key → 用 .get(預設) 沿用程式碼預設值,
             # 等於「第1組維持原樣、第2組預設關閉」,使用者的既有設定不受影響。
             self.bb_type.set(d.get('bb_type', self.bb_type.get()))
@@ -2668,8 +2682,8 @@ class StockTradingAppPro(tk.Tk):
             self.bb2_color.set(d.get('bb2_color', self.bb2_color.get()))
             self.bb2_type.set(d.get('bb2_type', self.bb2_type.get()))
             self.bb2_period.set(d.get('bb2_period', self.bb2_period.get()))
-            self.bb2_std1.set(d.get('bb2_std1', self.bb2_std1.get()))
-            self.bb2_std2.set(d.get('bb2_std2', self.bb2_std2.get()))
+            self.bb2_std_up.set(d.get('bb2_std_up', self.bb2_std_up.get()))
+            self.bb2_std_dn.set(d.get('bb2_std_dn', self.bb2_std_dn.get()))
             # 【ADR-133】舊設定檔沒有這幾個 key → 沿用預設 (黃金切割預設關閉)
             self.fib_show.set(d.get('fib_show', self.fib_show.get()))
             self.fib_lookback.set(d.get('fib_lookback', self.fib_lookback.get()))
@@ -2727,11 +2741,13 @@ class StockTradingAppPro(tk.Tk):
         tk.Label(dlg, text="布林通道 (中線 + 上下線,可開兩組)", bg="#1A2026", fg="#00E5FF",
                  font=('微軟正黑體', 9, 'bold')).grid(row=8, column=0, columnspan=4, sticky='w', padx=15)
         bb_hdr = tk.Frame(dlg, bg="#1A2026"); bb_hdr.grid(row=9, column=0, columnspan=4, sticky='w', padx=15)
-        for _t, _w in (("開關", 9), ("中線類型", 9), ("中線期間", 9), ("上下線σa", 9), ("上下線σb", 9), ("色彩", 11)):
+        # 【ADR-138】原本這兩欄是「上下線σa / 上下線σb」= 內圈那一對 / 外圈那一對,
+        # 使用者要的是「上線一個參數、下線一個參數,兩個要分開」。
+        for _t, _w in (("開關", 9), ("中線類型", 9), ("中線期間", 9), ("上線σ", 9), ("下線σ", 9), ("色彩", 11)):
             tk.Label(bb_hdr, text=_t, bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8),
                      width=_w, anchor='w').pack(side=tk.LEFT, padx=1)
 
-        def _bb_row(parent, label, v_show, v_type, v_period, v_a, v_b, v_color):
+        def _bb_row(parent, label, v_show, v_type, v_period, v_up, v_dn, v_color):
             fr = tk.Frame(parent, bg="#1A2026")
             tk.Checkbutton(fr, text=label, variable=v_show, bg="#1A2026", fg="white",
                            selectcolor="#2A323D", width=7, anchor='w').pack(side=tk.LEFT)
@@ -2739,21 +2755,21 @@ class StockTradingAppPro(tk.Tk):
                          state="readonly", style="BlackText.TCombobox").pack(side=tk.LEFT, padx=(2, 8))
             tk.Entry(fr, textvariable=v_period, width=5, bg="#2A323D", fg="white",
                      justify="center").pack(side=tk.LEFT, padx=(6, 12))
-            tk.Entry(fr, textvariable=v_a, width=5, bg="#2A323D", fg="white",
+            tk.Entry(fr, textvariable=v_up, width=5, bg="#2A323D", fg="white",
                      justify="center").pack(side=tk.LEFT, padx=(6, 12))
-            tk.Entry(fr, textvariable=v_b, width=5, bg="#2A323D", fg="white",
+            tk.Entry(fr, textvariable=v_dn, width=5, bg="#2A323D", fg="white",
                      justify="center").pack(side=tk.LEFT, padx=(6, 10))
             ttk.Combobox(fr, textvariable=v_color, values=list(self.color_map.keys()), width=10,
                          state="readonly", style="BlackText.TCombobox").pack(side=tk.LEFT, padx=2)
             return fr
 
         _bb_row(dlg, "第1組", self.bb_show, self.bb_type, self.bb_period,
-                self.bb_std1, self.bb_std2, self.bb_color).grid(
+                self.bb_std_up, self.bb_std_dn, self.bb_color).grid(
                 row=10, column=0, columnspan=4, sticky='w', padx=15, pady=1)
         _bb_row(dlg, "第2組", self.bb2_show, self.bb2_type, self.bb2_period,
-                self.bb2_std1, self.bb2_std2, self.bb2_color).grid(
+                self.bb2_std_up, self.bb2_std_dn, self.bb2_color).grid(
                 row=11, column=0, columnspan=4, sticky='w', padx=15, pady=1)
-        tk.Label(dlg, text="※ σb 填 0 = 該組只畫一對上下線;兩組可各自開關,中線類型/期間互相獨立。",
+        tk.Label(dlg, text="※ 上線σ 與 下線σ 各自獨立 (可不對稱,例如上 2、下 3);兩組可各自開關,中線類型/期間互相獨立。",
                  bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8)).grid(
                  row=12, column=0, columnspan=4, sticky='w', padx=15, pady=(2, 0))
         ttk.Separator(dlg, orient='horizontal').grid(row=13, column=0, columnspan=4, sticky='ew', pady=8)
@@ -2973,10 +2989,11 @@ class StockTradingAppPro(tk.Tk):
         try:
             out = core_indicators.calculate_indicators(
                 df, ma_flags, ma_types, ma_periods,
-                bb_period=self.bb_period.get(), bb_std1=self.bb_std1.get(), bb_std2=self.bb_std2.get(),
+                bb_period=self.bb_period.get(),
+                bb_std_up=self.bb_std_up.get(), bb_std_dn=self.bb_std_dn.get(),
                 bb_type=self.bb_type.get(),
                 bb2_show=self.bb2_show.get(), bb2_period=self.bb2_period.get(),
-                bb2_std1=self.bb2_std1.get(), bb2_std2=self.bb2_std2.get(),
+                bb2_std_up=self.bb2_std_up.get(), bb2_std_dn=self.bb2_std_dn.get(),
                 bb2_type=self.bb2_type.get(),
                 **common_kwargs)
             return self._attach_jae(out)
@@ -5636,7 +5653,7 @@ class StockTradingAppPro(tk.Tk):
             for i in range(6):
                 col_name = f"MA_CUSTOM_{i}"
                 if self.ma_shows[i].get() and col_name in df.columns:
-                    c_hex = self.color_map.get(self.ma_colors[i].get(), "#FFFFFF")
+                    c_hex = palette.resolve(self.ma_colors[i].get(), "#FFFFFF")
                     apds.append(mpf.make_addplot(df[col_name], panel=0, color=c_hex, width=1.2, secondary_y=False))
 
             # 【ADR-131】兩組布林共用同一段畫法,只差前綴/開關/顏色 ——
@@ -5644,13 +5661,10 @@ class StockTradingAppPro(tk.Tk):
             def _add_bb(prefix, show_var, color_var, default_hex):
                 if not (show_var.get() and f'{prefix}_UPPER' in df.columns):
                     return
-                _hex = self.color_map.get(color_var.get(), default_hex)
+                _hex = palette.resolve(color_var.get(), default_hex)
                 apds.append(mpf.make_addplot(df[f'{prefix}_UPPER'], panel=0, color=_hex, linestyle='--', width=1.0, secondary_y=False))
                 apds.append(mpf.make_addplot(df[f'{prefix}_MID'], panel=0, color=_hex, linestyle='-', width=1.0, secondary_y=False))
                 apds.append(mpf.make_addplot(df[f'{prefix}_LOWER'], panel=0, color=_hex, linestyle='--', width=1.0, secondary_y=False))
-                if f'{prefix}_UPPER2' in df.columns:
-                    apds.append(mpf.make_addplot(df[f'{prefix}_UPPER2'], panel=0, color=_hex, linestyle=':', width=1.0, secondary_y=False))
-                    apds.append(mpf.make_addplot(df[f'{prefix}_LOWER2'], panel=0, color=_hex, linestyle=':', width=1.0, secondary_y=False))
 
             # 第2組先畫、第1組後畫:重疊時第1組 (使用者的主要設定) 蓋在上面。
             # 每組內部:σa 虛線、σb 點線 (【第九輪 圖3需求】的區隔方式沿用)。
@@ -5801,7 +5815,7 @@ class StockTradingAppPro(tk.Tk):
             for i in range(6):
                 col = f"MA_CUSTOM_{i}"
                 if self.ma_shows[i].get() and col in df.columns:
-                    c_hex = self.color_map.get(self.ma_colors[i].get(), "#FFFFFF")
+                    c_hex = palette.resolve(self.ma_colors[i].get(), "#FFFFFF")
                     label_prefix = f"{self.ma_types[i].get()}{self.ma_periods[i].get()}"
                     obj = axlist[0].text(main_x, 0.97, '', transform=axlist[0].transAxes, color=c_hex, **main_text_props)
 
@@ -5820,17 +5834,14 @@ class StockTradingAppPro(tk.Tk):
                 nonlocal main_x
                 if not (show_var.get() and f'{prefix}_UPPER' in df.columns):
                     return
-                _hex = self.color_map.get(color_var.get(), default_hex)
+                _hex = palette.resolve(color_var.get(), default_hex)
                 obj = axlist[0].text(main_x, 0.97, '', transform=axlist[0].transAxes,
                                      color=_hex, **main_text_props)
 
                 def _fmt(row, _p=prefix, _l=label):
                     if f'{_p}_UPPER' in row and not np.isnan(row[f'{_p}_UPPER']):
-                        s = (f"{_l}上:{row[f'{_p}_UPPER']:.2f} 中:{row[f'{_p}_MID']:.2f}"
-                             f" 下:{row[f'{_p}_LOWER']:.2f}")
-                        if f'{_p}_UPPER2' in row and not np.isnan(row[f'{_p}_UPPER2']):
-                            s += f" 上2:{row[f'{_p}_UPPER2']:.2f} 下2:{row[f'{_p}_LOWER2']:.2f}"
-                        return s
+                        return (f"{_l}上:{row[f'{_p}_UPPER']:.2f} 中:{row[f'{_p}_MID']:.2f}"
+                                f" 下:{row[f'{_p}_LOWER']:.2f}")
                     return None
                 self.txt_main_segments.append({'obj': obj, 'fmt': _fmt})
                 main_x += 0.20
@@ -6772,6 +6783,15 @@ class StockTradingAppPro(tk.Tk):
         cfg = getattr(self, 'telegram_cfg', None) or {}
         return bool(cfg.get('remote_control')) and telegram_notify.config_ready(cfg)
 
+    def _tg_log_control_state(self):
+        """【ADR-138】把「手機下指令會不會有回應」的現況寫進系統日誌。
+
+        規則在 core/telegram_control.control_status(),這裡只負責印出來 ——
+        沒開的時候也要印,那正是使用者最需要看到訊息的時候。
+        """
+        ok, why = telegram_control.control_status(getattr(self, 'telegram_cfg', None))
+        self.log_message(("【遠端控制】✅ " if ok else "【遠端控制】ℹ️ ") + why)
+
     def start_telegram_control(self):
         """啟動遠端控制輪詢執行緒 (只啟動一次)。"""
         if getattr(self, '_tg_ctrl_thread_started', False):
@@ -7110,8 +7130,9 @@ class StockTradingAppPro(tk.Tk):
             self.telegram_cfg = {'bot_token': token, 'chat_id': chat_id,
                                  'enabled': enabled, 'remote_control': remote}
             self.log_message(f"【Telegram通知】設定已儲存 ({'已啟用' if enabled else '已停用'})。")
-            self.log_message("【遠端控制】" + ('⚠️ 已啟用手機遠端控制;只有設定的 Chat ID 可以下指令。'
-                                            if remote else '已停用手機遠端控制。'))
+            # 【ADR-138】改用同一份 control_status():存檔後印的話和啟動時
+            # 印的話一致,使用者不會看到兩種說法。
+            self._tg_log_control_state()
             if remote:
                 self.start_telegram_control()
             dlg.destroy()
@@ -10280,7 +10301,9 @@ class StockTradingAppPro(tk.Tk):
         _lbl(top, "商品代碼").grid(row=0, column=2, sticky='w', padx=(10, 0))
         e_sym = _ent(top, s.get('symbol', ''), 10); e_sym.grid(row=0, column=3, padx=4)
         lbl_name = tk.Label(top, text="", bg="#1A2026", fg="#29B6F6", font=('微軟正黑體', 9, 'bold'))
-        lbl_name.grid(row=5, column=0, columnspan=7, sticky='w', pady=(2, 0))
+        # 【ADR-138】columnspan 由 7 改 2:原本橫跨整列,會蓋到同一列 col2 起的
+        # 「籌碼允許讀當日」勾選框 (目前因為文字短所以看起來沒事,是潛在撞格)。
+        lbl_name.grid(row=5, column=0, columnspan=2, sticky='w', pady=(2, 0))
         _lbl(top, "交易種類").grid(row=0, column=4, sticky='w', padx=(10, 0))
         tk.Label(top, text="← 也可直接點左側自選股帶入(自動判斷股票/期貨)", bg="#1A2026",
                  fg="#8A99AD", font=('微軟正黑體', 8)).grid(row=0, column=6, sticky='w', padx=(10, 0))
@@ -10367,10 +10390,15 @@ class StockTradingAppPro(tk.Tk):
         # 【ADR-136】停損停利即時觸發:改成可勾選,不分商品別。
         # 舊策略沒有這個欄位時,intrabar_stop_enabled() 會沿用它原本的行為
         # (期貨=即時、股票=收盤才判定),所以勾選框打開時顯示的就是現況。
+        #
+        # 【ADR-138】放 row 14 而不是緊接在停損欄位後面:row 10~13 已被
+        # Buy&Hold / 委託方式等佔用。ADR-136 原本放 row 10,**被後放的
+        # Buy&Hold 整個蓋掉**,使用者實機截圖顯示內建策略根本看不到這個勾選框
+        # (tkinter 的 grid 撞格不報錯,只是後放的蓋前放的 —— 同 P-104)。
         var_intrabar = tk.BooleanVar(value=strategy_engine.intrabar_stop_enabled(s))
         tk.Checkbutton(top, text="停損停利即時觸發 (盤中觸價就出場,不等K棒收盤;回測同步照此模擬)",
                        variable=var_intrabar, bg="#1A2026", fg="#FFCA28", selectcolor="#2A323D",
-                       font=('微軟正黑體', 9)).grid(row=10, column=0, columnspan=6,
+                       font=('微軟正黑體', 9)).grid(row=14, column=0, columnspan=6,
                                                     sticky='w', pady=(2, 0))
         # 【ADR-059】買進後持有不賣 (Buy & Hold):使用者要拿它當比較基準。
         # 勾了就放行「沒有出場方式」的驗證,但只限回測/模擬 (見 validate_strategy)。
@@ -12798,7 +12826,7 @@ class StockTradingAppPro(tk.Tk):
             if not result or not result['levels']:
                 return
             self._fib_last_result = result
-            base = self.color_map.get(self.fib_color.get(), "#FFCA28")
+            base = palette.resolve(self.fib_color.get(), "#FFCA28")
             for lv in result['levels']:
                 if lv['kind'] == 'endpoint':
                     lw, alpha, ls = 1.1, 0.75, '-'

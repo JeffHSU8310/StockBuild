@@ -702,9 +702,10 @@ def _round9_six_items():
     # 布林雙組
     idx=_pd.date_range("2026-01-01",periods=60,freq="D"); b=_np.linspace(100,110,60)
     df=_pd.DataFrame({"Open":b,"High":b+1,"Low":b-1,"Close":b+.2,"Volume":[1]*60},index=idx)
-    app.bb_show.set(True); app.bb_period.set(10); app.bb_std1.set(1.5); app.bb_std2.set(2.5)
+    app.bb_show.set(True); app.bb_period.set(10)
+    app.bb_std_up.set(1.5); app.bb_std_dn.set(2.5)
     r=app.calculate_custom_indicators(df)
-    assert 'BB_UPPER2' in r.columns and r['BB_MID'].first_valid_index()==idx[9], "布林自訂/雙組失效"
+    assert 'BB_UPPER' in r.columns and r['BB_MID'].first_valid_index()==idx[9], "布林自訂失效"
     app.bb_show.set(False)
     # 期貨 tick 前綴比對 (第4項根因)
     app.current_contract=FC('TXFR1',name='臺股期貨')
@@ -4937,6 +4938,116 @@ run_case("ADR-130: 停損點位不受進出場分界 X 限制 (但仍要真的�
          _stop_level_free_of_x_130)
 
 
+def _grid_overlaps(func_name, src=None):
+    """【ADR-131 → ADR-138】用 AST 靜態算出某個對話框函式裡的 grid 撞格。
+
+    回傳 [(父容器, row, col, 先放的行號, 後放的行號), ...],空 list = 沒撞格。
+
+    tkinter 的 grid 是**後放的蓋前放的,而且完全不報錯**(P-104)。實機上
+    已經因此弄丟過兩整區 UI:ADR-131 的布林參數列、ADR-138 的內建策略
+    「停損停利即時觸發」勾選框。這個檢查抓的是那個 bug 的**類別**,
+    不是那一行字串 —— 換個位置再撞一次照樣抓得到。
+
+    兩件事一定要做對,否則整條檢查會變成假警報製造機 (假警報的下場就是被
+    關掉,等於白做):
+
+      1. **依父容器分組**。第一版沒分組,把 `top`、`watch_fr`、`dlg` 底下各自的
+         (row, col) 混在一起算,對 `_qt_open_chukuangren_editor` 這種「多個
+         Frame 各自 grid」的對話框報了一整串假警報。不同容器有各自獨立的
+         grid 座標系,本來就可以同時佔 (0,0)。
+      2. **認得 if/elif 分支**。`open_sub_settings` 用 if/elif 依指標種類放不同
+         的欄位,每個分支都從 row=0 開始 —— 那些分支**互斥**,實際上永遠不會
+         同時存在。只有「路徑相容」的兩個 grid 才拿來比。
+
+    認不出父容器 / 位置不是字面常數 (例如迴圈裡的 `row=i+1`) 一律**跳過**,
+    寧可漏報也不要誤報。
+    """
+    import ast as _ast
+    if src is None:
+        src = open('stock_app_pro.py', encoding='utf-8').read()
+    tree = _ast.parse(src)
+    fn = None
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.FunctionDef) and node.name == func_name:
+            fn = node
+            break
+    assert fn is not None, f"找不到 {func_name}"
+
+    # 變數 → 父容器 (`bb_hdr = tk.Frame(dlg, ...)` 之後 `bb_hdr.grid(...)`)
+    var_parent = {}
+    for n in _ast.walk(fn):
+        if isinstance(n, _ast.Assign) and isinstance(n.value, _ast.Call):
+            if n.value.args and isinstance(n.value.args[0], _ast.Name):
+                for t in n.targets:
+                    if isinstance(t, _ast.Name):
+                        var_parent[t.id] = n.value.args[0].id
+
+    def _parent_of(node):
+        recv = node.func.value
+        if isinstance(recv, _ast.Call):        # tk.Label(top, ...).grid(...)
+            if recv.args and isinstance(recv.args[0], _ast.Name):
+                return recv.args[0].id
+            return None
+        if isinstance(recv, _ast.Name):        # e_name.grid(...)
+            return var_parent.get(recv.id)
+        return None
+
+    def _lit(kw, name, default):
+        for k in kw:
+            if k.arg == name:
+                if isinstance(k.value, _ast.Constant) and isinstance(k.value.value, int):
+                    return k.value.value
+                return None                     # 非字面值 → 這個呼叫整個跳過
+        return default
+
+    # 逐節點走訪,同時記住「目前在哪些 if 的哪一條分支裡」。
+    calls = []          # (父容器, row, col, 行號, 分支路徑)
+
+    def _visit(node, path):
+        if isinstance(node, _ast.If):
+            _visit(node.test, path)
+            _visit_body(node.body, path + ((id(node), 0),))
+            _visit_body(node.orelse, path + ((id(node), 1),))
+            return
+        if (isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute)
+                and node.func.attr == 'grid'):
+            parent = _parent_of(node)
+            row = _lit(node.keywords, 'row', None)
+            col = _lit(node.keywords, 'column', 0)
+            cspan = _lit(node.keywords, 'columnspan', 1)
+            rspan = _lit(node.keywords, 'rowspan', 1)
+            if not (parent is None or row is None or col is None
+                    or cspan is None or rspan is None):
+                for r in range(row, row + rspan):
+                    for c in range(col, col + cspan):
+                        calls.append((parent, r, c, node.lineno, path))
+        for sub in _ast.iter_child_nodes(node):
+            _visit(sub, path)
+
+    def _visit_body(stmts, path):
+        for st in stmts:
+            _visit(st, path)
+
+    _visit_body(fn.body, ())
+
+    def _exclusive(p1, p2):
+        d1 = dict(p1)
+        return any(k in d1 and d1[k] != v for k, v in p2)
+
+    bad = []
+    for i in range(len(calls)):
+        p1, r1, c1, ln1, path1 = calls[i]
+        for j in range(i + 1, len(calls)):
+            p2, r2, c2, ln2, path2 = calls[j]
+            if (p1, r1, c1) != (p2, r2, c2) or ln1 == ln2:
+                continue
+            if _exclusive(path1, path2):
+                continue                        # 互斥的 if/elif 分支
+            bad.append((p1, r1, c1, ln1, ln2))
+    assert calls, f"{func_name} 應該解析得到 grid 呼叫 (解析不到就等於這條檢查是空殼)"
+    return bad
+
+
 def _bollinger_two_sets_131():
     """【ADR-131】主圖布林:參數列不見了 + 改成兩組完整通道。
 
@@ -4955,52 +5066,19 @@ def _bollinger_two_sets_131():
       B. **功能**:兩組布林各自獨立 (中線類型/期間 + 兩條上下線),而且第1組
          的欄位名沒有被改掉。
     """
-    import ast as _ast
     import pandas as _pd
-    from core import indicators as _ind
 
-    # ---- A. grid 儲存格不可以重疊 ----
-    _src = open('stock_app_pro.py', encoding='utf-8').read()
-    _tree = _ast.parse(_src)
-    _fn = None
-    for _node in _ast.walk(_tree):
-        if isinstance(_node, _ast.FunctionDef) and _node.name == 'open_main_settings':
-            _fn = _node
-            break
-    assert _fn is not None, "找不到 open_main_settings"
-
-    def _lit(kw, name, default):
-        for k in kw:
-            if k.arg == name:
-                if isinstance(k.value, _ast.Constant) and isinstance(k.value.value, int):
-                    return k.value.value
-                return None          # 非字面值 (例如迴圈裡的 row=i+1) → 跳過
-        return default
-
-    occupied = {}
-    for _node in _ast.walk(_fn):
-        if not (isinstance(_node, _ast.Call) and isinstance(_node.func, _ast.Attribute)
-                and _node.func.attr == 'grid'):
-            continue
-        row = _lit(_node.keywords, 'row', None)
-        col = _lit(_node.keywords, 'column', 0)
-        cspan = _lit(_node.keywords, 'columnspan', 1)
-        rspan = _lit(_node.keywords, 'rowspan', 1)
-        if row is None or col is None or cspan is None or rspan is None:
-            continue                  # 迴圈產生的位置不在這條規則的範圍內
-        for r in range(row, row + rspan):
-            for c in range(col, col + cspan):
-                if (r, c) in occupied:
-                    raise AssertionError(
-                        f"主圖指標設定的 grid 撞格:第 {_node.lineno} 行與第 "
-                        f"{occupied[(r, c)]} 行都佔到 (row={r}, column={c}) —— "
-                        "tkinter 會讓後放的蓋掉前放的,參數就會像使用者截圖那樣不見")
-                occupied[(r, c)] = _node.lineno
-    assert occupied, "應該解析得到 grid 呼叫 (解析不到就等於這條檢查是空殼)"
+    # ---- A. grid 儲存格不可以重疊 (共用 _grid_overlaps,ADR-138 起分父容器/分支) ----
+    _bad = _grid_overlaps('open_main_settings')
+    assert not _bad, (
+        "主圖指標設定的 grid 撞格:" +
+        "、".join(f"父容器 {p} (row={r}, col={c}) 第 {l1} 行與第 {l2} 行"
+                  for p, r, c, l1, l2 in _bad) +
+        " —— tkinter 會讓後放的蓋掉前放的,參數就會像使用者截圖那樣不見")
 
     # ---- B. 兩組布林的功能 ----
-    for _v in ('bb_type', 'bb2_show', 'bb2_type', 'bb2_period', 'bb2_std1',
-               'bb2_std2', 'bb2_color'):
+    for _v in ('bb_type', 'bb2_show', 'bb2_type', 'bb2_period', 'bb2_std_up',
+               'bb2_std_dn', 'bb2_color'):
         assert hasattr(app, _v), f"缺少第2組布林的設定變數 {_v}"
 
     _n = 90
@@ -5012,39 +5090,46 @@ def _bollinger_two_sets_131():
         index=_pd.date_range('2026-01-01', periods=_n, freq='D'))
 
     _orig = {k: getattr(app, k).get() for k in
-             ('bb_show', 'bb_period', 'bb_std1', 'bb_std2', 'bb_type',
-              'bb2_show', 'bb2_period', 'bb2_std1', 'bb2_std2', 'bb2_type')}
+             ('bb_show', 'bb_period', 'bb_std_up', 'bb_std_dn', 'bb_type',
+              'bb2_show', 'bb2_period', 'bb2_std_up', 'bb2_std_dn', 'bb2_type')}
     try:
         # 只開第1組:第2組欄位不可以出現 (反向對照 —— 否則圖上會多出線)
         app.bb_show.set(True); app.bb_period.set(20)
-        app.bb_std1.set(2.0); app.bb_std2.set(3.0); app.bb_type.set('SMA')
+        app.bb_std_up.set(2.0); app.bb_std_dn.set(3.0); app.bb_type.set('SMA')
         app.bb2_show.set(False)
         out1 = app.calculate_custom_indicators(_df)
-        for c in ('BB_MID', 'BB_UPPER', 'BB_LOWER', 'BB_UPPER2', 'BB_LOWER2'):
+        for c in ('BB_MID', 'BB_UPPER', 'BB_LOWER'):
             assert c in out1.columns, f"第1組布林欄位 {c} 不見了 (繪圖與十字線都靠它)"
         assert 'BB2_MID' not in out1.columns, "沒開第2組就不該有 BB2 欄位"
+        # 【ADR-138】不再有「第二對上下線」;殘留的話繪圖會默默多畫兩條點線
+        assert 'BB_UPPER2' not in out1.columns, "ADR-138 起不該再有 BB_UPPER2"
 
         # 兩組都開:各自獨立的中線
         app.bb2_show.set(True); app.bb2_period.set(60)
-        app.bb2_std1.set(1.5); app.bb2_std2.set(2.5); app.bb2_type.set('EMA')
+        app.bb2_std_up.set(1.5); app.bb2_std_dn.set(2.5); app.bb2_type.set('EMA')
         out2 = app.calculate_custom_indicators(_df)
-        for c in ('BB2_MID', 'BB2_UPPER', 'BB2_LOWER', 'BB2_UPPER2', 'BB2_LOWER2'):
+        for c in ('BB2_MID', 'BB2_UPPER', 'BB2_LOWER'):
             assert c in out2.columns, f"第2組布林欄位 {c} 沒有算出來"
         assert not out2['BB_MID'].equals(out2['BB2_MID']), \
             "兩組中線 (SMA20 / EMA60) 算出來一樣,等於第2組的參數沒有生效"
-        # 上下線確實照各自的 σ 展開
-        import numpy as _np
+        # 【ADR-138】上線走 std_up、下線走 std_dn —— 兩邊刻意設不對稱,
+        # 接錯邊 (例如上下都用 std_up) 一定會被抓到。
         _i = -1
         assert abs((out2['BB_UPPER'].iloc[_i] - out2['BB_MID'].iloc[_i])
-                   - 2.0 * out2['BB_STD'].iloc[_i]) < 1e-6, "第1組 σa 不對"
+                   - 2.0 * out2['BB_STD'].iloc[_i]) < 1e-6, "第1組上線 σ 不對"
+        assert abs((out2['BB_MID'].iloc[_i] - out2['BB_LOWER'].iloc[_i])
+                   - 3.0 * out2['BB_STD'].iloc[_i]) < 1e-6, "第1組下線 σ 不對"
         assert abs((out2['BB2_UPPER'].iloc[_i] - out2['BB2_MID'].iloc[_i])
-                   - 1.5 * out2['BB2_STD'].iloc[_i]) < 1e-6, "第2組 σa 不對"
+                   - 1.5 * out2['BB2_STD'].iloc[_i]) < 1e-6, "第2組上線 σ 不對"
+        assert abs((out2['BB2_MID'].iloc[_i] - out2['BB2_LOWER'].iloc[_i])
+                   - 2.5 * out2['BB2_STD'].iloc[_i]) < 1e-6, "第2組下線 σ 不對"
 
-        # σb=0 → 該組只畫一對上下線
-        app.bb2_std2.set(0.0)
+        # σ 填 0 → 退回 2.0,不可以讓上下線跟中線疊在一起 (看起來像布林壞了)
+        app.bb2_std_dn.set(0.0)
         out3 = app.calculate_custom_indicators(_df)
-        assert 'BB2_UPPER2' not in out3.columns, "σb=0 不該畫第二條上下線"
-        assert 'BB2_UPPER' in out3.columns, "σb=0 只影響第二條,第一條仍要在"
+        assert abs((out3['BB2_MID'].iloc[_i] - out3['BB2_LOWER'].iloc[_i])
+                   - 2.0 * out3['BB2_STD'].iloc[_i]) < 1e-6, "σ=0 應退回 2.0"
+        app.bb2_std_dn.set(2.5)
 
         # 只開第2組:第1組關著也要能單獨畫
         app.bb_show.set(False)
@@ -5057,7 +5142,7 @@ def _bollinger_two_sets_131():
         app.__dict__.pop('_bb_param_warned', None)
 
 
-run_case("ADR-131: 主圖布林參數列被蓋掉 (grid撞格) + 兩組完整布林通道",
+run_case("ADR-131/138: 主圖布林參數列被蓋掉 (grid撞格) + 兩組通道 + 上下線各自 σ",
          _bollinger_two_sets_131)
 
 
@@ -5726,6 +5811,148 @@ def _custom_parity_and_intrabar_stop_135():
 
 run_case("ADR-135: 自訂策略補齊內建基本功能 + 停損停利即時觸發 (不限期貨)",
          _custom_parity_and_intrabar_stop_135)
+
+
+def _adr138_bollinger_palette_grid_telegram():
+    """【ADR-138】這一輪使用者回報的四件事,外加一個順手抓到的舊 bug。
+
+      1. 內建策略編輯器**看不到**「停損停利即時觸發」勾選框 —— grid 撞格,
+         被後放的 Buy&Hold 那一列整個蓋住 (ADR-136 明明加了,原始碼也有,
+         就是看不見)。同一個坑的第二次 (第一次是 ADR-131 的布林參數列)。
+      2. 布林「我要上線一個參數,下線一個參數,兩個要分開」。
+      3. 「所有指標線的顏色可以更多選擇。最好有 255 種」。
+      4. 「我在 Telegram Key 入 /help 完全沒有回應,可是我收得到系統傳給我的
+         訊息」—— 通知與遠端控制是兩個獨立開關,而沒開時**連一行日誌都沒有**。
+      5. (順手抓到) `load/save_indicator_settings` 只認 DEFAULT_INDICATOR_SETTINGS
+         列到的 key,ADR-131/133/134 新增的設定存了也讀不回來。
+    """
+    import json as _json
+    import os as _os
+    import re as _re
+    import tempfile as _tf
+    from core import palette as _pal
+    from core import telegram_control as _tgc
+    from data import config_store as _cstore
+
+    # ---- 1. 所有對話框都不可以有 grid 撞格 ----
+    # 只檢查「改壞了會讓整區 UI 消失」的那幾個設定/編輯對話框。
+    for _dlg in ('_qt_open_editor', '_qt_open_custom_editor',
+                 '_qt_open_chukuangren_editor', 'open_main_settings',
+                 'open_sub_settings', 'open_sub_indicators',
+                 'open_regime_settings', '_qt_open_telegram_settings'):
+        _bad = _grid_overlaps(_dlg)
+        assert not _bad, (
+            f"{_dlg} 的 grid 撞格:" +
+            "、".join(f"父容器 {p} (row={r}, col={c}) 第 {l1} 行與第 {l2} 行"
+                      for p, r, c, l1, l2 in _bad) +
+            " —— tkinter 後放的會蓋掉前放的且不報錯,那一區在畫面上會直接消失")
+
+    # 內建策略編輯器的「即時觸發」勾選框確實在這個函式裡。
+    # (ADR-135 的案例只驗了「整份原始碼有這一行」—— 那條在 bug 存在時照樣是綠的,
+    #  真正擋住這個 bug 的是上面的撞格檢查。)
+    #
+    # 切片邊界用「下一個同縮排的 def」找,不可以拿「關鍵字出現的位置」去切
+    # (那等於先找到再切給自己看,永遠是綠的 —— P-109/P-110 踩過兩次)。
+    _src = open('stock_app_pro.py', encoding='utf-8').read()
+    _i = _src.index('    def _qt_open_editor(')
+    _m = _re.search(r'\n    def (?!_qt_open_editor\b)\w+', _src[_i:])
+    assert _m, "找不到 _qt_open_editor 的結尾"
+    _seg = _src[_i:_i + _m.start()]
+    assert 'def _qt_open_custom_editor' not in _seg, "切片切太長,切到別的編輯器去了"
+    assert '停損停利即時觸發' in _seg, "內建策略編輯器要有『停損停利即時觸發』勾選框"
+    assert "s['intrabar_stop'] = bool(var_intrabar.get())" in _seg, \
+        "內建策略編輯器存檔時要把『即時觸發』寫進策略"
+
+    # ---- 2. 布林:上線 σ / 下線 σ 分開兩個 tk 變數 ----
+    for _v in ('bb_std_up', 'bb_std_dn', 'bb2_std_up', 'bb2_std_dn'):
+        assert hasattr(app, _v), f"缺少布林設定變數 {_v}"
+    for _v in ('bb_std1', 'bb_std2', 'bb2_std1', 'bb2_std2'):
+        assert not hasattr(app, _v), f"舊的 {_v} 應該整個移除,留著遲早兩份各自維護"
+    # 上/下線各自 σ 的數學驗證在 ADR-131/138 那個案例 (走 calculate_custom_indicators)。
+
+    # 設定持久化走完整 GUI 路徑:_collect → 存檔 → 讀檔 → _apply
+    _orig = app._collect_indicator_settings()
+    try:
+        app.bb_std_up.set(1.25); app.bb_std_dn.set(3.75)
+        app.bb2_show.set(True); app.bb2_type.set('WMA'); app.bb2_period.set(48)
+        app.fib_show.set(True); app.fib_lookback.set(91)
+        with _tf.TemporaryDirectory() as _tmp:
+            _path = _os.path.join(_tmp, 'ind.json')
+            _cstore.save_indicator_settings(_path, app._collect_indicator_settings())
+            # 先把值改掉,再套回來 —— 不然「什麼都沒做」也會過 (空殼斷言)
+            app.bb_std_up.set(9.0); app.bb_std_dn.set(9.0)
+            app.bb2_type.set('SMA'); app.bb2_period.set(60)
+            app.fib_show.set(False); app.fib_lookback.set(20)
+            app._apply_indicator_settings(_cstore.load_indicator_settings(_path))
+        assert app.bb_std_up.get() == 1.25, "上線 σ 沒有存回來"
+        assert app.bb_std_dn.get() == 3.75, "下線 σ 沒有存回來"
+        assert app.bb2_type.get() == 'WMA', \
+            "第2組布林中線類型沒有存回來 (ADR-131 的設定從來沒真的持久化過)"
+        assert app.bb2_period.get() == 48, "第2組布林期間沒有存回來"
+        assert app.fib_show.get() is True and app.fib_lookback.get() == 91, \
+            "黃金切割的設定沒有存回來 (ADR-133)"
+
+        # 舊格式設定檔要能平順遷移 (使用者手上就有一份 bb_std1/bb_std2)
+        with _tf.TemporaryDirectory() as _tmp:
+            _path = _os.path.join(_tmp, 'old.json')
+            with open(_path, 'w', encoding='utf-8') as _f:
+                _json.dump({'bb_show': True, 'bb_period': 10,
+                            'bb_std1': 1.5, 'bb_std2': 2.5}, _f)
+            app._apply_indicator_settings(_cstore.load_indicator_settings(_path))
+        assert app.bb_std_up.get() == 1.5 and app.bb_std_dn.get() == 1.5, \
+            "舊設定檔的 bb_std1 要變成上下線共用的 σ"
+        assert app.bb_std_dn.get() != 2.5, \
+            "舊的外圈 σ2 不可以被拿去當下線 —— 會變成使用者沒設定過的歪斜通道"
+    finally:
+        app._apply_indicator_settings(_orig)
+
+    # ---- 3. 255 色真的接進 app,而且舊有 8 色還在原位 ----
+    assert len(_pal.GENERATED_COLORS) == 255, "使用者要的是 255 種顏色"
+    assert len(app.color_map) == len(_pal.PALETTE) >= 255, "色盤沒有接進 app"
+    assert list(app.color_map)[:8] == [lb for lb, _ in _pal.LEGACY_COLORS], \
+        "舊有 8 色要排最前面且標籤不變 (設定檔存的是標籤字串,改了就全部對不上)"
+    # 每一個標籤都要解析得回顏色 (下拉選了卻畫不出來就白搭)
+    for _lb in app.color_map:
+        assert _pal.resolve(_lb).startswith('#'), f"{_lb} 解析不出色碼"
+    # 繪圖與十字線都要走 palette.resolve (才容忍色盤日後再調整)
+    assert _src.count('palette.resolve(') >= 4, "繪圖/十字線的取色要走 palette.resolve"
+
+    # ---- 4. Telegram 遠端控制的狀態要說得出口 ----
+    _ok, _why = _tgc.control_status({'bot_token': 'x', 'chat_id': '1', 'enabled': True})
+    assert _ok is False and '遠端控制' in _why, "只勾通知時要講清楚為什麼指令沒反應"
+    _ok2, _why2 = _tgc.control_status({'bot_token': '', 'chat_id': '1',
+                                       'remote_control': True})
+    assert _ok2 is False and 'Bot Token' in _why2, "勾了但沒填 token 要指名少了什麼"
+    _ok3, _ = _tgc.control_status({'bot_token': 'x', 'chat_id': '1',
+                                   'remote_control': True})
+    assert _ok3 is True, "反向對照:都備妥時要回報已啟用 (否則等於把功能講死)"
+
+    # 走 GUI 路徑:沒開的時候**也要**有日誌 (原本是完全靜默,使用者無從得知)
+    _logs = []
+    _orig_log, _orig_cfg = app.log_message, app.telegram_cfg
+    try:
+        app.log_message = lambda m: _logs.append(str(m))
+        app.telegram_cfg = {'bot_token': 'x', 'chat_id': '1', 'enabled': True}
+        app._tg_log_control_state()
+        assert any('遠端控制' in m for m in _logs), "沒開遠端控制時也要留下一行日誌"
+        _logs.clear()
+        app.telegram_cfg = {'bot_token': 'x', 'chat_id': '1', 'enabled': True,
+                            'remote_control': True}
+        app._tg_log_control_state()
+        assert any('已啟用' in m for m in _logs), "開了之後日誌要說已啟用"
+    finally:
+        app.log_message = _orig_log
+        app.telegram_cfg = _orig_cfg
+
+    # 啟動時真的會呼叫它 (純函式對了但沒被呼叫是常見的空殼,P-64)
+    _init = _src[_src.index('def __init__'):]
+    _init = _init[:_init.index('\n    def ')]
+    assert 'self._tg_log_control_state()' in _init, \
+        "啟動時 (不論有沒有開) 都要印一次遠端控制狀態"
+
+
+run_case("ADR-138: 布林上下線各自σ + 255色 + 內建編輯器勾選框被蓋掉 + 遠端控制狀態可見",
+         _adr138_bollinger_palette_grid_telegram)
 
 
 print(f"{'案例':60s} 結果")

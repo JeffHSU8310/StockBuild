@@ -46,16 +46,24 @@ def moving_average(series: pd.Series, period: int, kind: str = 'SMA'):
     return None
 
 
-def bollinger_set(df: pd.DataFrame, period, std_a, std_b, ma_type='SMA',
+def bollinger_set(df: pd.DataFrame, period, std_up, std_dn, ma_type='SMA',
                   prefix='BB', with_width=False) -> pd.DataFrame:
-    """【ADR-131】算一組布林通道 (中線 + 兩條上下線),就地寫進 df。
+    """【ADR-131 → ADR-138】算一組布林通道,就地寫進 df。
 
-    欄位名:{prefix}_MID / _STD / _UPPER / _LOWER,第二條上下線是
-    {prefix}_UPPER2 / _LOWER2。prefix='BB' 時產生的欄位名與 ADR-029 完全相同,
-    所以第1組不需要任何呼叫端配合修改。
+    欄位名:{prefix}_MID / _STD / _UPPER / _LOWER。
 
-    參數轉換失敗一律退回安全值 (期間 20、σ 2.0、不畫第二條),維持本模組
-    「壞參數不可以讓整張圖畫不出來」的慣例 (P-?? / 見 ADR-029 的降級處理)。
+    【ADR-138 語意變更】兩個 σ 參數從「第一對 / 第二對上下線」改成
+    **「上線的 σ / 下線的 σ」** —— 使用者要求:「我要上線一個參數,下線一個
+    參數,兩個要分開」。
+
+        UPPER = MID + std_up * STD
+        LOWER = MID - std_dn * STD
+
+    所以一組布林只畫**一條上線 + 一條下線**,但兩邊可以不對稱 (例如上線 2σ、
+    下線 3σ)。要畫第二條通道請開「第2組」—— 它本來就是完整獨立的一組。
+
+    參數轉換失敗一律退回安全值 (期間 20、σ 2.0),維持本模組
+    「壞參數不可以讓整張圖畫不出來」的慣例 (見 ADR-029 的降級處理)。
 
     ※ 中線可以是 SMA/EMA/WMA,但**標準差一律取收盤價的 rolling std** ——
       那是布林通道的定義,不隨中線類型改變。
@@ -64,31 +72,26 @@ def bollinger_set(df: pd.DataFrame, period, std_a, std_b, ma_type='SMA',
         p = max(2, int(float(str(period))))
     except (TypeError, ValueError):
         p = 20
-    try:
-        s_a = float(str(std_a))
-        if s_a <= 0:
-            s_a = 2.0
-    except (TypeError, ValueError):
-        s_a = 2.0
-    try:
-        s_b = float(str(std_b))
-    except (TypeError, ValueError):
-        s_b = 0.0
+
+    def _sigma(v):
+        try:
+            f = float(str(v))
+        except (TypeError, ValueError):
+            return 2.0
+        return f if f > 0 else 2.0
+
+    s_up, s_dn = _sigma(std_up), _sigma(std_dn)
 
     mid = moving_average(df['Close'], p, ma_type)
     if mid is None:
         mid = df['Close'].rolling(window=p).mean()
     df[f'{prefix}_MID'] = mid
     df[f'{prefix}_STD'] = df['Close'].rolling(window=p).std()
-    df[f'{prefix}_UPPER'] = df[f'{prefix}_MID'] + (s_a * df[f'{prefix}_STD'])
-    df[f'{prefix}_LOWER'] = df[f'{prefix}_MID'] - (s_a * df[f'{prefix}_STD'])
+    df[f'{prefix}_UPPER'] = df[f'{prefix}_MID'] + (s_up * df[f'{prefix}_STD'])
+    df[f'{prefix}_LOWER'] = df[f'{prefix}_MID'] - (s_dn * df[f'{prefix}_STD'])
     if with_width:
         df[f'{prefix}_WIDTH'] = (
             (df[f'{prefix}_UPPER'] - df[f'{prefix}_LOWER']) / df[f'{prefix}_MID'] * 100)
-    # 第二條上下線:σ<=0 或跟第一條一樣就不畫 (畫了也是重疊的兩條線)
-    if s_b > 0 and abs(s_b - s_a) > 1e-9:
-        df[f'{prefix}_UPPER2'] = df[f'{prefix}_MID'] + (s_b * df[f'{prefix}_STD'])
-        df[f'{prefix}_LOWER2'] = df[f'{prefix}_MID'] - (s_b * df[f'{prefix}_STD'])
     return df
 
 
@@ -127,11 +130,13 @@ def calculate_indicators(
     rsi_show: bool, rsi_p: str,
     kdj_show: bool, kd_n: str, kd_m1: str, kd_m2: str,
     dmi_show: bool, dmi_n: str,
-    bb_period=20, bb_std1=2.0, bb_std2=0.0,  # 【ADR-029】布林自訂:期間+兩組標準差 (std2<=0 不算第二組)
+    # 【ADR-029 → ADR-138】布林自訂:期間 + **上線 σ / 下線 σ 各一個**。
+    # ADR-138 之前這兩個是「內圈那對 / 外圈那對」,現在改成上下線各自獨立。
+    bb_period=20, bb_std_up=2.0, bb_std_dn=2.0,
     bb_type='SMA',                            # 【ADR-131】中線類型 SMA/EMA/WMA
-    # 【ADR-131】第2組完整布林 (自己的中線 + 自己的兩條上下線)。
+    # 【ADR-131】第2組完整布林 (自己的中線 + 自己的上下線)。
     # 全部給預設值,舊呼叫端不傳也能跑。
-    bb2_show=False, bb2_period=60, bb2_std1=2.0, bb2_std2=0.0, bb2_type='SMA',
+    bb2_show=False, bb2_period=60, bb2_std_up=2.0, bb2_std_dn=2.0, bb2_type='SMA',
 ) -> pd.DataFrame:
     df = df.copy()
 
@@ -149,13 +154,13 @@ def calculate_indicators(
         # 第1組布林:**沿用原本的欄位名** (BB_MID/BB_UPPER/...),所以既有的
         # 繪圖、十字線提示、BBW 副圖完全不用改 —— 這是 ADR-131 刻意的選擇,
         # 把新功能的迴歸風險壓在「只有第2組是新的」。
-        bollinger_set(df, bb_period, bb_std1, bb_std2, ma_type=bb_type,
+        bollinger_set(df, bb_period, bb_std_up, bb_std_dn, ma_type=bb_type,
                       prefix='BB', with_width=True)
 
     if bb2_show:
-        # 【ADR-131】第2組布林:自己的中線期間/類型 + 自己的兩條上下線。
+        # 【ADR-131】第2組布林:自己的中線期間/類型 + 自己的上下線。
         # BB_WIDTH 只由第1組產生 (副圖只有一條,不改副圖語意)。
-        bollinger_set(df, bb2_period, bb2_std1, bb2_std2, ma_type=bb2_type,
+        bollinger_set(df, bb2_period, bb2_std_up, bb2_std_dn, ma_type=bb2_type,
                       prefix='BB2', with_width=False)
 
     try:

@@ -112,7 +112,8 @@ DEFAULT_INDICATOR_SETTINGS = {
     'ma_periods': ['5', '10', '20', '60', '120', '240'],
     'ma_colors': [],  # 空 = 沿用程式預設色盤 (第一次啟動,尚未存檔)
     'bb_show': False, 'bb_color': '青 (#00E5FF)',
-    'bb_period': 20, 'bb_std1': 2.0, 'bb_std2': 3.0,
+    # 【ADR-138】上線 σ / 下線 σ 各一個 (原本是「內圈那對 / 外圈那對」)
+    'bb_period': 20, 'bb_std_up': 2.0, 'bb_std_dn': 2.0,
     'var_bbw': False,
     'var_macd': True, 'macd_f': '12', 'macd_s': '26', 'macd_sig': '9',
     'var_rsi': False, 'rsi_p': '14',
@@ -121,28 +122,77 @@ DEFAULT_INDICATOR_SETTINGS = {
 }
 
 
+def migrate_indicator_settings(saved: dict) -> dict:
+    """【ADR-138】把舊格式的布林 σ 欄位換成新格式,回傳新的 dict (不改原物件)。
+
+    舊格式 (ADR-029 ~ ADR-131):
+        `{p}_std1` = 內圈那**一對**上下線的 σ、`{p}_std2` = 外圈那一對的 σ,
+        兩對同色,σ2<=0 就不畫外圈。
+    新格式 (ADR-138,使用者要求「我要上線一個參數,下線一個參數,兩個要分開」):
+        `{p}_std_up` = **上線**的 σ、`{p}_std_dn` = **下線**的 σ,只有一對,
+        但上下可以不對稱。
+
+    遷移規則:`std_up = std_dn = 舊的 std1`,舊的 std2 (外圈) **直接捨棄**。
+
+    刻意不拿 std2 當下線的 σ:使用者設 σ1=2/σ2=3 的意思是「2σ 一對 + 3σ 一對」,
+    若對映成「上 2σ、下 3σ」,他會在圖上看到一條自己從沒設定過的歪斜通道,
+    而且沒有任何提示。寧可少畫一對 (那是這次功能改動本來就會發生的事,
+    ADR 有寫明),也不要偷偷改掉他既有那對的形狀。
+
+    新 key 只要**已經存在**就完全不動 —— 這樣重跑遷移是冪等的。
+    """
+    out = dict(saved or {})
+    for p in ('bb', 'bb2'):
+        if f'{p}_std_up' in out or f'{p}_std_dn' in out:
+            continue
+        legacy = out.get(f'{p}_std1')
+        if legacy is None:
+            continue
+        try:
+            v = float(legacy)
+        except (TypeError, ValueError):
+            continue
+        if v <= 0:
+            continue
+        out[f'{p}_std_up'] = v
+        out[f'{p}_std_dn'] = v
+    return out
+
+
 def load_indicator_settings(path: str) -> dict:
     """讀取指標參數設定。檔案不存在/壞掉/欄位不完整都回傳預設值 (絕不因為
     設定檔壞掉就讓圖表畫不出來——這條路徑只影響「用什麼參數」,不影響
-    「畫不畫得出圖」)。"""
+    「畫不畫得出圖」)。
+
+    【ADR-138 修正】原本這裡是 `for k in DEFAULT_INDICATOR_SETTINGS`,
+    也就是**只認得預設 dict 裡列出的 key**。ADR-131 (布林中線類型/第2組)、
+    ADR-133 (黃金切割)、ADR-134 (KDJ 超買賣線/JAE) 新增的設定都沒補進
+    這份預設 dict,結果是「存檔時被濾掉、讀檔時也被濾掉」—— 那幾輪的參數
+    從頭到尾就沒有真的持久化過,使用者每次重開都回到程式碼預設值。
+    改成保留 saved 裡的**所有** key;值合不合法由呼叫端逐項 try/except
+    (`_apply_indicator_settings`) 判斷,那裡本來就是這樣寫的。
+    """
     settings = json.loads(json.dumps(DEFAULT_INDICATOR_SETTINGS))  # 深拷貝
     if os.path.exists(path):
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 saved = json.load(f)
-            for k in DEFAULT_INDICATOR_SETTINGS:
-                if k in saved:
-                    settings[k] = saved[k]
+            if isinstance(saved, dict):
+                settings.update(migrate_indicator_settings(saved))
         except Exception:
             pass
     return settings
 
 
 def save_indicator_settings(path: str, settings: dict):
+    """【ADR-138 修正】原本只寫出 DEFAULT_INDICATOR_SETTINGS 列到的 key,
+    見 load_indicator_settings 的說明 —— 現在呼叫端給什麼就存什麼,
+    缺的 key 才補預設值。"""
     try:
+        out = json.loads(json.dumps(DEFAULT_INDICATOR_SETTINGS))
+        out.update(settings or {})
         with open(path, 'w', encoding='utf-8') as f:
-            json.dump({k: settings.get(k, DEFAULT_INDICATOR_SETTINGS[k]) for k in DEFAULT_INDICATOR_SETTINGS},
-                      f, ensure_ascii=False, indent=2)
+            json.dump(out, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 

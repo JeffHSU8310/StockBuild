@@ -60,6 +60,33 @@ COMMANDS = {
 }
 
 
+def control_status(cfg):
+    """【ADR-138】回傳 (是否啟用, 給人看的原因)。
+
+    起因:使用者回報「我在 Telegram 打 /help 完全沒有回應,但系統傳給我的
+    訊息我收得到」。查下來不是 Telegram 那邊的問題,而是**通知與遠端控制是
+    兩個獨立開關**(ADR-108 刻意這樣設計:通知是唯讀推播,遠端控制能讓系統
+    開始下單,風險等級不同)。只勾「啟用 Telegram 通知」的話,輪詢執行緒
+    根本不會建立,打什麼指令都不會有回應。
+
+    而當時**連一行日誌都沒有** —— 沒開就靜悄悄什麼都不做,使用者無從得知
+    自己少勾了一個框。這個函式就是要讓那個狀態說得出口 (P-02 的精神:
+    沒有的東西要明講,不要靜默)。
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    has_token = bool(str(cfg.get('bot_token', '')).strip())
+    has_chat = bool(str(cfg.get('chat_id', '')).strip())
+    if not cfg.get('remote_control'):
+        return False, ("未啟用手機遠端控制 —— 這與「啟用 Telegram 通知」是兩個"
+                       "獨立的勾選框,只勾通知的話手機下指令不會有任何回應。"
+                       "請到「Telegram 設定」勾選「⚠️ 啟用手機遠端控制」。")
+    if not has_token or not has_chat:
+        missing = '、'.join([x for x, ok in (('Bot Token', has_token),
+                                             ('Chat ID', has_chat)) if not ok])
+        return False, f"已勾選遠端控制,但 {missing} 沒有填,無法啟動輪詢。"
+    return True, f"已啟用手機遠端控制;只有 Chat ID {str(cfg.get('chat_id')).strip()} 下的指令會被接受。"
+
+
 def is_authorized(chat_id, allowed_chat_id):
     """只有設定檔裡那一個 chat_id 可以下指令。
 
