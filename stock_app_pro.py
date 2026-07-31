@@ -8846,14 +8846,18 @@ class StockTradingAppPro(tk.Tk):
         實測回報的重大落差,這裡補上以B (實際下單/實際損益) 的即時價為準的
         獨立監控通道,不影響原本以A為準、K棒收盤才判定的既有邏輯 (兩者互不
         排斥,誰先觸發就用誰的結果,觸發後 state 變 FLAT,另一邊自然是no-op)。
-        股票/零股不受影響,維持原本K棒收盤才判定的行為。"""
+
+        【ADR-135】**股票/零股也適用了**(原本只做期貨)。使用者:「停損停利
+        點數到了,就立即執行,不需要等待到收盤。」"""
         if not live_price_by_symbol:
             return
         for s in list(self.strategies):
             if not s.get('enabled'):
                 continue
-            if strategy_engine.trade_type_of(s) != '期貨':
-                continue
+            # 【ADR-135】原本這裡擋掉非期貨。使用者要求「停損停利點數到了就立即
+            # 執行,不需要等待到收盤」,沒有限定商品別 —— 拿掉限制,股票/零股也
+            # 走同一條即時監控。上游 _qt_update_realtime_pnl 本來就同時解析
+            # 股票與期貨合約,live_price_by_symbol 涵蓋得到。
             # 【ADR-124】這條路原本**完全沒有交易時段閘門** —— 它掛在
             # _qt_update_realtime_pnl 底下每 3 秒跑一次,不看時間。使用者實測:
             # 終極波段 12:01 開的空單,在 **15:00:01 夜盤開盤第一秒**被平掉
@@ -9197,6 +9201,42 @@ class StockTradingAppPro(tk.Tk):
             _time.sleep(2)
 
     # ---------- 策略編輯器 ----------
+    def _qt_build_price_type_row(self, parent, s, cb_tt):
+        """【ADR-135】委託方式 (限價/市價/範圍市價) 這一列,內建與自訂策略共用。
+
+        規則有兩條外部依據,**只能有一份實作**(兩份遲早分歧,P-67):
+          · 範圍市價僅期貨支援 (TAIFEX 規則)
+          · 零股依交易所規則只能限價 (鐵則6)
+        會跟著「交易種類」下拉即時切換可選值。回傳 {'get': callable}。
+        """
+        row = tk.Frame(parent, bg="#1A2026")
+        tk.Label(row, text="委託方式", bg="#1A2026", fg="white",
+                 font=('微軟正黑體', 9)).pack(side=tk.LEFT)
+        cb_ptype = ttk.Combobox(row, width=8, state='readonly', style="BlackText.TCombobox")
+        cb_ptype.pack(side=tk.LEFT, padx=6)
+        hint = tk.Label(row, bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8))
+        hint.pack(side=tk.LEFT, padx=(6, 0))
+
+        def _sync(*_a):
+            tt_now = cb_tt.get()
+            if tt_now == '期貨':
+                vals = list(strategy_engine.PRICE_TYPES)
+                txt = "限價才會套用「讓價檔數」讓價;市價/範圍市價 依當下市場成交(價格送0)。"
+            elif tt_now == '零股':
+                vals = ['限價']
+                txt = "零股依交易所規則只能限價 (鐵則6),市價/範圍市價 不開放。"
+            else:
+                vals = ['限價', '市價']
+                txt = "限價才會套用「讓價檔數」讓價;市價 依當下市場成交(價格送0)。股票無範圍市價。"
+            cb_ptype.config(values=vals)
+            cur = s.get('price_type', '限價') if not cb_ptype.get() else cb_ptype.get()
+            cb_ptype.set(cur if cur in vals else '限價')
+            hint.config(text=txt)
+
+        cb_tt.bind('<<ComboboxSelected>>', lambda e: _sync(), add='+')
+        _sync()
+        return {'frame': row, 'get': lambda: (cb_ptype.get() or '限價')}
+
     def _qt_open_custom_editor(self, strategy, readonly=False):
         """【ADR-040】自訂 Python 策略編輯器:基本參數 + 程式碼區 + 安全警語。"""
         is_new = strategy is None
@@ -9264,12 +9304,68 @@ class StockTradingAppPro(tk.Tk):
         _lbl(top, "模式").grid(row=1, column=4, sticky='w', padx=(8, 0), pady=(6, 0))
         cb_mode = ttk.Combobox(top, values=['模擬', '實單'], width=7, state='readonly', style="BlackText.TCombobox")
         cb_mode.set(s.get('mode', '模擬')); cb_mode.grid(row=1, column=5, padx=4, pady=(6, 0))
-        # 【ADR-045】自訂策略不設 方向/停損%/停利% 欄位:做多做空、何時出場
-        # 全部由使用者的 on_bar 程式碼決定 (ctx.buy/sell/close_position,
-        # 移動停損可用 ctx.state + ctx.entry_price 自行實作)。
-        tk.Label(top, text="※ 方向與停損/停利不在此設定 — 由你的 on_bar 程式碼自行決定進出場。",
+        # 【ADR-045 → ADR-135】方向仍由 on_bar 的 BUY/SELL 決定 (不設欄位),
+        # 但**停損/停利改成可以設**:使用者要求自訂策略「其他的都跟內建策略基本
+        # 功能一樣」,而且要求「停損停利點數到了就立即執行」。
+        # 全部預設 0 = 停用 = 維持 ADR-045 的原意 (完全由程式碼控制出場);
+        # 有填才生效,所以既有自訂策略的行為不變。
+        tk.Label(top, text="※ 方向由你的 on_bar 程式碼決定 (BUY/SELL);"
+                          "下面的停損/停利留 0 就是完全交給程式碼控制。",
                  bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 9)).grid(
                  row=2, column=0, columnspan=6, sticky='w', pady=(6, 0))
+        _risk = tk.Frame(top, bg="#1A2026")
+        _risk.grid(row=8, column=0, columnspan=7, sticky='w', pady=(6, 0))
+        tk.Label(_risk, text="停損%", bg="#1A2026", fg="white",
+                 font=('微軟正黑體', 9)).pack(side=tk.LEFT)
+        e_sl = _ent(_risk, s.get('stop_loss_pct', 0.0), 6); e_sl.pack(side=tk.LEFT, padx=(2, 8))
+        tk.Label(_risk, text="停利%", bg="#1A2026", fg="white",
+                 font=('微軟正黑體', 9)).pack(side=tk.LEFT)
+        e_tp = _ent(_risk, s.get('take_profit_pct', 0.0), 6); e_tp.pack(side=tk.LEFT, padx=(2, 8))
+        tk.Label(_risk, text="停損(元/點)", bg="#1A2026", fg="white",
+                 font=('微軟正黑體', 9)).pack(side=tk.LEFT)
+        e_sla = _ent(_risk, s.get('stop_loss_abs', 0.0), 7); e_sla.pack(side=tk.LEFT, padx=(2, 8))
+        tk.Label(_risk, text="停利(元/點)", bg="#1A2026", fg="white",
+                 font=('微軟正黑體', 9)).pack(side=tk.LEFT)
+        e_tpa = _ent(_risk, s.get('take_profit_abs', 0.0), 7); e_tpa.pack(side=tk.LEFT, padx=(2, 8))
+        tk.Label(_risk, text="讓價檔數", bg="#1A2026", fg="white",
+                 font=('微軟正黑體', 9)).pack(side=tk.LEFT)
+        e_slip = _ent(_risk, s.get('slippage_ticks', 0), 5); e_slip.pack(side=tk.LEFT, padx=2)
+        # 【ADR-136】即時觸發改成可勾選 (使用者要求),不分商品別。
+        var_intrabar = tk.BooleanVar(value=strategy_engine.intrabar_stop_enabled(s))
+        tk.Checkbutton(_risk, text="停損停利即時觸發 (盤中觸價就出場,不等收盤)",
+                       variable=var_intrabar, bg="#1A2026", fg="#FFCA28",
+                       selectcolor="#2A323D", font=('微軟正黑體', 9)).pack(side=tk.LEFT, padx=(10, 0))
+        tk.Label(top, text="※ 停損/停利 0=停用。勾「即時觸發」= 盤中觸價就出場;不勾 = 等該週期K棒收盤才判定。"
+                          "回測會照同一個設定模擬 (勾了就用當根高低點判斷觸價)。",
+                 bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8)).grid(
+                 row=9, column=0, columnspan=7, sticky='w')
+
+        # 【ADR-135】風控/時段欄位:原本自訂策略的編輯器沒有這幾項,但
+        # new_strategy() 的預設值 (每日3次、冷卻300秒、時段閘門開、含夜盤)
+        # **一直都在生效** —— 使用者看不到也改不了,正是 ADR-123 那個
+        # 「看不見的預設值」的同一類問題。這次一併攤開來可設定。
+        _risk2 = tk.Frame(top, bg="#1A2026")
+        _risk2.grid(row=10, column=0, columnspan=7, sticky='w', pady=(6, 0))
+        tk.Label(_risk2, text="每日進場上限", bg="#1A2026", fg="white",
+                 font=('微軟正黑體', 9)).pack(side=tk.LEFT)
+        e_maxd = _ent(_risk2, s.get('max_trades_per_day', 3), 5); e_maxd.pack(side=tk.LEFT, padx=(2, 8))
+        tk.Label(_risk2, text="冷卻秒數", bg="#1A2026", fg="white",
+                 font=('微軟正黑體', 9)).pack(side=tk.LEFT)
+        e_cool = _ent(_risk2, s.get('cooldown_sec', 300), 6); e_cool.pack(side=tk.LEFT, padx=(2, 8))
+        tk.Label(_risk2, text="期貨時段", bg="#1A2026", fg="white",
+                 font=('微軟正黑體', 9)).pack(side=tk.LEFT)
+        cb_fsess = ttk.Combobox(_risk2, values=['日盤+夜盤', '只做日盤'], width=9,
+                                state='readonly', style="BlackText.TCombobox")
+        cb_fsess.set('只做日盤' if s.get('futures_session') == 'day' else '日盤+夜盤')
+        cb_fsess.pack(side=tk.LEFT, padx=(2, 8))
+        var_sess_gate = tk.BooleanVar(value=bool(s.get('session_gate', True)))
+        tk.Checkbutton(_risk2, text="交易時段閘門 (非交易時間待命)", variable=var_sess_gate,
+                       bg="#1A2026", fg="white", selectcolor="#2A323D",
+                       font=('微軟正黑體', 9)).pack(side=tk.LEFT)
+
+        # 【ADR-135】委託方式 (限價/市價/範圍市價) —— 與內建策略共用同一份規則
+        _pt = self._qt_build_price_type_row(top, s, cb_tt)
+        _pt['frame'].grid(row=11, column=0, columnspan=7, sticky='w', pady=(6, 0))
         _lbl(top, "自訂參數 (key=value,逗號分隔)").grid(row=3, column=0, columnspan=2, sticky='w', pady=(6, 0))
         params_str = ", ".join(f"{k}={v}" for k, v in (s.get('custom_params', {}) or {}).items())
         e_params = _ent(top, params_str, 34); e_params.grid(row=3, column=2, columnspan=3, sticky='w', padx=4, pady=(6, 0))
@@ -9390,8 +9486,29 @@ class StockTradingAppPro(tk.Tk):
             s['direction'] = s.get('direction', '做多') or '做多'
             try: s['qty'] = int(e_qty.get().strip())
             except (TypeError, ValueError): s['qty'] = 0
-            s['stop_loss_pct'] = float(s.get('stop_loss_pct', 0.0) or 0.0)
-            s['take_profit_pct'] = float(s.get('take_profit_pct', 0.0) or 0.0)
+            # 【ADR-135】停損/停利改成從欄位讀 (0=停用,維持 ADR-045 的原意)
+            def _f(entry, default=0.0):
+                try:
+                    return float(entry.get().strip())
+                except (TypeError, ValueError):
+                    return default
+
+            def _i(entry, default):
+                try:
+                    return int(float(entry.get().strip()))
+                except (TypeError, ValueError):
+                    return default
+            s['stop_loss_pct'] = _f(e_sl)
+            s['take_profit_pct'] = _f(e_tp)
+            s['stop_loss_abs'] = _f(e_sla)
+            s['take_profit_abs'] = _f(e_tpa)
+            s['slippage_ticks'] = _i(e_slip, 0)
+            s['max_trades_per_day'] = _i(e_maxd, 3)
+            s['cooldown_sec'] = _i(e_cool, 300)
+            s['futures_session'] = 'day' if cb_fsess.get() == '只做日盤' else 'day_night'
+            s['session_gate'] = bool(var_sess_gate.get())
+            s['intrabar_stop'] = bool(var_intrabar.get())
+            s['price_type'] = _pt['get']()
             s['entry_time_start'] = e_en_st.get().strip()
             s['entry_time_end'] = e_en_ed.get().strip()
             s['exit_time_start'] = e_ex_st.get().strip()
@@ -9424,6 +9541,13 @@ class StockTradingAppPro(tk.Tk):
                     return False, "已啟用「看A做B」,但『看A』的商品代碼不可空白"
                 if strategy_engine.watch_timeframe_of(strat) not in strategy_engine.VALID_TIMEFRAMES:
                     return False, "『看A』的週期不合法"
+            # 【ADR-135】自訂策略也能選委託方式了 → 用**同一份**交易所規則檢查
+            # (範圍市價僅期貨、零股只能限價)。
+            _ok_pt, _why_pt = strategy_engine.validate_price_type(strat)
+            if not _ok_pt:
+                return False, _why_pt
+            if not strategy_engine.is_valid_timeframe(strat.get('timeframe')):
+                return False, "週期格式不正確 (可選 5分K/15分K/30分K/60分K/日K,或自訂 N分K/N時K)"
             # 【ADR-045】改用 AST 靜態檢查 (core/custom_strategy.validate_source),
             # 絕不在主行程 exec 使用者程式碼:舊版 exec 檢查 (1) 與「策略在獨立
             # 子行程執行」的安全承諾矛盾,頂層 while True 會凍死 GUI;(2) 使用者
@@ -9873,30 +9997,9 @@ class StockTradingAppPro(tk.Tk):
         tk.Label(top, text="(做空僅限期貨)", bg="#1A2026", fg="#8A99AD",
                  font=('微軟正黑體', 8)).grid(row=4, column=4, columnspan=2, sticky='w', padx=(8, 0), pady=(8, 0))
 
-        # 【新ADR】委託方式:限價/市價/範圍市價 (範圍市價僅期貨;零股鐵則6鎖限價)
-        _lbl(top, "委託方式").grid(row=5, column=0, sticky='w', pady=(8, 0))
-        cb_ptype = ttk.Combobox(top, width=8, state='readonly', style="BlackText.TCombobox")
-        cb_ptype.grid(row=5, column=1, padx=4, pady=(8, 0), sticky='w')
-        lbl_ptype_hint = tk.Label(top, bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8))
-        lbl_ptype_hint.grid(row=5, column=2, columnspan=4, sticky='w', padx=(8, 0), pady=(8, 0))
-
-        def _sync_ptype_options(*_a):
-            tt_now = cb_tt.get()
-            if tt_now == '期貨':
-                vals = list(strategy_engine.PRICE_TYPES)
-                hint = "限價套用「讓價檔數」;市價/範圍市價 依當下市場成交。"
-            elif tt_now == '零股':
-                vals = ['限價']
-                hint = "零股依交易所規則只能限價 (鐵則6)。"
-            else:
-                vals = ['限價', '市價']
-                hint = "限價套用「讓價檔數」;市價 依當下市場成交。股票無範圍市價。"
-            cb_ptype.config(values=vals)
-            cur = s.get('price_type', '限價') if not cb_ptype.get() else cb_ptype.get()
-            cb_ptype.set(cur if cur in vals else '限價')
-            lbl_ptype_hint.config(text=hint)
-        cb_tt.bind('<<ComboboxSelected>>', lambda e: _sync_ptype_options(), add='+')
-        _sync_ptype_options()
+        # 【ADR-135】委託方式改用共用函式 (原本這裡是第三份複製)
+        _pt = self._qt_build_price_type_row(top, s, cb_tt)
+        _pt['frame'].grid(row=5, column=0, columnspan=6, sticky='w', pady=(8, 0))
 
         # 【新ADR 多帳戶】模擬成交要記進哪個模擬帳戶
         _lbl(top, "模擬帳戶").grid(row=6, column=0, sticky='w', pady=(8, 0))
@@ -9981,7 +10084,7 @@ class StockTradingAppPro(tk.Tk):
             except (TypeError, ValueError):
                 s['qty'] = 0
             s['mode'] = cb_mode.get()
-            s['price_type'] = cb_ptype.get() or '限價'
+            s['price_type'] = _pt['get']()
             s['account_id'] = _ids2[cb_acct2.current()] if cb_acct2.current() >= 0 else 'default'
             # 【ADR-110階段2】實單要下到哪一家券商的哪一個帳號
             s['broker'], s['broker_account'] = _live_get()
@@ -10224,6 +10327,14 @@ class StockTradingAppPro(tk.Tk):
         tk.Label(top, text="(格式: HH:MM 或 HH:MM:SS)", bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8)).grid(row=8, column=2, columnspan=2, sticky='w', pady=(6, 0))
         tk.Label(top, text="⚠ 停損%/停利%/停損(元)/停利(元)/出場訊號 至少要有一種不為 0,否則無法儲存 (持倉會永遠不出場)",
                  bg="#1A2026", fg="#FFCA28", font=('微軟正黑體', 8)).grid(row=9, column=0, columnspan=6, sticky='w', pady=(2, 0))
+        # 【ADR-136】停損停利即時觸發:改成可勾選,不分商品別。
+        # 舊策略沒有這個欄位時,intrabar_stop_enabled() 會沿用它原本的行為
+        # (期貨=即時、股票=收盤才判定),所以勾選框打開時顯示的就是現況。
+        var_intrabar = tk.BooleanVar(value=strategy_engine.intrabar_stop_enabled(s))
+        tk.Checkbutton(top, text="停損停利即時觸發 (盤中觸價就出場,不等K棒收盤;回測同步照此模擬)",
+                       variable=var_intrabar, bg="#1A2026", fg="#FFCA28", selectcolor="#2A323D",
+                       font=('微軟正黑體', 9)).grid(row=10, column=0, columnspan=6,
+                                                    sticky='w', pady=(2, 0))
         # 【ADR-059】買進後持有不賣 (Buy & Hold):使用者要拿它當比較基準。
         # 勾了就放行「沒有出場方式」的驗證,但只限回測/模擬 (見 validate_strategy)。
         var_bnh = tk.BooleanVar(value=bool(s.get('buy_and_hold', False)))
@@ -10289,34 +10400,9 @@ class StockTradingAppPro(tk.Tk):
         cb_mode = ttk.Combobox(top, values=['模擬', '實單'], width=7, state='readonly', style="BlackText.TCombobox")
         cb_mode.set(s.get('mode', '模擬')); cb_mode.grid(row=3, column=5, padx=4, pady=(6, 0))
 
-        # 【新ADR】委託方式:限價/市價/範圍市價。範圍市價僅期貨支援 (TAIFEX規則);
-        # 零股依鐵則6只能限價,交易種類選零股時鎖住只剩「限價」可選。
-        _ptype_row = tk.Frame(top, bg="#1A2026")
-        _ptype_row.grid(row=12, column=0, columnspan=7, sticky='w', pady=(2, 0))
-        tk.Label(_ptype_row, text="委託方式", bg="#1A2026", fg="white",
-                 font=('微軟正黑體', 9)).pack(side=tk.LEFT)
-        cb_ptype = ttk.Combobox(_ptype_row, width=8, state='readonly', style="BlackText.TCombobox")
-        cb_ptype.pack(side=tk.LEFT, padx=6)
-        _lbl_ptype_hint = tk.Label(_ptype_row, bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8))
-        _lbl_ptype_hint.pack(side=tk.LEFT, padx=(6, 0))
-
-        def _sync_ptype_options(*_a):
-            tt_now = cb_tt.get()
-            if tt_now == '期貨':
-                vals = list(strategy_engine.PRICE_TYPES)
-                hint = "限價才會套用「讓價檔數」讓價;市價/範圍市價 依當下市場成交(價格送0)。"
-            elif tt_now == '零股':
-                vals = ['限價']
-                hint = "零股依交易所規則只能限價 (鐵則6),市價/範圍市價 不開放。"
-            else:  # 股票
-                vals = ['限價', '市價']
-                hint = "限價才會套用「讓價檔數」讓價;市價 依當下市場成交(價格送0)。股票無範圍市價。"
-            cb_ptype.config(values=vals)
-            cur = s.get('price_type', '限價') if not cb_ptype.get() else cb_ptype.get()
-            cb_ptype.set(cur if cur in vals else '限價')
-            _lbl_ptype_hint.config(text=hint)
-        cb_tt.bind('<<ComboboxSelected>>', lambda e: _sync_ptype_options(), add='+')
-        _sync_ptype_options()
+        # 【ADR-135】委託方式改用共用函式 (規則的依據是交易所規定,只能有一份)
+        _pt = self._qt_build_price_type_row(top, s, cb_tt)
+        _pt['frame'].grid(row=12, column=0, columnspan=7, sticky='w', pady=(2, 0))
 
         # 【新ADR 多帳戶】模擬成交要記進哪個模擬帳戶——不同策略選不同帳戶,
         # 同一檔標的在不同策略下的部位才不會互相覆蓋 (見 core/paper_account.py
@@ -10563,7 +10649,7 @@ class StockTradingAppPro(tk.Tk):
             except (TypeError, ValueError): s['take_profit_abs'] = 0.0
             try: s['slippage_ticks'] = int(e_slip.get().strip())
             except (TypeError, ValueError): s['slippage_ticks'] = 2
-            s['price_type'] = cb_ptype.get() or '限價'
+            s['price_type'] = _pt['get']()
             s['account_id'] = _ids2[cb_acct2.current()] if cb_acct2.current() >= 0 else 'default'
             # 【ADR-110階段2】實單要下到哪一家券商的哪一個帳號
             s['broker'], s['broker_account'] = _live_get()
@@ -10577,6 +10663,7 @@ class StockTradingAppPro(tk.Tk):
             # 【ADR-070】交易時段閘門設定
             s['futures_session'] = 'day' if cb_fut_sess.get() == '只做日盤' else 'day_night'
             s['session_gate'] = bool(var_sess_gate.get())
+            s['intrabar_stop'] = bool(var_intrabar.get())
             # 【ADR-101】籌碼未來函數開關 (進階;預設 False = 只讀前一日籌碼)
             s['chips_allow_same_day'] = bool(var_chip_sameday.get())
             # 【ADR-074】看A做B 設定

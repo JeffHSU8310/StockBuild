@@ -5553,6 +5553,181 @@ run_case("ADR-134: 副圖指標整合入口 + JAE 新指標 + KDJ 超買超賣�
          _sub_indicators_and_jae_134)
 
 
+def _custom_parity_and_intrabar_stop_135():
+    """【ADR-135】(1) 自訂策略補齊內建策略的基本功能 (2) 停損停利即時觸發。
+
+    使用者要求:
+      「1.在自訂策略中,也會用到看A做B & 看A週期做B週期 & 下單數量 & 週期 &
+          市價單/範圍市價/限價單 & 快選功能(同內建策略一樣),也就是說,
+          我只要寫其他條件的程式就好。其他的都跟內建策略基本功能一樣。
+        2.還要有一個功能,停損停利點數到了,就立即執行。不需要等待到收盤。」
+
+    走**完整的 GUI 路徑**:純函式測不到「編輯器有沒有真的把欄位存進策略」,
+    也測不到「即時停損那條迴圈有沒有真的放行股票」(P-64)。
+    """
+    from core import strategy_engine as _se11
+
+    class FakeContract:
+        code = 'TSE'
+        symbol = '2330'
+
+    # ---- A. 自訂策略編輯器:欄位齊備 (原始碼層級 + 存檔行為) ----
+    _src = open('stock_app_pro.py', encoding='utf-8').read()
+    # 【切片要切準】第一版寫成「切到 def _qt_open_editor 為止」,但那中間還夾著
+    # 終極波段編輯器 —— 它的 _collect 也有 s['price_type'] = ...,於是「自訂策略
+    # 有沒有存委託方式」的斷言被隔壁那一份餵飽,把該行刪掉照樣綠 (突變測試抓到)。
+    # 改成切到**下一個同縮排的方法定義**為止。
+    import re as _re135
+    _cut = _src.index('    def _qt_open_custom_editor')
+    _m135 = _re135.search(r'\n    def (?!_qt_open_custom_editor)\w+', _src[_cut + 10:])
+    assert _m135, "切不出自訂策略編輯器的範圍"
+    _body = _src[_cut:_cut + 10 + _m135.start()]
+    assert 'def _qt_open_chukuangren_editor' not in _body, "切片不可以吃到別的編輯器"
+    assert 'def _qt_open_editor' not in _body, "切片不可以吃到內建編輯器"
+    for _need, _why in (
+            ("_qt_build_watch_panel", "看A做B (含看A週期)"),
+            ("_qt_build_price_type_row", "委託方式 (限價/市價/範圍市價)"),
+            ("e_qty", "下單數量"),
+            ("cb_tf", "週期"),
+            ("_qt_editor_symbol_target", "自選股快選帶入"),
+            ("stop_loss_abs", "停損點數"),
+            ("take_profit_abs", "停利點數"),
+            ("max_trades_per_day", "每日進場上限"),
+            ("cooldown_sec", "冷卻秒數"),
+            ("session_gate", "交易時段閘門"),
+            ("futures_session", "期貨時段"),
+            ("slippage_ticks", "讓價檔數")):
+        assert _need in _body, f"自訂策略編輯器缺少「{_why}」({_need})"
+
+    # 委託方式那一列要跟內建策略**共用同一個函式**,不可以各寫一份
+    assert _src.count('def _qt_build_price_type_row') == 1
+    assert _src.count('_qt_build_price_type_row(') >= 3, \
+        "委託方式應由內建與自訂兩個編輯器共用同一個建構函式"
+    # 而且規則本身要在 core (交易所規則只能有一份)
+    assert 'strategy_engine.validate_price_type' in _body, \
+        "自訂策略存檔要用 core 的同一份委託方式規則"
+    # 光是「有建出那一列」不夠 —— 存檔時要真的寫進策略,否則使用者選了也沒用
+    # (突變測試抓到的:把這一行刪掉,上面每一條斷言都還是綠的)。
+    for _assign, _why2 in (("s['price_type']", "委託方式"),
+                           ("s['stop_loss_abs']", "停損點數"),
+                           ("s['take_profit_abs']", "停利點數"),
+                           ("s['max_trades_per_day']", "每日進場上限"),
+                           ("s['cooldown_sec']", "冷卻秒數"),
+                           ("s['futures_session']", "期貨時段"),
+                           ("s['session_gate']", "交易時段閘門"),
+                           ("s['slippage_ticks']", "讓價檔數")):
+        assert f"{_assign} =" in _body, f"自訂策略存檔沒有寫入「{_why2}」({_assign})"
+
+    # ---- B. 委託方式規則:自訂策略走的是同一套 ----
+    for _tt, _pt, _want in (('期貨', '範圍市價', True), ('股票', '範圍市價', False),
+                            ('零股', '市價', False), ('零股', '限價', True),
+                            ('股票', '市價', True)):
+        _st = _se11.new_strategy()
+        _st.update({'trade_type': _tt, 'price_type': _pt})
+        _ok, _ = _se11.validate_price_type(_st)
+        assert _ok == _want, f"{_tt}+{_pt} 的委託方式判定不對 (期望 {_want})"
+
+    # ---- C. 停損停利即時觸發:股票也適用 ----
+    logs = []
+    orig_log = app.log_message
+    orig_running, orig_login, orig_api = app._qt_running, app.api_logged_in, app.sj_api
+    orig_strats, orig_rts = app.strategies, app.strategy_runtimes
+    orig_resolve = app._qt_resolve
+    _msess = stock_app_pro.market_session
+    orig_open = _msess.is_market_open
+
+    def _mount(**over):
+        s = _se11.new_strategy()
+        s.update({'name': '診斷ADR135', 'symbol': '2330', 'trade_type': '股票',
+                  'market': '台股', 'qty': 1, 'direction': '做多', 'mode': '模擬',
+                  'enabled': True, 'session_gate': False,
+                  'stop_loss_abs': 5.0, 'take_profit_abs': 0.0,
+                  'stop_loss_pct': 0.0, 'take_profit_pct': 0.0})
+        s.update(over)
+        rt = _se11.new_runtime()
+        rt.update({'state': 'LONG', 'qty': 1, 'entry_price': 600.0,
+                   'exec_entry_price': 600.0})
+        app.strategies = [s]
+        app.strategy_runtimes = {s['id']: rt}
+        return s, rt
+
+    try:
+        app.log_message = lambda m: (logs.append(str(m)), orig_log(m))[0]
+        app._qt_resolve = lambda _s: (FakeContract(), 'stock')
+        app.sj_api = object(); app.api_logged_in = True; app._qt_running = True
+        _msess.is_market_open = lambda *a, **k: True
+
+        # 1) 股票跌破停損點數 → **立刻**出場 (不等K棒收盤)
+        _s1, rt1 = _mount()
+        logs.clear()
+        app._qt_check_realtime_futures_stops({'2330': 594.0})   # 跌6元 > 5元
+        app.flush_after()
+        assert rt1['state'] == 'FLAT', \
+            f"股票停損點數到了要立刻出場 (state 仍是 {rt1['state']})"
+
+        # 2) 反向對照:沒到停損點不可以出場 (否則等於一有部位就砍)
+        _s2, rt2 = _mount()
+        app._qt_check_realtime_futures_stops({'2330': 597.0})   # 只跌3元 < 5元
+        app.flush_after()
+        assert rt2['state'] == 'LONG', "沒到停損點不可以出場"
+
+        # 3) 停利點數同樣即時
+        _s3, rt3 = _mount(stop_loss_abs=0.0, take_profit_abs=8.0)
+        app._qt_check_realtime_futures_stops({'2330': 609.0})   # 漲9元 > 8元
+        app.flush_after()
+        assert rt3['state'] == 'FLAT', "股票停利點數到了也要立刻出場"
+
+        # 4) 零股也適用
+        _s4, rt4 = _mount(trade_type='零股', qty=100)
+        app._qt_check_realtime_futures_stops({'2330': 594.0})
+        app.flush_after()
+        assert rt4['state'] == 'FLAT', "零股也要適用即時停損"
+
+        # 5) 期貨沒有被弄壞 (原本就有的行為)
+        _s5, rt5 = _mount(trade_type='期貨', symbol='TXF', market='台期貨',
+                          stop_loss_abs=70.0)
+        rt5.update({'entry_price': 44402.0, 'exec_entry_price': 44402.0})
+        app._qt_check_realtime_futures_stops({'TXF': 44277.0})  # 跌125點 > 70點
+        app.flush_after()
+        assert rt5['state'] == 'FLAT', "期貨的即時停損不可以被弄壞"
+
+        # 6) 【ADR-124 的閘門仍在】市場關閉時不可以出場
+        _msess.is_market_open = lambda *a, **k: False
+        _s6, rt6 = _mount(session_gate=True)
+        app._qt_check_realtime_futures_stops({'2330': 500.0})   # 跌很多
+        app.flush_after()
+        assert rt6['state'] == 'LONG', "市場關閉時這條路徑仍然不該出場 (ADR-124)"
+        _msess.is_market_open = lambda *a, **k: True
+
+        # 7) 【ADR-136】即時觸發改成可勾選:沒勾就不可以即時出場
+        _s7, rt7 = _mount(intrabar_stop=False)
+        app._qt_check_realtime_futures_stops({'2330': 500.0})
+        app.flush_after()
+        assert rt7['state'] == 'LONG', "沒勾『即時觸發』就不該盤中出場 (要等K棒收盤)"
+        # 正控:勾了就要出場 (少了這條,把功能整個關掉也會綠)
+        _s8, rt8 = _mount(intrabar_stop=True)
+        app._qt_check_realtime_futures_stops({'2330': 500.0})
+        app.flush_after()
+        assert rt8['state'] == 'FLAT', "勾了『即時觸發』就要盤中出場"
+
+        # 8) 兩個編輯器都要有這個勾選框,而且存檔要真的寫進去
+        _src2 = open('stock_app_pro.py', encoding='utf-8').read()
+        assert _src2.count("s['intrabar_stop'] = bool(var_intrabar.get())") == 2, \
+            "內建與自訂兩個編輯器都要把『即時觸發』存進策略"
+        assert _src2.count('strategy_engine.intrabar_stop_enabled(s)') >= 2, \
+            "兩個編輯器的勾選框都要用 core 的同一份相容判斷當初始值"
+    finally:
+        app.log_message = orig_log
+        app._qt_resolve = orig_resolve
+        _msess.is_market_open = orig_open
+        app._qt_running, app.api_logged_in, app.sj_api = orig_running, orig_login, orig_api
+        app.strategies, app.strategy_runtimes = orig_strats, orig_rts
+
+
+run_case("ADR-135: 自訂策略補齊內建基本功能 + 停損停利即時觸發 (不限期貨)",
+         _custom_parity_and_intrabar_stop_135)
+
+
 print(f"{'案例':60s} 結果")
 print("-" * 76)
 for name, st, msg in results:

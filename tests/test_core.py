@@ -999,13 +999,33 @@ class TestTradeTypeAndAbsStops(unittest.TestCase):
         intent = strategy_engine.check_intrabar_futures_stop(s, rt, 44350.0)  # 跌52點<70點
         self.assertIsNone(intent)
 
-    def test_intrabar_futures_stop_ignored_for_stocks(self):
+    def test_intrabar_stop_now_applies_to_stocks(self):
+        """【ADR-135】原本這條測「股票不適用即時停損」。使用者要求
+        「停損停利點數到了,就立即執行,不需要等待到收盤」且沒有限定商品別,
+        所以規則反過來了:**股票也要即時觸發**。同一組數字、相反的期待。"""
         s = strategy_engine.new_strategy()
         s.update({'name': 'ST', 'symbol': '2330', 'trade_type': '股票', 'stop_loss_abs': 5.0})
         rt = strategy_engine.new_runtime()
         rt.update({'state': 'LONG', 'qty': 1, 'exec_entry_price': 600.0})
-        intent = strategy_engine.check_intrabar_futures_stop(s, rt, 500.0)  # 跌100元遠超5元
-        self.assertIsNone(intent)  # 股票不受此新機制影響,維持K棒收盤才判定
+        intent = strategy_engine.check_intrabar_stop(s, rt, 500.0)   # 跌100元遠超5元
+        self.assertIsNotNone(intent, "股票也要即時停損 (ADR-135)")
+        self.assertEqual(intent['kind'], 'CLOSE')
+        # 反向對照:沒到停損點就不可以出場 (否則等於一有部位就砍)
+        self.assertIsNone(strategy_engine.check_intrabar_stop(s, rt, 597.0))
+
+    def test_intrabar_stop_applies_to_odd_lot_too(self):
+        s = strategy_engine.new_strategy()
+        s.update({'name': 'ODD', 'symbol': '2330', 'trade_type': '零股',
+                  'take_profit_abs': 10.0})
+        rt = strategy_engine.new_runtime()
+        rt.update({'state': 'LONG', 'qty': 100, 'exec_entry_price': 600.0})
+        self.assertIsNotNone(strategy_engine.check_intrabar_stop(s, rt, 615.0))
+        self.assertIsNone(strategy_engine.check_intrabar_stop(s, rt, 605.0))
+
+    def test_legacy_alias_still_points_at_the_same_function(self):
+        """舊名 check_intrabar_futures_stop 留成別名,既有呼叫端不必一次全改。"""
+        self.assertIs(strategy_engine.check_intrabar_futures_stop,
+                      strategy_engine.check_intrabar_stop)
 
     def test_intrabar_futures_stop_ignored_when_flat(self):
         s = strategy_engine.new_strategy()
@@ -7116,6 +7136,285 @@ class TestJAE(unittest.TestCase):
     def test_evaluate_returns_none_without_columns(self):
         self.assertIsNone(jae.evaluate(self._rising()))
         self.assertIsNone(jae.evaluate(None))
+
+
+
+class TestPriceTypeSharedRule(unittest.TestCase):
+    """【ADR-135】委託方式的規則抽成 validate_price_type(),內建與自訂策略共用。
+
+    這一份的依據是**交易所規則**(範圍市價僅期貨、零股只能限價/鐵則6),
+    分歧的後果是送出去會被券商退的委託 —— 所以只能有一份。
+    """
+
+    def _s(self, tt, pt):
+        s = strategy_engine.new_strategy()
+        s.update({'trade_type': tt, 'price_type': pt})
+        return s
+
+    def test_futures_can_use_all_three(self):
+        for pt in strategy_engine.PRICE_TYPES:
+            ok, why = strategy_engine.validate_price_type(self._s('期貨', pt))
+            self.assertTrue(ok, f"期貨 {pt} 應該可以: {why}")
+
+    def test_range_market_is_futures_only(self):
+        for tt in ('股票', '零股'):
+            ok, why = strategy_engine.validate_price_type(self._s(tt, '範圍市價'))
+            self.assertFalse(ok, f"{tt} 不該允許範圍市價")
+            self.assertIn('範圍市價', why)
+
+    def test_odd_lot_is_limit_only(self):
+        """鐵則6:零股依交易所規則只能限價。"""
+        for pt in ('市價', '範圍市價'):
+            ok, why = strategy_engine.validate_price_type(self._s('零股', pt))
+            self.assertFalse(ok, f"零股不該允許 {pt}")
+        ok, _ = strategy_engine.validate_price_type(self._s('零股', '限價'))
+        self.assertTrue(ok)
+
+    def test_stock_allows_limit_and_market(self):
+        for pt in ('限價', '市價'):
+            ok, why = strategy_engine.validate_price_type(self._s('股票', pt))
+            self.assertTrue(ok, f"股票 {pt} 應該可以: {why}")
+
+    def test_unknown_price_type_rejected(self):
+        ok, why = strategy_engine.validate_price_type(self._s('股票', '亂填'))
+        self.assertFalse(ok)
+
+    def test_validate_strategy_still_uses_the_same_rule(self):
+        """反向對照:抽出去之後,內建策略的驗證不可以就此失效。"""
+        s = self._s('零股', '市價')
+        s.update({'name': 'X', 'symbol': '2330', 'qty': 1, 'timeframe': '5分K',
+                  'direction': '做多', 'stop_loss_pct': 2.0})
+        ok, why = strategy_engine.validate_strategy(s)
+        self.assertFalse(ok)
+        self.assertIn('零股', why)
+
+
+
+class TestIntrabarStopToggle(unittest.TestCase):
+    """【ADR-136】停損停利即時觸發改成可勾選的選項,不分商品別。"""
+
+    def _s(self, tt='股票', **over):
+        s = strategy_engine.new_strategy()
+        s.update({'symbol': '2330', 'trade_type': tt, 'stop_loss_abs': 5.0})
+        s.update(over)
+        return s
+
+    def _rt(self, entry=600.0, state='LONG'):
+        rt = strategy_engine.new_runtime()
+        rt.update({'state': state, 'qty': 1, 'entry_price': entry, 'exec_entry_price': entry})
+        return rt
+
+    def test_new_strategy_defaults_to_on(self):
+        self.assertTrue(strategy_engine.new_strategy()['intrabar_stop'])
+
+    def test_explicit_setting_wins(self):
+        self.assertTrue(strategy_engine.intrabar_stop_enabled(self._s(intrabar_stop=True)))
+        self.assertFalse(strategy_engine.intrabar_stop_enabled(self._s(intrabar_stop=False)))
+        # 不分商品:期貨勾掉也要關得掉
+        self.assertFalse(strategy_engine.intrabar_stop_enabled(
+            self._s('期貨', intrabar_stop=False)))
+
+    def test_legacy_strategies_keep_their_old_behaviour(self):
+        """**沒有這個欄位的舊策略不可以被悄悄改掉行為。**
+
+        期貨從 ADR-087 起本來就是即時;股票/零股本來是K棒收盤才判定。"""
+        for tt, want in (('期貨', True), ('股票', False), ('零股', False)):
+            s = self._s(tt)
+            s.pop('intrabar_stop', None)
+            self.assertEqual(strategy_engine.intrabar_stop_enabled(s), want, tt)
+
+    def test_toggle_actually_gates_the_check(self):
+        s = self._s('股票', intrabar_stop=True)
+        self.assertIsNotNone(strategy_engine.check_intrabar_stop(s, self._rt(), 590.0))
+        s['intrabar_stop'] = False
+        self.assertIsNone(strategy_engine.check_intrabar_stop(s, self._rt(), 590.0),
+                          "沒勾就不可以即時觸發")
+
+    def test_chukuangren_still_excluded(self):
+        """反向對照:自己管出場的種類仍然不適用,勾了也一樣 (ADR-123)。"""
+        s = self._s('期貨', intrabar_stop=True)
+        s['kind'] = chukuangren_band.KIND
+        self.assertIsNone(strategy_engine.check_intrabar_stop(s, self._rt(40000.0), 30000.0))
+
+
+class TestBarStopExtracted(unittest.TestCase):
+    """【ADR-136】K棒收盤的停損判斷抽成 check_bar_stop(),讓自訂策略也能共用。"""
+
+    def _s(self, **over):
+        s = strategy_engine.new_strategy()
+        s.update({'symbol': '2330', 'trade_type': '股票', 'direction': '做多'})
+        # 【重要】new_strategy() 預設 stop_loss_pct=2.0 —— 不歸零的話每個案例
+        # 都同時有兩個停損在跑,測到的不是自己設的那一個 (第一版就是這樣紅的)。
+        for _k in ('stop_loss_pct', 'take_profit_pct', 'stop_loss_abs', 'take_profit_abs'):
+            s[_k] = 0.0
+        s.update(over)
+        return s
+
+    def _rt(self, entry=100.0, state='LONG'):
+        rt = strategy_engine.new_runtime()
+        rt.update({'state': state, 'qty': 1, 'entry_price': entry, 'exec_entry_price': entry})
+        return rt
+
+    def test_pct_and_abs_stops(self):
+        s = self._s(stop_loss_pct=2.0)
+        self.assertIsNotNone(strategy_engine.check_bar_stop(s, self._rt(), 97.0))
+        self.assertIsNone(strategy_engine.check_bar_stop(s, self._rt(), 99.0))
+        s2 = self._s(stop_loss_abs=3.0)
+        self.assertIsNotNone(strategy_engine.check_bar_stop(s2, self._rt(), 96.0))
+        self.assertIsNone(strategy_engine.check_bar_stop(s2, self._rt(), 98.0))
+
+    def test_take_profit(self):
+        s = self._s(take_profit_pct=5.0)
+        self.assertIsNotNone(strategy_engine.check_bar_stop(s, self._rt(), 106.0))
+        self.assertIsNone(strategy_engine.check_bar_stop(s, self._rt(), 104.0))
+
+    def test_short_side_is_mirrored(self):
+        s = self._s(stop_loss_abs=3.0, trade_type='期貨', market='台期貨')
+        self.assertIsNotNone(strategy_engine.check_bar_stop(s, self._rt(state='SHORT'), 104.0))
+        self.assertIsNone(strategy_engine.check_bar_stop(s, self._rt(state='SHORT'), 102.0))
+
+    def test_no_position_no_stop(self):
+        s = self._s(stop_loss_abs=1.0)
+        self.assertIsNone(strategy_engine.check_bar_stop(s, strategy_engine.new_runtime(), 1.0))
+
+    def test_evaluate_strategy_still_uses_it(self):
+        """反向對照:抽出去之後內建策略的K棒停損不可以失效。"""
+        s = self._s(stop_loss_pct=2.0, timeframe='日K', qty=1)
+        rt = self._rt()
+        df = pd.DataFrame({'Open': [100.0] * 30, 'High': [101.0] * 30,
+                           'Low': [96.0] * 30, 'Close': [100.0] * 29 + [97.0],
+                           'Volume': [1000] * 30},
+                          index=pd.date_range('2026-01-01', periods=30, freq='D'))
+        intents = strategy_engine.evaluate_strategy(s, rt, df, 1.0, '2026-01-30')
+        self.assertTrue(any(it['kind'] == 'CLOSE' for it in intents),
+                        "內建策略的K棒收盤停損不可以因為重構而失效")
+
+
+class TestStopLevelsAndTouch(unittest.TestCase):
+    """【ADR-136】把停損停利換算成價位,給回測判斷「盤中有沒有觸價」。"""
+
+    def _s(self, **over):
+        s = strategy_engine.new_strategy()
+        s.update({'symbol': '2330', 'trade_type': '股票'})
+        for _k in ('stop_loss_pct', 'take_profit_pct', 'stop_loss_abs', 'take_profit_abs'):
+            s[_k] = 0.0          # 見 TestBarStopExtracted._s 的說明
+        s.update(over)
+        return s
+
+    def _rt(self, entry=100.0, state='LONG'):
+        rt = strategy_engine.new_runtime()
+        rt.update({'state': state, 'qty': 1, 'entry_price': entry})
+        return rt
+
+    def test_levels_for_long(self):
+        stop, take = strategy_engine.stop_levels(
+            self._s(stop_loss_abs=5.0, take_profit_abs=8.0), self._rt())
+        self.assertAlmostEqual(stop, 95.0)
+        self.assertAlmostEqual(take, 108.0)
+
+    def test_levels_for_short_are_mirrored(self):
+        stop, take = strategy_engine.stop_levels(
+            self._s(stop_loss_abs=5.0, take_profit_abs=8.0), self._rt(state='SHORT'))
+        self.assertAlmostEqual(stop, 105.0)
+        self.assertAlmostEqual(take, 92.0)
+
+    def test_nearest_level_wins_when_both_pct_and_abs_set(self):
+        """同時設了% 與點數 → 取**先會被碰到**的那一個 (離進場價最近)。"""
+        stop, _ = strategy_engine.stop_levels(
+            self._s(stop_loss_pct=10.0, stop_loss_abs=3.0), self._rt())
+        self.assertAlmostEqual(stop, 97.0, msg="3元比10%(=10元)先到")
+
+    def test_touch_uses_high_low(self):
+        s = self._s(stop_loss_abs=5.0)
+        # 收盤沒破,但盤中最低點破了 → 即時模型要觸發
+        hit = strategy_engine.bar_touch_exit(s, self._rt(), 99.0, 100.0, 94.0)
+        self.assertIsNotNone(hit)
+        self.assertAlmostEqual(hit[0], 95.0)
+        self.assertIn('停損', hit[1])
+        self.assertIsNone(strategy_engine.bar_touch_exit(s, self._rt(), 99.0, 100.0, 96.0))
+
+    def test_gap_fills_at_open_not_at_the_stop(self):
+        """跳空時成交在開盤價 (比停損價更差) —— 不做樂觀假設。"""
+        s = self._s(stop_loss_abs=5.0)
+        hit = strategy_engine.bar_touch_exit(s, self._rt(), 90.0, 91.0, 89.0)
+        self.assertAlmostEqual(hit[0], 90.0, msg="跳空開低,只能成交在開盤價")
+
+    def test_stop_wins_when_both_touched_in_one_bar(self):
+        """同一根同時碰到停損與停利 → 算停損。分不出誰先到,取對使用者不利的
+        那一邊才不會高估績效。"""
+        s = self._s(stop_loss_abs=5.0, take_profit_abs=5.0)
+        hit = strategy_engine.bar_touch_exit(s, self._rt(), 100.0, 106.0, 94.0)
+        self.assertIn('停損', hit[1])
+
+    def test_no_levels_no_touch(self):
+        self.assertIsNone(strategy_engine.bar_touch_exit(self._s(), self._rt(), 1, 2, 0))
+
+
+class TestCustomStrategyStopsInBacktest(unittest.TestCase):
+    """【ADR-136】自訂策略的停損停利原本在回測裡**完全沒有被套用**。
+
+    使用者:「自訂策略,程式不要寫的太複雜,只要專注在買賣的條件行為就好。
+    其他的就交給系統…並且可以有效執行回測(這一點非常重要)。」
+    """
+
+    # on_bar 要回傳 ctx.buy()/ctx.sell()/ctx.close_position()/None,
+    # 而且部位狀態讀的是 **ctx.position**(ctx.state 是使用者自己的暫存 dict)。
+    # 第一版寫成回傳字串 'BUY' 且讀 ctx.state,結果一筆單都沒開 —— 是測試
+    # 的假策略寫錯,不是回測錯。
+    SRC = ("def on_bar(ctx):\n"
+           "    if ctx.position == 'FLAT':\n"
+           "        return ctx.buy()\n"
+           "    return None\n")
+
+    def _df(self, closes, lows=None, highs=None):
+        n = len(closes)
+        lows = lows or [c - 0.5 for c in closes]
+        highs = highs or [c + 0.5 for c in closes]
+        return pd.DataFrame({'Open': closes, 'High': highs, 'Low': lows,
+                             'Close': closes, 'Volume': [1000] * n},
+                            index=pd.date_range('2026-01-01', periods=n, freq='D'))
+
+    def _strat(self, **over):
+        s = strategy_engine.new_strategy()
+        s.update({'kind': 'custom', 'source_code': self.SRC, 'name': 'C',
+                  'symbol': '2330', 'trade_type': '股票', 'market': '台股',
+                  'qty': 1, 'timeframe': '日K', 'custom_params': {},
+                  'intrabar_stop': False})
+        for _k in ('stop_loss_pct', 'take_profit_pct', 'stop_loss_abs', 'take_profit_abs'):
+            s[_k] = 0.0          # 自訂策略預設「完全交給程式碼」(ADR-045)
+        s.update(over)
+        return s
+
+    def test_custom_strategy_stop_now_fires_in_backtest(self):
+        """進場後一路下跌:設了停損就必須出場。修正前這裡是 0 筆平倉。"""
+        df = self._df([100.0] * 3 + [100.0 - i * 2 for i in range(1, 12)])
+        r = backtest.run_backtest(self._strat(stop_loss_abs=5.0), df,
+                                  apply_cost_model=False, settle_open_at_end=False)
+        self.assertTrue(r['trades'], "自訂策略設了停損,回測必須有平倉紀錄")
+        self.assertIn('停損', r['trades'][0]['exit_reason'])
+
+    def test_without_stop_it_still_holds(self):
+        """反向對照:沒設停損就不該平倉 —— 否則等於系統亂砍使用者的部位。"""
+        df = self._df([100.0] * 3 + [100.0 - i * 2 for i in range(1, 12)])
+        r = backtest.run_backtest(self._strat(), df, apply_cost_model=False,
+                                  settle_open_at_end=False)
+        self.assertFalse(r['trades'], "沒設停損就不該有平倉")
+
+    def test_intrabar_toggle_changes_the_backtest(self):
+        """勾了即時觸發,回測要用當根**高低點**判斷觸價 —— 只摸到影子也算。
+
+        這一組資料收盤永遠不破停損,只有盤中最低點破 → 不勾:不出場;
+        勾了:出場。兩者結果不同,才代表回測真的照設定在模擬。"""
+        closes = [100.0] * 3 + [99.0] * 10
+        lows = [99.5] * 3 + [90.0] * 10          # 盤中破,收盤沒破
+        df = self._df(closes, lows=lows)
+        off = backtest.run_backtest(self._strat(stop_loss_abs=5.0, intrabar_stop=False),
+                                    df, apply_cost_model=False, settle_open_at_end=False)
+        on = backtest.run_backtest(self._strat(stop_loss_abs=5.0, intrabar_stop=True),
+                                   df, apply_cost_model=False, settle_open_at_end=False)
+        self.assertFalse(off['trades'], "沒勾即時:收盤沒破就不出場")
+        self.assertTrue(on['trades'], "勾了即時:盤中觸價就要出場")
+        self.assertIn('盤中觸及', on['trades'][0]['exit_reason'])
 
 
 
