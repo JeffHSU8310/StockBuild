@@ -107,6 +107,14 @@ PITFALLS P-27）。它們存在的唯一理由就是「可離線單元測試」�
   它與 `market_pattern.py`（型態偵測）、`volume_profile.py`（量價支撐壓力）
   的分工是：後兩者算「現在是什麼狀態」，`regime_panel` 決定「要不要算、
   要不要說」。
+  ADR-132/133 之後多兩件事：`PATTERN_TIMEFRAMES`（日K + 60分K 的**允許清單**，
+  刻意不全面開放 —— 分K 會產生大量無意義訊號，而現在這些訊號會推播到手機上）、
+  以及每日推播的 `should_notify_now()` / `format_daily_report()`。
+- `fibonacci.py`（ADR-133）：黃金切割律／費波南希回撤的純計算。
+  `find_swing()` 用「高低點誰比較晚出現」自動判斷這一段是上升還是下降（不必
+  使用者手動拉線）；`level_price()` 兩個方向共用同一條算式，只差起算端，
+  所以比率 > 1 自然落在起點另一側＝延伸目標。比率常數同時是 UI 勾選清單的
+  來源（含台股常用的次級分割律 0.191／0.809）。
 
 ### 設定存取層：`data/`
 - `config_store.py`：`load_broker_config`/`save_broker_config`、

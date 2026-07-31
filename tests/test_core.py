@@ -47,6 +47,7 @@ from core import telegram_notify
 from core import telegram_control
 from core import market_pattern
 from core import kbars_plan
+from core import fibonacci
 from core import regime_panel
 from core import chips_parser
 from core import chips_features
@@ -6741,6 +6742,151 @@ class TestRegimeDailyNotify(unittest.TestCase):
         同時會寫進系統日誌,前綴不對就只有日誌看得到。"""
         txt = regime_panel.format_daily_report('2026-03-10', [('日K', [self._sig('多頭趨勢')], None)])
         self.assertTrue(telegram_notify.is_quant_message(txt))
+
+
+
+class TestFibonacci(unittest.TestCase):
+    """【ADR-133】黃金切割律 (費波南希回撤)。
+
+    比例的定義:百分比是「**已經回撤掉多少**」——
+      上升段 (低→高):0% 在高點、100% 在低點,價位 = high - (high-low)*r
+      下降段 (高→低):0% 在低點、100% 在高點,價位 = low + (high-low)*r
+    兩個方向同一條算式,只差起算端,所以 r>1 自然落在起點的另一側 (延伸目標)。
+    """
+
+    def _df(self, closes):
+        n = len(closes)
+        return pd.DataFrame({'Open': closes,
+                             'High': [c + 1 for c in closes],
+                             'Low': [c - 1 for c in closes],
+                             'Close': closes,
+                             'Volume': [100] * n},
+                            index=pd.date_range('2026-01-01', periods=n, freq='D'))
+
+    # ---------- 比率清單 ----------
+
+    def test_key_ratios_are_the_two_most_watched(self):
+        """0.618 是黃金比例、0.382 是另一條最常看的線。"""
+        self.assertIn(0.618, fibonacci.KEY_RATIOS)
+        self.assertIn(0.382, fibonacci.KEY_RATIOS)
+        self.assertTrue(fibonacci.is_key_ratio(0.618))
+        self.assertFalse(fibonacci.is_key_ratio(0.5))
+
+    def test_default_levels_cover_the_standard_set(self):
+        for r in (0.236, 0.382, 0.5, 0.618, 0.786):
+            self.assertIn(r, fibonacci.DEFAULT_LEVELS, f"缺少標準比率 {r}")
+
+    def test_secondary_levels_are_the_taiwan_convention(self):
+        """次級分割律:0 與 0.382 的中間值 0.191、0.618 與 1 的中間值 0.809。"""
+        self.assertEqual(tuple(fibonacci.SECONDARY_LEVELS), (0.191, 0.809))
+        self.assertAlmostEqual(0.191, (0.0 + 0.382) / 2, places=3)
+        self.assertAlmostEqual(0.809, (0.618 + 1.0) / 2, places=3)
+
+    def test_normalize_ratios_is_defensive(self):
+        """壞設定不可以讓主圖畫不出來。"""
+        self.assertEqual(fibonacci.normalize_ratios(None), tuple(fibonacci.DEFAULT_LEVELS))
+        self.assertEqual(fibonacci.normalize_ratios([]), tuple(fibonacci.DEFAULT_LEVELS))
+        self.assertEqual(fibonacci.normalize_ratios(['abc', None]), tuple(fibonacci.DEFAULT_LEVELS))
+        # 去重 + 排序 + 濾掉離譜值
+        self.assertEqual(fibonacci.normalize_ratios([0.618, 0.382, 0.618, -1, 99]),
+                         (0.382, 0.618))
+
+    # ---------- 擺盪點與方向 ----------
+
+    def test_uptrend_when_high_comes_last(self):
+        sw = fibonacci.find_swing(self._df([100.0] + [100 + i for i in range(1, 40)]), 60)
+        self.assertEqual(sw['trend'], fibonacci.TREND_UP)
+
+    def test_downtrend_when_low_comes_last(self):
+        sw = fibonacci.find_swing(self._df([140 - i for i in range(40)]), 60)
+        self.assertEqual(sw['trend'], fibonacci.TREND_DOWN)
+
+    def test_lookback_limits_the_window(self):
+        """只看最近 N 根 —— 很久以前的極值不該綁架現在的切割區間。"""
+        closes = [500.0] * 10 + [100.0 + i for i in range(30)]
+        sw = fibonacci.find_swing(self._df(closes), 30)
+        self.assertLess(sw['high'], 200.0, "取樣窗外的 500 不該被算進來")
+
+    def test_flat_data_returns_none(self):
+        """完全沒有波動 (High == Low) 就沒有可切割的區間。
+
+        注意 _df() 會把 High/Low 撐開 ±1,所以「收盤價都一樣」**不等於**
+        沒有波動 —— 這裡要自己造一份真正持平的資料 (第一版寫錯,測試當場紅)。"""
+        flat = pd.DataFrame({'Open': [100.0] * 30, 'High': [100.0] * 30,
+                             'Low': [100.0] * 30, 'Close': [100.0] * 30,
+                             'Volume': [100] * 30},
+                            index=pd.date_range('2026-01-01', periods=30, freq='D'))
+        self.assertIsNone(fibonacci.find_swing(flat, 30))
+        # 反向對照:有波動就要算得出來
+        self.assertIsNotNone(fibonacci.find_swing(self._df([100.0] * 30), 30))
+
+    def test_bad_input_is_safe(self):
+        self.assertIsNone(fibonacci.find_swing(None, 60))
+        self.assertIsNone(fibonacci.find_swing(pd.DataFrame(), 60))
+        # lookback 壞掉要退回預設而不是爆炸
+        self.assertIsNotNone(fibonacci.find_swing(
+            self._df([100 + i for i in range(40)]), 'abc'))
+
+    # ---------- 價位計算 ----------
+
+    def test_uptrend_level_prices(self):
+        """上升段 100→200:0% 在高點 200、100% 在低點 100、61.8% 在 138.2。"""
+        hi, lo = 200.0, 100.0
+        self.assertAlmostEqual(fibonacci.level_price(hi, lo, fibonacci.TREND_UP, 0.0), 200.0)
+        self.assertAlmostEqual(fibonacci.level_price(hi, lo, fibonacci.TREND_UP, 1.0), 100.0)
+        self.assertAlmostEqual(fibonacci.level_price(hi, lo, fibonacci.TREND_UP, 0.5), 150.0)
+        self.assertAlmostEqual(fibonacci.level_price(hi, lo, fibonacci.TREND_UP, 0.618), 138.2)
+        self.assertAlmostEqual(fibonacci.level_price(hi, lo, fibonacci.TREND_UP, 0.382), 161.8)
+
+    def test_downtrend_level_prices_are_mirrored(self):
+        """下降段 200→100:0% 在低點 100、100% 在高點 200、61.8% 在 161.8。"""
+        hi, lo = 200.0, 100.0
+        self.assertAlmostEqual(fibonacci.level_price(hi, lo, fibonacci.TREND_DOWN, 0.0), 100.0)
+        self.assertAlmostEqual(fibonacci.level_price(hi, lo, fibonacci.TREND_DOWN, 1.0), 200.0)
+        self.assertAlmostEqual(fibonacci.level_price(hi, lo, fibonacci.TREND_DOWN, 0.618), 161.8)
+
+    def test_extension_falls_beyond_the_start(self):
+        """延伸 (r>1) 要落在起點的另一側 —— 那才是「跌破/突破之後的目標」。"""
+        hi, lo = 200.0, 100.0
+        up = fibonacci.level_price(hi, lo, fibonacci.TREND_UP, 1.618)
+        self.assertLess(up, lo, "上升段的延伸應在低點之下 (跌破後的目標)")
+        dn = fibonacci.level_price(hi, lo, fibonacci.TREND_DOWN, 1.618)
+        self.assertGreater(dn, hi, "下降段的延伸應在高點之上")
+
+    def test_levels_are_ordered_and_tagged(self):
+        sw = {'high': 200.0, 'low': 100.0, 'trend': fibonacci.TREND_UP}
+        lv = fibonacci.levels(sw, [0.0, 0.382, 0.618, 1.0, 1.618])
+        self.assertEqual([x['ratio'] for x in lv], [0.0, 0.382, 0.618, 1.0, 1.618])
+        kinds = {x['ratio']: x['kind'] for x in lv}
+        self.assertEqual(kinds[0.0], 'endpoint')
+        self.assertEqual(kinds[1.0], 'endpoint')
+        self.assertEqual(kinds[0.618], 'retrace')
+        self.assertEqual(kinds[1.618], 'extend')
+        self.assertTrue([x for x in lv if x['ratio'] == 0.618][0]['key'])
+
+    def test_all_prices_inside_the_band_for_retracements(self):
+        """反向對照:0~1 之間的比例算出來一定落在高低點之間。
+        算式寫反 (例如把 high-低 寫成 low-high) 這條就會紅。"""
+        sw = {'high': 200.0, 'low': 100.0, 'trend': fibonacci.TREND_UP}
+        for x in fibonacci.levels(sw, fibonacci.DEFAULT_LEVELS):
+            self.assertGreaterEqual(x['price'], 100.0 - 1e-9, x['label'])
+            self.assertLessEqual(x['price'], 200.0 + 1e-9, x['label'])
+
+    def test_compute_and_summarize(self):
+        r = fibonacci.compute(self._df([100 + i for i in range(60)]), 60,
+                              fibonacci.DEFAULT_LEVELS)
+        self.assertIsNotNone(r)
+        self.assertEqual(r['swing']['trend'], fibonacci.TREND_UP)
+        txt = fibonacci.summarize(r)
+        self.assertIn('0.618', txt)
+        self.assertIn(fibonacci.TREND_UP, txt)
+        self.assertIn('資料不足', fibonacci.summarize(None))
+
+    def test_ratio_label_is_readable(self):
+        self.assertEqual(fibonacci.ratio_label(0.5), '0.5')
+        self.assertEqual(fibonacci.ratio_label(0.618), '0.618')
+        self.assertEqual(fibonacci.ratio_label(1.0), '1')
+        self.assertEqual(fibonacci.ratio_label(0.0), '0')
 
 
 

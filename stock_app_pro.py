@@ -53,6 +53,7 @@ from core import market_pattern
 # 【ADR-122】kbars 請求要不要分段、每段幾天 (門檻與段長的單一出處)。
 from core import kbars_plan
 # 【ADR-120】主圖【盤勢判斷】面板的純邏輯 (設定正規化 + 通知去重)。
+from core import fibonacci
 from core import regime_panel
 # 【ADR-100】籌碼資料:解析純邏輯在 core/,本地 CSV 存取在 data/。
 from core import chips_parser
@@ -379,6 +380,13 @@ class StockTradingAppPro(tk.Tk):
         self.bb2_period = tk.IntVar(value=60)
         self.bb2_std1 = tk.DoubleVar(value=2.0)
         self.bb2_std2 = tk.DoubleVar(value=0.0)
+        # 【ADR-133】黃金切割律 (費波南希回撤)。擺盪高低點由最近 N 根自動抓,
+        # 不必手動拉線;比率清單可勾選 (含台股常用的次級分割律 0.191/0.809)。
+        self.fib_show = tk.BooleanVar(value=False)
+        self.fib_lookback = tk.IntVar(value=fibonacci.DEFAULT_LOOKBACK)
+        self.fib_color = tk.StringVar(value="黃 (#FFCA28)")
+        self.fib_ratios = list(fibonacci.DEFAULT_LEVELS)
+        self._fib_last_result = None
 
         self.var_macd = tk.BooleanVar(value=True)
         self.macd_f, self.macd_s, self.macd_sig = tk.StringVar(value="12"), tk.StringVar(value="26"), tk.StringVar(value="9")
@@ -1349,7 +1357,11 @@ class StockTradingAppPro(tk.Tk):
         tk.Checkbutton(row_frame, text="還原權息", variable=self.var_adjusted, bg="#12161A", fg="#00E676", selectcolor="#2A323D", command=self.start_fetch_thread).pack(side=tk.LEFT, padx=(10,2))
 
         tk.Label(row_frame, text=" || 主圖:", bg="#12161A", fg="#FFCA28", font=('微軟正黑體', 9, 'bold')).pack(side=tk.LEFT, padx=(5,2))
-        tk.Button(row_frame, text="⚙ 均線/布林", bg="#2A323D", fg="white", relief="flat", command=self.open_main_settings).pack(side=tk.LEFT, padx=2)
+        tk.Button(row_frame, text="⚙ 均線/布林/黃金切割", bg="#2A323D", fg="white", relief="flat", command=self.open_main_settings).pack(side=tk.LEFT, padx=2)
+        # 【ADR-133】黃金切割律 (費波南希回撤):勾了就畫,細部參數在上面的 ⚙。
+        tk.Checkbutton(row_frame, text="黃金切割", variable=self.fib_show,
+                       bg="#12161A", fg="#FFCA28", selectcolor="#2A323D",
+                       command=self._fib_toggle).pack(side=tk.LEFT, padx=(4, 0))
 
         tk.Label(row_frame, text=" || 副圖:", bg="#12161A", fg="#FFCA28", font=('微軟正黑體', 9, 'bold')).pack(side=tk.LEFT, padx=(10,2))
         indicators = [
@@ -2608,6 +2620,9 @@ class StockTradingAppPro(tk.Tk):
             'bb2_show': self.bb2_show.get(), 'bb2_color': self.bb2_color.get(),
             'bb2_type': self.bb2_type.get(), 'bb2_period': self.bb2_period.get(),
             'bb2_std1': self.bb2_std1.get(), 'bb2_std2': self.bb2_std2.get(),
+            # 【ADR-133】黃金切割律
+            'fib_show': self.fib_show.get(), 'fib_lookback': self.fib_lookback.get(),
+            'fib_color': self.fib_color.get(), 'fib_ratios': list(self.fib_ratios),
             'var_bbw': self.var_bbw.get(),
             'var_macd': self.var_macd.get(), 'macd_f': self.macd_f.get(),
             'macd_s': self.macd_s.get(), 'macd_sig': self.macd_sig.get(),
@@ -2644,6 +2659,12 @@ class StockTradingAppPro(tk.Tk):
             self.bb2_period.set(d.get('bb2_period', self.bb2_period.get()))
             self.bb2_std1.set(d.get('bb2_std1', self.bb2_std1.get()))
             self.bb2_std2.set(d.get('bb2_std2', self.bb2_std2.get()))
+            # 【ADR-133】舊設定檔沒有這幾個 key → 沿用預設 (黃金切割預設關閉)
+            self.fib_show.set(d.get('fib_show', self.fib_show.get()))
+            self.fib_lookback.set(d.get('fib_lookback', self.fib_lookback.get()))
+            self.fib_color.set(d.get('fib_color', self.fib_color.get()))
+            if 'fib_ratios' in d:
+                self.fib_ratios = list(fibonacci.normalize_ratios(d.get('fib_ratios')))
             self.var_bbw.set(d.get('var_bbw', self.var_bbw.get()))
             self.var_macd.set(d.get('var_macd', self.var_macd.get()))
             self.macd_f.set(d.get('macd_f', self.macd_f.get()))
@@ -2668,7 +2689,7 @@ class StockTradingAppPro(tk.Tk):
     def open_main_settings(self):
         # 【ADR-131】視窗放大:布林從 1 行變成「標題 + 欄位名 + 兩組」共 4 行,
         # 沿用 400x350 會把「確認並套用」按鈕擠出視窗外 (等於設定存不了)。
-        dlg = tk.Toplevel(self); dlg.title("主圖指標參數設定"); dlg.configure(bg="#1A2026"); self.center_window(dlg, 620, 520); dlg.transient(self); dlg.grab_set()
+        dlg = tk.Toplevel(self); dlg.title("主圖指標參數設定"); dlg.configure(bg="#1A2026"); self.center_window(dlg, 660, 700); dlg.transient(self); dlg.grab_set()
         tk.Label(dlg, text="開關", bg="#1A2026", fg="white").grid(row=0, column=0, pady=10); tk.Label(dlg, text="類型", bg="#1A2026", fg="white").grid(row=0, column=1); tk.Label(dlg, text="週期", bg="#1A2026", fg="white").grid(row=0, column=2); tk.Label(dlg, text="色彩", bg="#1A2026", fg="white").grid(row=0, column=3)
         for i in range(6):
             tk.Checkbutton(dlg, text=f"MA{i+1}", variable=self.ma_shows[i], bg="#1A2026", fg="white", selectcolor="#2A323D").grid(row=i+1, column=0, sticky="w", padx=15, pady=2)
@@ -2715,10 +2736,56 @@ class StockTradingAppPro(tk.Tk):
         tk.Label(dlg, text="※ σb 填 0 = 該組只畫一對上下線;兩組可各自開關,中線類型/期間互相獨立。",
                  bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8)).grid(
                  row=12, column=0, columnspan=4, sticky='w', padx=15, pady=(2, 0))
+        ttk.Separator(dlg, orient='horizontal').grid(row=13, column=0, columnspan=4, sticky='ew', pady=8)
+        # 【ADR-133】黃金切割律 (費波南希回撤)
+        tk.Label(dlg, text="黃金切割律 (費波南希回撤)", bg="#1A2026", fg="#FFCA28",
+                 font=('微軟正黑體', 9, 'bold')).grid(row=14, column=0, columnspan=4, sticky='w', padx=15)
+        fib_top = tk.Frame(dlg, bg="#1A2026"); fib_top.grid(row=15, column=0, columnspan=4, sticky='w', padx=15)
+        tk.Checkbutton(fib_top, text="顯示", variable=self.fib_show, bg="#1A2026", fg="white",
+                       selectcolor="#2A323D", width=6, anchor='w').pack(side=tk.LEFT)
+        tk.Label(fib_top, text="取樣根數", bg="#1A2026", fg="white",
+                 font=('微軟正黑體', 9)).pack(side=tk.LEFT, padx=(8, 2))
+        tk.Entry(fib_top, textvariable=self.fib_lookback, width=6, bg="#2A323D", fg="white",
+                 justify="center").pack(side=tk.LEFT)
+        tk.Label(fib_top, text="色彩", bg="#1A2026", fg="white",
+                 font=('微軟正黑體', 9)).pack(side=tk.LEFT, padx=(10, 2))
+        ttk.Combobox(fib_top, textvariable=self.fib_color, values=list(self.color_map.keys()),
+                     width=10, state="readonly", style="BlackText.TCombobox").pack(side=tk.LEFT)
+        fib_vars = {}
+        fib_grid = tk.Frame(dlg, bg="#1A2026"); fib_grid.grid(row=16, column=0, columnspan=4, sticky='w', padx=15, pady=(2, 0))
+        _fib_on = set(self.fib_ratios)
+        for _i, _r in enumerate(fibonacci.ALL_LEVELS):
+            _v = tk.BooleanVar(value=any(abs(_r - o) < 1e-9 for o in _fib_on))
+            fib_vars[_r] = _v
+            _txt = fibonacci.ratio_label(_r)
+            if fibonacci.is_key_ratio(_r):
+                _txt += '★'
+            elif _r > 1.0:
+                _txt += '(延伸)'
+            elif _r in fibonacci.SECONDARY_LEVELS:
+                _txt += '(次級)'
+            tk.Checkbutton(fib_grid, text=_txt, variable=_v, bg="#1A2026", fg="white",
+                           selectcolor="#2A323D", font=('微軟正黑體', 8)).grid(
+                           row=_i // 5, column=_i % 5, sticky='w', padx=4)
+        tk.Label(dlg, text="※ 高低點自動取最近 N 根 (誰比較晚出現就往那個方向量);"
+                          "★=0.382/0.618 最常看,次級=台股波浪常用,延伸=跌破/突破起點後的目標。",
+                 bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8)).grid(
+                 row=17, column=0, columnspan=4, sticky='w', padx=15, pady=(2, 0))
+
         tk.Label(dlg, text="※ 按下方按鈕會記住這些設定,下次開啟程式直接沿用。",
                  bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8)).grid(
-                 row=13, column=0, columnspan=4, sticky='w', padx=15)
-        tk.Button(dlg, text="確認並套用 (並記住此設定)", bg="#29B6F6", fg="black", font=('微軟正黑體', 10, 'bold'), command=lambda: [self._save_indicator_settings(), self.trigger_redraw(), dlg.destroy()]).grid(row=14, column=0, columnspan=4, pady=15)
+                 row=18, column=0, columnspan=4, sticky='w', padx=15)
+
+        def _apply_main():
+            self.fib_ratios = list(fibonacci.normalize_ratios(
+                [r for r, v in fib_vars.items() if v.get()]))
+            self._save_indicator_settings()
+            self.trigger_redraw()
+            if self.fib_show.get():
+                self.safe_after(300, self._fib_log_summary)
+            dlg.destroy()
+
+        tk.Button(dlg, text="確認並套用 (並記住此設定)", bg="#29B6F6", fg="black", font=('微軟正黑體', 10, 'bold'), command=_apply_main).grid(row=19, column=0, columnspan=4, pady=15)
 
     def open_sub_settings(self, ind):
         dlg = tk.Toplevel(self); dlg.title(f"{ind} 參數設定"); dlg.configure(bg="#1A2026"); self.center_window(dlg, 250, 180); dlg.transient(self); dlg.grab_set()
@@ -5642,6 +5709,8 @@ class StockTradingAppPro(tk.Tk):
             # 【ADR-102】量價支撐壓力:在主圖畫水平線。放在這裡是因為 axlist 剛
             # 建好、還沒交給 canvas,與其他 overlay (vlines/hline) 同一階段。
             self._draw_sr_levels(axlist[0], raw_df)
+            # 【ADR-133】黃金切割律:同一階段畫,同一份 raw_df,不用多打一次 API。
+            self._draw_fib_levels(axlist[0], raw_df)
             # 【ADR-120】盤勢/型態偵測:不畫在圖上,只把「新出現的」寫進系統
             # 日誌。放在畫圖之後、用同一份 raw_df,不用多打一次 API。
             self._regime_check(raw_df)
@@ -12392,6 +12461,62 @@ class StockTradingAppPro(tk.Tk):
             # 支撐壓力只是輔助資訊,絕不能因為它出錯就讓整張 K 線圖畫不出來
             self.log_message(f"【支撐壓力】計算失敗 ({type(e).__name__}: {e}),本次略過繪製。")
 
+    def _fib_toggle(self):
+        """【ADR-133】黃金切割開關:存設定 + 重畫 + 勾起來時把點位寫進日誌。"""
+        try:
+            self._save_indicator_settings()
+        except Exception:
+            pass
+        self.trigger_redraw()
+        if self.fib_show.get():
+            self.safe_after(300, self._fib_log_summary)
+
+    def _draw_fib_levels(self, ax, raw_df):
+        """在主圖畫黃金切割律的水平線。任何例外都不可影響 K 線圖本身
+        (跟支撐壓力同樣的理由 —— 輔助資訊不可以害主功能掛掉)。"""
+        self._fib_last_result = None
+        if not self.fib_show.get():
+            return
+        try:
+            src = self._sr_source_df(raw_df)
+            if src is None or len(src) < 20:
+                return
+            result = fibonacci.compute(src, self.fib_lookback.get(), self.fib_ratios)
+            if not result or not result['levels']:
+                return
+            self._fib_last_result = result
+            base = self.color_map.get(self.fib_color.get(), "#FFCA28")
+            for lv in result['levels']:
+                if lv['kind'] == 'endpoint':
+                    lw, alpha, ls = 1.1, 0.75, '-'
+                elif lv['key']:
+                    # 0.382 / 0.618 是實務上最常看的兩條,畫粗一點一眼認得出來
+                    lw, alpha, ls = 1.4, 0.85, '--'
+                elif lv['kind'] == 'extend':
+                    lw, alpha, ls = 0.7, 0.40, ':'
+                else:
+                    lw, alpha, ls = 0.8, 0.55, '--'
+                ax.axhline(y=lv['price'], color=base, linestyle=ls,
+                           linewidth=lw, alpha=alpha, zorder=6)
+                ax.text(0.005, lv['price'], f" {lv['label']} {lv['price']:.2f} ",
+                        transform=ax.get_yaxis_transform(), ha='left', va='center',
+                        color=base, fontsize=7, alpha=min(1.0, alpha + 0.15),
+                        bbox=dict(boxstyle='round,pad=0.15', fc='#12161A',
+                                  ec=base, lw=0.5, alpha=0.70), zorder=7)
+        except Exception as e:
+            self.log_message(f"【黃金切割】計算失敗 ({type(e).__name__}: {e}),本次略過繪製。")
+
+    def _fib_log_summary(self):
+        """把這次算出的切割點位寫進系統日誌,方便拿數字去掛單或設停損。"""
+        r = getattr(self, '_fib_last_result', None)
+        if not r:
+            return
+        self.log_message(f"【黃金切割】{fibonacci.summarize(r)}")
+        for lv in r['levels']:
+            mark = '★' if lv['key'] else ' '
+            self.log_message(f"　　{mark} {lv['label']}　{lv['price']:.2f}"
+                             f"　({ {'endpoint': '端點', 'retrace': '回撤', 'extend': '延伸'}[lv['kind']] })")
+
     def _sr_log_summary(self):
         """把這次算出的點位摘要寫進系統日誌,方便拿數字去掛單或設停損。"""
         r = getattr(self, '_sr_last_result', None)
@@ -12467,10 +12592,16 @@ class StockTradingAppPro(tk.Tk):
     REGIME_NOTIFY_POLL_SEC = 60
 
     def regime_daily_notify_worker(self):
-        """每天收盤後對加權指數做一次盤勢判斷,結果推播到手機 (ADR-132)。
+        """加權指數盤勢判斷的背景工作者 (ADR-132 / ADR-133)。
+
+        兩件事:
+        1. **持續自動判斷** (ADR-133):每根 K 棒收盤後對加權指數的日K 與 60分K
+           各評估一次,新出現的型態寫進系統日誌 —— **完全不需要使用者把主圖
+           切到那個週期**。使用者的原話:「不需要我人工切換,你就可以自動判斷」。
+        2. **每天收盤後推播一次** (ADR-132)。
 
         **刻意不掛在量化 runner 上**:那條迴圈由「自動交易總開關」控制,
-        而盤勢推播是看盤輔助,使用者沒開自動交易時一樣該收到。
+        而盤勢判斷是看盤輔助,使用者沒開自動交易時一樣該運作。
         自己一條 daemon thread,總開關關著也照跑。
         """
         import time as _time
@@ -12478,11 +12609,78 @@ class StockTradingAppPro(tk.Tk):
             if getattr(self, '_closing', False):
                 return
             try:
+                self._regime_auto_scan_pass()
+            except Exception as e:
+                self.safe_after(0, self.log_message,
+                                f"【盤勢判斷】自動判斷失敗 ({type(e).__name__}: {e})")
+            try:
                 self._regime_daily_notify_pass()
             except Exception as e:
                 self.safe_after(0, self.log_message,
                                 f"【盤勢判斷】每日推播檢查失敗 ({type(e).__name__}: {e})")
             _time.sleep(self.REGIME_NOTIFY_POLL_SEC)
+
+    def _regime_scan_slot(self, tf, now_dt):
+        """這個週期「現在屬於哪一根 K 棒」的識別字串。
+
+        用它來決定「要不要重新評估」:同一根 K 棒內重複評估只會抓到一樣的
+        資料、算出一樣的結果,白打 API (ADR-127 的同一個教訓)。
+
+        分K 類:對齊 K 棒邊界 (60分K 就是每個整點)。
+        日K 類:每 10 分鐘一格 —— 日K 盤中會持續變動 (這條路徑刻意用未完成的
+        今日K棒,才看得到「今天正在形成的型態」),但不需要每分鐘重算。
+        """
+        mins = strategy_engine.timeframe_minutes(tf)
+        midnight = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        elapsed = int((now_dt - midnight).total_seconds() // 60)
+        step = mins if mins else 10
+        return f"{tf}|{midnight:%Y-%m-%d}|{(elapsed // step) * step}"
+
+    def _regime_auto_scan_pass(self, now_dt=None):
+        """【ADR-133】自動對加權指數的日K/60分K 做盤勢判斷,不看主圖現在顯示什麼。
+
+        結果只寫系統日誌 (沿用 ADR-120 的去重),Telegram 推播仍然維持
+        「每天收盤後一次」(ADR-132) —— 使用者要的是「不用手動切換也看得到」,
+        不是「一直被通知」。
+        """
+        s = regime_panel.normalize(self.regime_settings)
+        if not (s['enabled'] and s['pattern_enabled']):
+            return
+        if not (self.api_logged_in and getattr(self, 'sj_api', None)):
+            return
+        now_dt = now_dt or datetime.now()
+        # 只在台股有在跑的時候掃:收盤後資料不再變動,一直重掃沒有意義。
+        # 收盤後那一輪由每日推播 (_regime_daily_notify_pass) 負責收尾。
+        if not market_session.is_stock_open(now_dt):
+            return
+        if not hasattr(self, '_regime_scan_slots'):
+            self._regime_scan_slots = {}
+        for tf in regime_panel.PATTERN_TIMEFRAMES:
+            try:
+                slot = self._regime_scan_slot(tf, now_dt)
+                if self._regime_scan_slots.get(tf) == slot:
+                    continue
+                df = self._regime_notify_fetch(tf)
+                if df is None or len(df) < 20:
+                    continue
+                # 抓到資料才記 slot:抓不到就讓下一輪重試,不要把這一格用掉
+                self._regime_scan_slots[tf] = slot
+                signals = market_pattern.evaluate_all(df, regime_panel.pattern_params(s))
+                if not signals:
+                    continue
+                bar_date = str(df.index[-1]).split(' ')[0]
+                key = f"AUTO|{regime_panel.DEFAULT_INDEX_SYMBOL}|{tf}"
+                prev = (self._regime_notify_state or {}).get(key)
+                msgs, new_state = regime_panel.plan_notifications(signals, prev, bar_date)
+                self._regime_notify_state[key] = new_state
+                if msgs:
+                    self.safe_after(0, self.log_message,
+                                    f"【盤勢判斷】加權指數 {bar_date} {tf}偵測到:"
+                                    + "；".join(msgs))
+            except Exception as e:
+                # 單一週期失敗不可以讓另一個週期也不掃 (鐵則8 的精神)
+                self.safe_after(0, self.log_message,
+                                f"【盤勢判斷】{tf} 自動判斷失敗 ({type(e).__name__}: {e})")
 
     def _regime_notify_fetch(self, tf):
         """抓加權指數某個週期的 K 棒給推播用。抓不到回 None。
