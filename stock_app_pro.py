@@ -9330,7 +9330,13 @@ class StockTradingAppPro(tk.Tk):
         tk.Label(_risk, text="讓價檔數", bg="#1A2026", fg="white",
                  font=('微軟正黑體', 9)).pack(side=tk.LEFT)
         e_slip = _ent(_risk, s.get('slippage_ticks', 0), 5); e_slip.pack(side=tk.LEFT, padx=2)
-        tk.Label(top, text="※ 停損/停利 0=停用;有填就會**在盤中觸價立刻出場**,不等K棒收盤 (ADR-135)。",
+        # 【ADR-136】即時觸發改成可勾選 (使用者要求),不分商品別。
+        var_intrabar = tk.BooleanVar(value=strategy_engine.intrabar_stop_enabled(s))
+        tk.Checkbutton(_risk, text="停損停利即時觸發 (盤中觸價就出場,不等收盤)",
+                       variable=var_intrabar, bg="#1A2026", fg="#FFCA28",
+                       selectcolor="#2A323D", font=('微軟正黑體', 9)).pack(side=tk.LEFT, padx=(10, 0))
+        tk.Label(top, text="※ 停損/停利 0=停用。勾「即時觸發」= 盤中觸價就出場;不勾 = 等該週期K棒收盤才判定。"
+                          "回測會照同一個設定模擬 (勾了就用當根高低點判斷觸價)。",
                  bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8)).grid(
                  row=9, column=0, columnspan=7, sticky='w')
 
@@ -9501,6 +9507,7 @@ class StockTradingAppPro(tk.Tk):
             s['cooldown_sec'] = _i(e_cool, 300)
             s['futures_session'] = 'day' if cb_fsess.get() == '只做日盤' else 'day_night'
             s['session_gate'] = bool(var_sess_gate.get())
+            s['intrabar_stop'] = bool(var_intrabar.get())
             s['price_type'] = _pt['get']()
             s['entry_time_start'] = e_en_st.get().strip()
             s['entry_time_end'] = e_en_ed.get().strip()
@@ -10320,6 +10327,14 @@ class StockTradingAppPro(tk.Tk):
         tk.Label(top, text="(格式: HH:MM 或 HH:MM:SS)", bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8)).grid(row=8, column=2, columnspan=2, sticky='w', pady=(6, 0))
         tk.Label(top, text="⚠ 停損%/停利%/停損(元)/停利(元)/出場訊號 至少要有一種不為 0,否則無法儲存 (持倉會永遠不出場)",
                  bg="#1A2026", fg="#FFCA28", font=('微軟正黑體', 8)).grid(row=9, column=0, columnspan=6, sticky='w', pady=(2, 0))
+        # 【ADR-136】停損停利即時觸發:改成可勾選,不分商品別。
+        # 舊策略沒有這個欄位時,intrabar_stop_enabled() 會沿用它原本的行為
+        # (期貨=即時、股票=收盤才判定),所以勾選框打開時顯示的就是現況。
+        var_intrabar = tk.BooleanVar(value=strategy_engine.intrabar_stop_enabled(s))
+        tk.Checkbutton(top, text="停損停利即時觸發 (盤中觸價就出場,不等K棒收盤;回測同步照此模擬)",
+                       variable=var_intrabar, bg="#1A2026", fg="#FFCA28", selectcolor="#2A323D",
+                       font=('微軟正黑體', 9)).grid(row=10, column=0, columnspan=6,
+                                                    sticky='w', pady=(2, 0))
         # 【ADR-059】買進後持有不賣 (Buy & Hold):使用者要拿它當比較基準。
         # 勾了就放行「沒有出場方式」的驗證,但只限回測/模擬 (見 validate_strategy)。
         var_bnh = tk.BooleanVar(value=bool(s.get('buy_and_hold', False)))
@@ -10648,6 +10663,7 @@ class StockTradingAppPro(tk.Tk):
             # 【ADR-070】交易時段閘門設定
             s['futures_session'] = 'day' if cb_fut_sess.get() == '只做日盤' else 'day_night'
             s['session_gate'] = bool(var_sess_gate.get())
+            s['intrabar_stop'] = bool(var_intrabar.get())
             # 【ADR-101】籌碼未來函數開關 (進階;預設 False = 只讀前一日籌碼)
             s['chips_allow_same_day'] = bool(var_chip_sameday.get())
             # 【ADR-074】看A做B 設定

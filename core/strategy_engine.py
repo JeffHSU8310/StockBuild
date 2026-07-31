@@ -639,6 +639,10 @@ def new_strategy():
         # 以前的籌碼,與實盤可取得的資訊一致;True 僅供研究,回測會虛高。
         'chips_allow_same_day': False,
         'futures_session': 'day_night',  # 'day'=只做日盤 08:45-13:45;'day_night'=含夜盤 15:00-次日05:00
+        # 【ADR-136】停損停利即時觸發 (不等K棒收盤)。新策略預設開啟 ——
+        # 使用者明確要這個功能。舊策略沒有這個 key,由 intrabar_stop_enabled()
+        # 依商品別沿用它原本的行為 (期貨 True / 其他 False),不會被悄悄改掉。
+        'intrabar_stop': True,
         # 【ADR-074 看A做B】訊號來源 (A) 與執行商品 (B) 分離。watch_enabled=False 時
         # A=B (看自己做自己,一般模式)。A 可為指數 (加權/櫃買/台指期等,各項商品皆可);
         # B 為上面的 symbol/trade_type,不可為加權/櫃買指數 (指數不能下單)。
@@ -1112,29 +1116,10 @@ def evaluate_strategy(strategy, runtime, df_closed, now_ts, today_str):
         return filter_intents_by_time(intents, strategy, bar_ts, runtime=runtime)
 
     # 持倉中:先看停損/停利,再看出場訊號
-    entry = float(runtime.get('entry_price', 0) or 0)
-    direction_mult = 1.0 if state == 'LONG' else -1.0
-    if entry > 0:
-        move_pct = (close - entry) / entry * 100.0 * direction_mult
-        move_abs = (close - entry) * direction_mult  # 【ADR-043】絕對價差 (股票元/期貨點)
-        sl = float(strategy.get('stop_loss_pct', 0) or 0)
-        tp = float(strategy.get('take_profit_pct', 0) or 0)
-        sl_abs = float(strategy.get('stop_loss_abs', 0) or 0)
-        tp_abs = float(strategy.get('take_profit_abs', 0) or 0)
-        unit = '點' if is_futures(strategy) else '元'
-        # 停損:百分比或絕對值任一觸發即出場 (取先到者)
-        if sl > 0 and move_pct <= -sl:
-            intents.append(_close_intent(runtime, close, f"停損出場 (損益 {move_pct:.2f}% ≤ -{sl}%)"))
-            return intents
-        if sl_abs > 0 and move_abs <= -sl_abs:
-            intents.append(_close_intent(runtime, close, f"停損出場 (損益 {move_abs:+.2f}{unit} ≤ -{sl_abs}{unit})"))
-            return intents
-        if tp > 0 and move_pct >= tp:
-            intents.append(_close_intent(runtime, close, f"停利出場 (損益 {move_pct:.2f}% ≥ {tp}%)"))
-            return intents
-        if tp_abs > 0 and move_abs >= tp_abs:
-            intents.append(_close_intent(runtime, close, f"停利出場 (損益 {move_abs:+.2f}{unit} ≥ {tp_abs}{unit})"))
-            return intents
+    _stop = check_bar_stop(strategy, runtime, close)
+    if _stop is not None:
+        intents.append(_stop)
+        return intents
     ok, details = eval_conditions(df_closed, strategy.get('exit_signals', []), 'OR', errors=cond_errors)
     runtime['condition_errors'] = list(cond_errors)
     if ok:
@@ -1429,6 +1414,127 @@ def include_night_of(strategy):
     return s.get('futures_session', 'day_night') != 'day'
 
 
+def intrabar_stop_enabled(strategy):
+    """【ADR-136】停損停利要不要「即時觸發」(不等K棒收盤)。
+
+    使用者要求把它變成一個**可勾選的選項**,而且「不分商品」——
+    勾了就即時,沒勾就維持K棒收盤才判定。
+
+    **沒有這個欄位的舊策略,一律沿用它原本的行為**,不可以因為新增欄位就
+    悄悄改變既有策略:
+      · 期貨 → True  (ADR-087 起本來就是即時)
+      · 其他 → False (本來就是K棒收盤才判定)
+    """
+    s = strategy or {}
+    if 'intrabar_stop' in s:
+        return bool(s.get('intrabar_stop'))
+    return trade_type_of(s) == '期貨'
+
+
+def stop_levels(strategy, runtime):
+    """【ADR-136】把停損/停利換算成**價位**。回傳 (stop_price, take_price),
+    沒設定的那一邊是 None;沒有部位或沒有進場價回 (None, None)。
+
+    為什麼要有這個:回測要判斷「這根K棒的高低點有沒有觸及停損價」,
+    需要的是價位而不是百分比。**與 check_bar_stop 用同一組欄位換算**,
+    兩邊才不會一個有觸發、一個沒觸發。
+    """
+    state = (runtime or {}).get('state', 'FLAT')
+    if state not in ('LONG', 'SHORT'):
+        return None, None
+    entry = float((runtime or {}).get('entry_price', 0) or 0)
+    if entry <= 0:
+        return None, None
+    mult = 1.0 if state == 'LONG' else -1.0
+    sl = float(strategy.get('stop_loss_pct', 0) or 0)
+    tp = float(strategy.get('take_profit_pct', 0) or 0)
+    sl_abs = float(strategy.get('stop_loss_abs', 0) or 0)
+    tp_abs = float(strategy.get('take_profit_abs', 0) or 0)
+    stops, takes = [], []
+    if sl > 0:
+        stops.append(entry - mult * entry * sl / 100.0)
+    if sl_abs > 0:
+        stops.append(entry - mult * sl_abs)
+    if tp > 0:
+        takes.append(entry + mult * entry * tp / 100.0)
+    if tp_abs > 0:
+        takes.append(entry + mult * tp_abs)
+    # 多個設定同時存在時取「先被碰到的那一個」= 離進場價最近的
+    stop_p = (max(stops) if state == 'LONG' else min(stops)) if stops else None
+    take_p = (min(takes) if state == 'LONG' else max(takes)) if takes else None
+    return stop_p, take_p
+
+
+def check_bar_stop(strategy, runtime, close):
+    """【ADR-136】K棒收盤價的停損/停利判斷,回傳 CLOSE intent 或 None。
+
+    這段原本內嵌在 evaluate_strategy() 裡,**自訂策略完全走不到**
+    (自訂策略走 custom_strategy.decision_to_intents,不經過 evaluate_strategy)
+    —— 於是使用者在自訂策略編輯器設的停損停利,在回測裡形同虛設。
+    抽出來讓兩條路共用同一份判斷 (P-67)。
+    """
+    state = (runtime or {}).get('state', 'FLAT')
+    if state not in ('LONG', 'SHORT'):
+        return None
+    entry = float((runtime or {}).get('entry_price', 0) or 0)
+    if entry <= 0:
+        return None
+    close = float(close)
+    direction_mult = 1.0 if state == 'LONG' else -1.0
+    move_pct = (close - entry) / entry * 100.0 * direction_mult
+    move_abs = (close - entry) * direction_mult  # 【ADR-043】絕對價差 (股票元/期貨點)
+    sl = float(strategy.get('stop_loss_pct', 0) or 0)
+    tp = float(strategy.get('take_profit_pct', 0) or 0)
+    sl_abs = float(strategy.get('stop_loss_abs', 0) or 0)
+    tp_abs = float(strategy.get('take_profit_abs', 0) or 0)
+    unit = '點' if is_futures(strategy) else '元'
+    # 停損:百分比或絕對值任一觸發即出場 (取先到者)
+    if sl > 0 and move_pct <= -sl:
+        return _close_intent(runtime, close, f"停損出場 (損益 {move_pct:.2f}% ≤ -{sl}%)")
+    if sl_abs > 0 and move_abs <= -sl_abs:
+        return _close_intent(runtime, close, f"停損出場 (損益 {move_abs:+.2f}{unit} ≤ -{sl_abs}{unit})")
+    if tp > 0 and move_pct >= tp:
+        return _close_intent(runtime, close, f"停利出場 (損益 {move_pct:.2f}% ≥ {tp}%)")
+    if tp_abs > 0 and move_abs >= tp_abs:
+        return _close_intent(runtime, close, f"停利出場 (損益 {move_abs:+.2f}{unit} ≥ {tp_abs}{unit})")
+    return None
+
+
+def bar_touch_exit(strategy, runtime, bar_open, bar_high, bar_low):
+    """【ADR-136】回測用:這根K棒的**高低點**有沒有觸及停損/停利價。
+
+    回傳 (成交價, 原因) 或 None。這是「即時停損」在回測裡的對應模型 ——
+    勾了即時觸發,實盤是盤中觸價就走,回測若只看收盤價就會**低估停損次數**,
+    回測結果跟實際行為對不上 (使用者:「可以有效執行回測,這一點非常重要」)。
+
+    成交價的取法刻意保守:**跳空時用開盤價**(比停損價更差),不做
+    「一定成交在停損價」的樂觀假設。同一根同時碰到停損與停利時**算停損**
+    —— 分不出誰先到,取對使用者不利的那一邊才不會高估績效。
+    """
+    state = (runtime or {}).get('state', 'FLAT')
+    if state not in ('LONG', 'SHORT'):
+        return None
+    stop_p, take_p = stop_levels(strategy, runtime)
+    if stop_p is None and take_p is None:
+        return None
+    try:
+        o, hi, lo = float(bar_open), float(bar_high), float(bar_low)
+    except (TypeError, ValueError):
+        return None
+    unit = '點' if is_futures(strategy) else '元'
+    if state == 'LONG':
+        if stop_p is not None and lo <= stop_p:
+            return (min(o, stop_p), f"停損出場 (盤中觸及 {stop_p:.2f}{unit})")
+        if take_p is not None and hi >= take_p:
+            return (max(o, take_p), f"停利出場 (盤中觸及 {take_p:.2f}{unit})")
+    else:
+        if stop_p is not None and hi >= stop_p:
+            return (max(o, stop_p), f"停損出場 (盤中觸及 {stop_p:.2f}{unit})")
+        if take_p is not None and lo <= take_p:
+            return (min(o, take_p), f"停利出場 (盤中觸及 {take_p:.2f}{unit})")
+    return None
+
+
 def check_intrabar_stop(strategy, runtime, live_price):
     """【新ADR / ADR-135】即時停損停利:不等K棒收盤,即時價 (呼叫端傳入下單商品B的
     最新市價快照) 一觸及使用者設定的停損%/停利%/停損點數/停利點數,立刻回傳
@@ -1456,6 +1562,9 @@ def check_intrabar_stop(strategy, runtime, live_price):
     # 【ADR-123】自己管出場的策略種類一律不適用 —— 見 OWN_EXIT_KINDS 的說明。
     # 放在最前面:這是「這條規則對這檔策略根本不適用」,不是「條件沒觸發」。
     if has_own_exit_logic(strategy):
+        return None
+    # 【ADR-136】使用者要求改成可勾選的選項:沒勾就維持「K棒收盤才判定」。
+    if not intrabar_stop_enabled(strategy):
         return None
     state = runtime.get('state', 'FLAT')
     if state not in ('LONG', 'SHORT'):

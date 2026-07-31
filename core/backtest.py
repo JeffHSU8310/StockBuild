@@ -159,20 +159,58 @@ def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
             except custom_fn.StrategyError:
                 decision = 'HOLD'
             intents = custom_fn.decision_to_intents(decision, s, rt, float(eval_window['Close'].iloc[-1]), str(df.index[i]))
+            # 【ADR-136】自訂策略的停損/停利本來**完全沒有被套用**:
+            # decision_to_intents 只把 on_bar 的 BUY/SELL/CLOSE 轉成 intent,
+            # 而停損停利住在 evaluate_strategy() 裡 —— 自訂策略那條路根本不經過。
+            # 結果是使用者在編輯器設了停損,回測卻當作沒設,回測數字與實際行為
+            # 對不上 (使用者:「可以有效執行回測,這一點非常重要」)。
+            # 這裡補上同一份判斷 (strategy_engine.check_bar_stop),讓「條件寫在
+            # 程式碼、風控交給系統」真的成立。
+            # 程式碼自己已經要出場時就不重複 —— 尊重策略作者的決定。
+            if not any(it.get('kind') == 'CLOSE' for it in intents):
+                _stop_it = strategy_engine.check_bar_stop(
+                    s, rt, float(eval_window['Close'].iloc[-1]))
+                if _stop_it is not None:
+                    intents = [_stop_it] + [it for it in intents if it.get('kind') != 'OPEN']
         else:
             intents = strategy_engine.evaluate_strategy(s, rt, eval_window, now_ts_eval, today_eval)
-            
+
+        # 【ADR-136】即時停損的回測模型:勾了「停損停利即時觸發」的策略,實盤是
+        # **盤中觸價就走**;回測若只看收盤價會低估停損次數,兩邊對不上。
+        # 這裡在成交那一根 K 棒上用高低點判斷觸價,優先於當根的其他 intent。
+        if (open_trade is not None
+                and strategy_engine.intrabar_stop_enabled(s)
+                and not any(it.get('kind') == 'CLOSE' for it in intents)):
+            _touch = strategy_engine.bar_touch_exit(
+                s, rt, float(df['Open'].iloc[i]), float(df['High'].iloc[i]),
+                float(df['Low'].iloc[i]))
+            if _touch is not None:
+                _tp, _treason = _touch
+                _ti = strategy_engine._close_intent(rt, _tp, _treason)
+                _ti['_touch_price'] = _tp      # 成交價用觸價,不用開盤價 (見下)
+                intents = [_ti] + [it for it in intents if it.get('kind') != 'OPEN']
+
         # 【ADR-064】強制將所有訊號的預期成交價改為「隔天(今日)開盤價」
         # 【ADR-075】intent['price'] 用 A 的開盤 (→ apply_fill 的 entry_price,
         # 停損停利以 A 判定);實際成交價另取 B 對齊到同一時間的開盤 (exec_open)。
         open_px = float(df['Open'].iloc[i])
         for intent in intents:
-            intent['price'] = open_px
+            # 【ADR-136】盤中觸價出場的成交價是「觸價」(或跳空時的開盤價),
+            # 不可以被 ADR-064 這條「一律用開盤價」蓋掉 —— 那會讓即時停損在
+            # 回測裡永遠成交在開盤價,失去模擬的意義。
+            intent['price'] = intent.get('_touch_price', open_px)
         exec_open, exec_close_px = _exec_at(ts) if _use_watch else (open_px, float(df['Close'].iloc[i]))
 
         for intent in intents:
             action = intent['action']
-            fill = _fill_price(exec_open, action)  # 【ADR-075】成交在 B 的開盤價
+            # 【ADR-075】成交在 B 的開盤價。
+            # 【ADR-136】例外:盤中觸價出場要成交在觸價。但**看A做B 時不適用** ——
+            # 觸價是在 A 的 K 棒上算出來的,拿 A 的價格當 B 的成交價是錯的,
+            # 那種情況仍退回 B 的開盤價 (保守,且與既有模型一致)。
+            _px_src = exec_open
+            if not _use_watch and intent.get('_touch_price') is not None:
+                _px_src = float(intent['_touch_price'])
+            fill = _fill_price(_px_src, action)
             if intent['kind'] == 'OPEN':
                 strategy_engine.apply_fill(s, rt, intent, now_ts)
                 # 【ADR-053 重大修正】方向必須取自「實際開倉動作」,不能讀

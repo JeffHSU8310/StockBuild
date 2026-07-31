@@ -5697,6 +5697,25 @@ def _custom_parity_and_intrabar_stop_135():
         app._qt_check_realtime_futures_stops({'2330': 500.0})   # 跌很多
         app.flush_after()
         assert rt6['state'] == 'LONG', "市場關閉時這條路徑仍然不該出場 (ADR-124)"
+        _msess.is_market_open = lambda *a, **k: True
+
+        # 7) 【ADR-136】即時觸發改成可勾選:沒勾就不可以即時出場
+        _s7, rt7 = _mount(intrabar_stop=False)
+        app._qt_check_realtime_futures_stops({'2330': 500.0})
+        app.flush_after()
+        assert rt7['state'] == 'LONG', "沒勾『即時觸發』就不該盤中出場 (要等K棒收盤)"
+        # 正控:勾了就要出場 (少了這條,把功能整個關掉也會綠)
+        _s8, rt8 = _mount(intrabar_stop=True)
+        app._qt_check_realtime_futures_stops({'2330': 500.0})
+        app.flush_after()
+        assert rt8['state'] == 'FLAT', "勾了『即時觸發』就要盤中出場"
+
+        # 8) 兩個編輯器都要有這個勾選框,而且存檔要真的寫進去
+        _src2 = open('stock_app_pro.py', encoding='utf-8').read()
+        assert _src2.count("s['intrabar_stop'] = bool(var_intrabar.get())") == 2, \
+            "內建與自訂兩個編輯器都要把『即時觸發』存進策略"
+        assert _src2.count('strategy_engine.intrabar_stop_enabled(s)') >= 2, \
+            "兩個編輯器的勾選框都要用 core 的同一份相容判斷當初始值"
     finally:
         app.log_message = orig_log
         app._qt_resolve = orig_resolve
