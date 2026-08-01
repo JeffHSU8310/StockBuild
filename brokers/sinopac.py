@@ -199,3 +199,159 @@ class SinopacBroker(BrokerClient):
         """從 trade 物件取出狀態字串。各家 SDK 的回傳結構不同,所以放 adapter。"""
         st = getattr(getattr(trade, 'status', None), 'status', '')
         return getattr(st, 'name', st) or '送出'
+
+    # ------------------------------------------------------------------
+    # 【ADR-139】永豐 API 測試(模擬環境的登入測試 + 證券/期貨下單測試)
+    # ------------------------------------------------------------------
+    # 這一段**完全不碰** self.api。它自己開一個 simulation=True 的臨時連線,
+    # 用完就丟。理由:使用者可能正登著正式環境在跑策略,測試若共用同一個
+    # 連線物件,等於把他從實盤踢下線 —— 那是絕對不能發生的副作用。
+    #
+    # 規格出處:https://sinotrade.github.io/zh/tutor/prepare/terms/
+
+    def signed_rows(self):
+        """回傳 [(帳號, 種類, signed), ...] 給 core.api_test.signed_summary()。
+
+        **要用正式模式登入的 self.api 查**才有意義(官方就是這樣說的),
+        所以這個方法讀的是既有的正式連線,不另外建連線。
+        """
+        rows = []
+        for acc in (self._accounts() or []):
+            kind = getattr(getattr(acc, 'account_type', None), 'value', None) \
+                or str(getattr(acc, 'account_type', '') or '')
+            rows.append((self.account_id(acc), kind, bool(getattr(acc, 'signed', False))))
+        return rows
+
+
+class SinopacApiTestSession:
+    """一次性的模擬環境連線,專門用來跑永豐要求的 API 測試。
+
+    刻意做成獨立類別而不是 SinopacBroker 的方法:
+      - 它的生命週期跟正式連線完全無關(建立 → 測完 → 丟掉);
+      - `simulation=True` 這件事被關在這個型別裡,不可能被誤用到正式連線上。
+
+    ## 與鐵則 14 的關係(這一點必須講清楚)
+
+    鐵則 14 說「只有 `_confirm_and_place_order()` 可以呼叫 `place_order()`」。
+    這裡出現了第二個呼叫點,是 ADR-139 明確記錄的例外,而且用兩道更強的閘門
+    換取這個例外:
+
+      1. **送出前逐次檢查 `self.simulation is True`**,不是只在建構時檢查。
+         非模擬連線走到這裡一律 raise,不會有「設定跑掉就打到正式環境」。
+      2. GUI 那邊仍然**先跳確認視窗**才會走到這裡 —— 鐵則 14 真正要保護的
+         「沒有委託在使用者不知情下送出去」完全沒有被放寬。
+
+    也就是說:例外的是「哪個函式可以呼叫」,不是「要不要確認」。
+    """
+
+    def __init__(self):
+        if not HAS_SJ:
+            raise RuntimeError("沒有安裝 shioaji,無法進行 API 測試")
+        # simulation=True 是這個型別存在的唯一理由。
+        self.api = sj.Shioaji(simulation=True)
+        self.simulation = True
+        self.accounts = []
+
+    # ---- 步驟一:登入測試 ----
+    def login(self, api_key, secret_key):
+        """官方要求的第一項測試。回傳 accounts。"""
+        self._assert_simulation()
+        self.accounts = self.api.login(api_key=api_key, secret_key=secret_key) or []
+        return self.accounts
+
+    def stock_account(self):
+        return getattr(self.api, 'stock_account', None)
+
+    def futopt_account(self):
+        return getattr(self.api, 'futopt_account', None)
+
+    # ---- 步驟二:下單測試 ----
+    def stock_contract(self, code):
+        """模擬環境的合約查詢。TSE 找不到就找 OTC,再找不到回 None。"""
+        self._assert_simulation()
+        stocks = getattr(getattr(self.api, 'Contracts', None), 'Stocks', None)
+        if stocks is None:
+            return None
+        for board in ('TSE', 'OTC'):
+            b = getattr(stocks, board, None)
+            if b is None:
+                continue
+            c = None
+            try:
+                c = b[code]
+            except Exception:
+                c = getattr(b, f"{board}{code}", None)
+            if c is not None:
+                return c
+        return None
+
+    def futures_months(self, symbol):
+        """回傳 [(代碼, 交割日), ...],交給 core.api_test.pick_near_month() 挑。
+
+        挑「哪一個月份」是純規則,放 core/ 才測得到;這裡只負責把 SDK 物件
+        攤平成純資料(P-67:規則不要在 adapter 裡再寫一份)。
+        """
+        self._assert_simulation()
+        futs = getattr(getattr(self.api, 'Contracts', None), 'Futures', None)
+        group = getattr(futs, symbol, None) if futs is not None else None
+        rows = []
+        for c in (group or []):
+            rows.append((getattr(c, 'code', ''), getattr(c, 'delivery_date', '')))
+        return rows
+
+    def futures_contract(self, symbol, code):
+        self._assert_simulation()
+        futs = getattr(getattr(self.api, 'Contracts', None), 'Futures', None)
+        group = getattr(futs, symbol, None) if futs is not None else None
+        for c in (group or []):
+            if getattr(c, 'code', '') == code:
+                return c
+        return None
+
+    def place_stock_test_order(self, contract, price, qty):
+        """證券下單測試。逐欄位照官方範例:限價 ROD、整股、現股、買進。"""
+        self._assert_simulation()
+        order = self.api.Order(
+            action=sj.constant.Action.Buy,
+            price=float(price),
+            quantity=int(qty),
+            price_type=sj.constant.StockPriceType.LMT,
+            order_type=sj.constant.OrderType.ROD,
+            order_lot=sj.constant.StockOrderLot.Common,
+            order_cond=sj.constant.StockOrderCond.Cash,
+            account=self.api.stock_account,
+        )
+        return self.api.place_order(contract, order)
+
+    def place_futures_test_order(self, contract, price, qty):
+        """期貨下單測試。逐欄位照官方範例:限價 ROD、OCType.Auto、買進。"""
+        self._assert_simulation()
+        order = self.api.Order(
+            action=sj.constant.Action.Buy,
+            price=float(price),
+            quantity=int(qty),
+            price_type=sj.constant.FuturesPriceType.LMT,
+            order_type=sj.constant.OrderType.ROD,
+            octype=sj.constant.FuturesOCType.Auto,
+            account=self.api.futopt_account,
+        )
+        return self.api.place_order(contract, order)
+
+    def close(self):
+        try:
+            self.api.logout()
+        except Exception:
+            pass
+
+    # ---- 閘門 ----
+    def _assert_simulation(self):
+        """每一次動作都重驗一遍,不是只在 __init__ 驗。
+
+        「建構時驗過就好」的假設在這裡不成立:這個物件會被丟進背景執行緒、
+        跨好幾秒的流程,中間任何人動到 self.simulation 都必須立刻擋下。
+        這道檢查很便宜,而它擋的是「測試單打到正式環境」。
+        """
+        if self.simulation is not True:
+            raise RuntimeError(
+                "API 測試連線不是模擬模式,已拒絕送出 —— 這道檢查是為了確保"
+                "測試單絕不可能打到正式環境(ADR-139)")
