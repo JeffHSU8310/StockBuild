@@ -116,6 +116,11 @@ PITFALLS P-27）。它們存在的唯一理由就是「可離線單元測試」�
   RSI 公認的中性線。趨勢採**位置為主、斜率為輔**（PITFALLS 見 ADR-134：
   等速下跌會讓 RSI 收斂成水平線，只看斜率會誤判成盤整）。
   **只產生線與訊號，不下單。**
+- `api_test.py`（ADR-139）：永豐 API 測試（模擬環境的登入/下單測試）的純規則
+  —— 測試時段（週一~五 08:00~20:00、18:00 後僅限台灣 IP）、shioaji 版本下限、
+  委託欄位驗證、**期貨最近月合約挑選**、報告排版。官方範例寫死的月份合約
+  （`TXFE6`）會過期，所以挑月份是執行期動態解析而不是常數。
+  真正的連線與送單在 `brokers/sinopac.SinopacApiTestSession`。
 - `palette.py`（ADR-138）：指標線色盤。**舊有 8 色排最前面且標籤字串不可
   更動** —— `indicator_settings.json` 存的是**標籤字串**不是色碼，標籤一改，
   使用者存過的顏色會全部對不上而靜默退回預設色。後面接 255 系統色
@@ -283,6 +288,7 @@ _tg_poll_worker (背景 daemon,getUpdates long polling)
 | 任何檔案 | `python -m py_compile` + `python diag_crossref.py`（跨模組斷鏈 **與重複定義**，ADR-109） |
 | shioaji 連線、即時報價、實鍵盤輸入法、實機排版顏色 | **只能請使用者實機驗證**，交付時附「怎麼驗」 |
 | Telegram 遠端控制 | `core/telegram_control.py` 測純邏輯 + diag 走 GUI 派送路徑；真實 Bot 收發只能實機驗證 |
+| 永豐 API 測試 (ADR-139) | `core/api_test.py` 測規則 + diag 用假 session 走完整送單路徑（確認視窗順序、simulation 閘門、1 秒間隔、不碰正式連線）；**真實模擬環境的連線與送單只能實機驗證** |
 
 ---
 
@@ -307,6 +313,7 @@ G:\StockBuild\
 │   ├─ volume_profile.py    量價支撐壓力 (POC/價值區/高量節點, ADR-102)
 │   ├─ regime_panel.py      主圖【盤勢判斷】:設定正規化 + 通知去重 (ADR-120)
 │   ├─ palette.py           指標線色盤:舊8色 + 255系統色 + 容錯解析 (ADR-138)
+│   ├─ api_test.py          永豐 API 測試的純規則:時段/版本/欄位/最近月 (ADR-139)
 │   ├─ market_session.py    交易時段/開盤暖機/跨開盤判斷 (ADR-070/121/127)
 │   ├─ kbars_plan.py        kbars 分段門檻/段長的單一出處 (ADR-122)
 │   └─ order_rules.py

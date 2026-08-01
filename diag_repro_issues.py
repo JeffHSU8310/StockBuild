@@ -16,6 +16,8 @@ import numpy as np
 import pandas as pd
 import stock_app_pro
 from stock_app_pro import StockTradingAppPro
+# 【ADR-139】要 monkeypatch SinopacApiTestSession,所以拿整個模組不是類別。
+from brokers import sinopac as sinopac_mod
 
 # ---------------------------------------------------------------------------
 # 【ADR-115】診斷腳本不可以動到使用者的真實資料檔
@@ -5953,6 +5955,224 @@ def _adr138_bollinger_palette_grid_telegram():
 
 run_case("ADR-138: 布林上下線各自σ + 255色 + 內建編輯器勾選框被蓋掉 + 遠端控制狀態可見",
          _adr138_bollinger_palette_grid_telegram)
+
+
+def _sinopac_api_test_139():
+    """【ADR-139】永豐 API 測試:模擬環境的登入測試 + 證券/期貨下單測試。
+
+    規格出處:https://sinotrade.github.io/zh/tutor/prepare/terms/
+
+    這個案例守的是**送單路徑**上最要命的幾件事:
+      A. 送出前一定先跳確認視窗(鐵則 14 沒有被放寬)
+      B. 只可能打到 simulation=True 的連線,而且是**每次送出前**重驗
+      C. 完全不碰正式連線(使用者可能正登著實盤在跑策略)
+      D. 兩筆測試單之間真的隔了 1 秒以上(官方要求)
+      E. 期貨月份是**動態挑最近月**,不是照抄官方範例的固定代碼
+      F. 登入失敗就不送單;帳戶缺一個就跳過那一項而不是整個崩掉
+    """
+    import re as _re
+    import types as _types
+    from core import api_test as _at
+
+    _src = open('stock_app_pro.py', encoding='utf-8').read()
+
+    # ---- A. 鐵則14:確認視窗必須在「開執行緒送單」之前 ----
+    # 用「下一個同縮排的 def」切片,不可拿關鍵字位置去切 (P-109/P-110)。
+    _i = _src.index('    def open_api_test_dialog(')
+    _m = _re.search(r'\n    def (?!open_api_test_dialog\b)\w+', _src[_i:])
+    assert _m, "找不到 open_api_test_dialog 的結尾"
+    _seg = _src[_i:_i + _m.start()]
+    assert 'def _api_test_validate' not in _seg, "切片切太長了"
+    _pos_confirm = _seg.find('askyesno')
+    _pos_thread = _seg.find('_api_test_worker')
+    assert _pos_confirm >= 0, "API 測試送出前必須跳確認視窗 (鐵則14)"
+    assert _pos_thread >= 0, "找不到送單的背景執行緒"
+    assert _pos_confirm < _pos_thread, \
+        "確認視窗必須在送單之前 —— 順序反了等於先送再問"
+    # 取消就什麼都不做 (反向對照:少了這條,askyesno 回傳值被忽略也會綠)
+    assert _re.search(r'if not messagebox\.askyesno\([^)]*\)[\s\S]{0,200}?return', _seg), \
+        "使用者按取消時必須 return,不可以照送"
+
+    # ---- B. simulation 閘門:每次送出前重驗,不是只在建構時 ----
+    _bsrc = open('brokers/sinopac.py', encoding='utf-8').read()
+    _j = _bsrc.index('class SinopacApiTestSession')
+    _bseg = _bsrc[_j:]
+    assert 'sj.Shioaji(simulation=True)' in _bseg, "API 測試連線必須是模擬模式"
+    for _meth in ('place_stock_test_order', 'place_futures_test_order', 'login'):
+        _k = _bseg.index(f'def {_meth}(')
+        _m2 = _re.search(r'\n    def ', _bseg[_k:])
+        _body = _bseg[_k:_k + (_m2.start() if _m2 else len(_bseg))]
+        assert '_assert_simulation()' in _body, \
+            f"{_meth} 送出前沒有重驗 simulation —— 這道閘門擋的是測試單打到正式環境"
+    # 正式的 SinopacBroker 仍然是 simulation=False (反向對照:不可以把整個
+    # 主連線改成模擬,那會讓實盤下單全部變成假的)
+    assert 'sj.Shioaji(simulation=False)' in _bsrc, "正式連線必須維持 simulation=False"
+
+    # 閘門真的會擋:把 simulation 改掉就 raise
+    _sess_cls = sinopac_mod.SinopacApiTestSession
+    _fake = _sess_cls.__new__(_sess_cls)
+    _fake.simulation = False
+    for _meth in ('_assert_simulation',):
+        try:
+            getattr(_fake, _meth)()
+            raise AssertionError("simulation=False 竟然沒有被擋下")
+        except RuntimeError:
+            pass
+    _fake.simulation = True
+    _fake._assert_simulation()          # 反向對照:模擬模式要放行
+
+    # ---- 準備一個假的測試連線 ----
+    sent = []
+    events = []
+
+    class FakeTrade:
+        def __init__(self): self.status = _types.SimpleNamespace(status='PendingSubmit')
+
+    class FakeSession:
+        made = []
+        fail_login = False
+        no_stock = False
+        no_futopt = False
+
+        def __init__(self):
+            self.simulation = True
+            FakeSession.made.append(self)
+            events.append('open')
+
+        def login(self, api_key, secret_key):
+            if FakeSession.fail_login:
+                raise RuntimeError("金鑰錯誤")
+            events.append('login')
+            return ['acc1', 'acc2']
+
+        def stock_account(self): return None if FakeSession.no_stock else object()
+        def futopt_account(self): return None if FakeSession.no_futopt else object()
+        def stock_contract(self, code): return f"C:{code}"
+
+        def futures_months(self, symbol):
+            # 刻意讓「日期最近的」是連續合約 R1 —— 挑錯就會抓到
+            return [(f'{symbol}R1', '2026/08/19'), (f'{symbol}G6', '2026/07/15'),
+                    (f'{symbol}I6', '2026/09/16'), (f'{symbol}J6', '2026/10/21')]
+
+        def futures_contract(self, symbol, code): return f"C:{code}"
+
+        def place_stock_test_order(self, contract, price, qty):
+            sent.append(('證券', contract, price, qty, time.monotonic()))
+            events.append('stock_order')
+            return FakeTrade()
+
+        def place_futures_test_order(self, contract, price, qty):
+            sent.append(('期貨', contract, price, qty, time.monotonic()))
+            events.append('futures_order')
+            return FakeTrade()
+
+        def close(self): events.append('close')
+
+    slept = []
+    orig_session = sinopac_mod.SinopacApiTestSession
+    orig_sleep = stock_app_pro.time.sleep
+    orig_log = app.log_message
+    orig_broker = app.brokers.get('sinopac')
+
+    def _plan(**over):
+        p = {'api_key': 'K', 'secret_key': 'S',
+             'stock': {'on': True, 'code': '2890', 'price': '28', 'qty': '1'},
+             'futures': {'on': True, 'code': 'TXF', 'price': '37000', 'qty': '1'}}
+        p.update(over)
+        return p
+
+    lines = []
+    try:
+        sinopac_mod.SinopacApiTestSession = FakeSession
+        stock_app_pro.time.sleep = lambda s: slept.append(s)
+        app.log_message = lambda m: None
+
+        # ---- C. 本地驗證先擋掉明顯錯誤,連線都不該建立 ----
+        FakeSession.made = []
+        for _bad, _why in ((_plan(api_key=''), '沒填金鑰'),
+                           (_plan(stock={'on': True, 'code': '289', 'price': '28', 'qty': '1'}), '證券代碼不合法'),
+                           (_plan(stock={'on': False, 'code': '2890', 'price': '28', 'qty': '1'},
+                                  futures={'on': False, 'code': 'TXF', 'price': '1', 'qty': '1'}), '兩項都沒勾')):
+            _ok, _ = app._api_test_validate(_bad)
+            assert not _ok, f"{_why} 應該在本地就被擋下"
+        assert not FakeSession.made, "本地驗證沒過就不該建立任何連線"
+        # 反向對照:官方範例的參數必須驗得過
+        assert app._api_test_validate(_plan())[0], "官方範例的參數要驗得過"
+
+        # ---- D. 正常流程:兩筆單都送出、順序對、間隔夠 ----
+        FakeSession.made = []; sent.clear(); events.clear(); slept.clear(); lines.clear()
+        app._api_test_worker(_plan(), lines.append, _types.SimpleNamespace(config=lambda **k: None))
+        app.flush_after()
+        assert [e for e in events if e.endswith('order')] == ['stock_order', 'futures_order'], \
+            f"兩筆測試單都要送出且證券在前 (實際 {events})"
+        assert events[-1] == 'close', "測完要把臨時連線關掉"
+        # 只認 core 常數那個值:app 背景執行緒也會 sleep(0.1/3.0 之類),
+        # 拿 min()/max() 去比會被那些雜訊影響 (第一版就是這樣紅的)。
+        assert _at.ORDER_INTERVAL_SEC in slept, \
+            f"兩筆測試單之間要等 {_at.ORDER_INTERVAL_SEC} 秒 (官方要求 1 秒以上,實際沒等)"
+        assert _at.ORDER_INTERVAL_SEC > 1.0, "core 的間隔常數必須大於 1 秒"
+
+        # ---- E. 期貨挑的是最近月,不是 R1、也不是過期的 G6 ----
+        _fut = [x for x in sent if x[0] == '期貨'][0]
+        assert _fut[1] == 'C:TXFI6', \
+            f"期貨應該挑最近月 TXFI6,不可以挑連續合約 R1 或過期的 G6 (實際 {_fut[1]})"
+        _stk = [x for x in sent if x[0] == '證券'][0]
+        assert (_stk[1], _stk[2], _stk[3]) == ('C:2890', 28.0, 1), \
+            f"證券單的欄位跟使用者填的不符 (實際 {_stk[:4]})"
+
+        # ---- F. 完全沒有碰到正式連線 ----
+        assert app.brokers.get('sinopac') is orig_broker, "API 測試不可以換掉正式連線物件"
+
+        # ---- G. 登入失敗就不可以送單 ----
+        FakeSession.fail_login = True
+        sent.clear(); events.clear(); lines.clear()
+        app._api_test_worker(_plan(), lines.append, _types.SimpleNamespace(config=lambda **k: None))
+        app.flush_after()
+        assert not sent, "登入測試沒過就不該送出任何委託"
+        assert any('登入' in str(x) for x in lines), "要說出是登入失敗"
+        FakeSession.fail_login = False
+
+        # ---- H. 缺一個帳戶只跳過那一項,不是整個崩掉 ----
+        FakeSession.no_stock = True
+        sent.clear(); events.clear(); lines.clear()
+        app._api_test_worker(_plan(), lines.append, _types.SimpleNamespace(config=lambda **k: None))
+        app.flush_after()
+        assert [x[0] for x in sent] == ['期貨'], \
+            f"沒有證券帳戶時應只送期貨那一筆 (實際 {[x[0] for x in sent]})"
+        FakeSession.no_stock = False
+
+        # ---- I. 只送一筆時不需要等待 (間隔是「兩筆之間」的規則) ----
+        sent.clear(); events.clear(); slept.clear()
+        app._api_test_worker(_plan(futures={'on': False, 'code': 'TXF', 'price': '37000', 'qty': '1'}),
+                             lines.append, _types.SimpleNamespace(config=lambda **k: None))
+        app.flush_after()
+        assert [x[0] for x in sent] == ['證券']
+        assert _at.ORDER_INTERVAL_SEC not in slept, "只有一筆單時不需要等待"
+    finally:
+        sinopac_mod.SinopacApiTestSession = orig_session
+        stock_app_pro.time.sleep = orig_sleep
+        app.log_message = orig_log
+
+    # ---- J. 查詢測試狀態:未登入正式環境時要講清楚,不可以亂回答 ----
+    _orig_login = app.api_logged_in
+    try:
+        app.api_logged_in = False
+        _txt = app._api_test_signed_text()
+        assert '正式' in _txt, "沒登入正式環境時要說明查詢條件"
+    finally:
+        app.api_logged_in = _orig_login
+
+    # ---- K. 對話框的確認文字要把「實際會送出什麼」攤開 ----
+    _ct = app._api_test_confirm_text(_plan())
+    for _must in ('模擬', '2890', '28', 'TXF', '37000'):
+        assert _must in _ct, f"確認視窗要寫出 {_must}"
+
+    # ---- L. 版面不可撞格 (P-104/P-115) ----
+    assert not _grid_overlaps('open_api_test_dialog'), "API 測試對話框有 grid 撞格"
+
+
+run_case("ADR-139: 永豐 API 測試 (模擬環境登入+證券/期貨下單測試,確認視窗/模擬閘門/1秒間隔)",
+         _sinopac_api_test_139)
 
 
 print(f"{'案例':60s} 結果")

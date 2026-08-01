@@ -58,6 +58,8 @@ from core import jae
 from core import regime_panel
 # 【ADR-138】指標線色盤 (舊 8 色 + 255 系統色)
 from core import palette
+# 【ADR-139】永豐 API 測試的純規則 (測試時段/版本/欄位/最近月合約)。
+from core import api_test
 # 【ADR-100】籌碼資料:解析純邏輯在 core/,本地 CSV 存取在 data/。
 from core import chips_parser
 # 【ADR-101】籌碼併進策略 df (含未來函數防護)。
@@ -74,6 +76,10 @@ from data import taifex_store
 from data import chips_store
 # 【ADR-097 階段0】券商連線生命週期抽到 brokers/ 套件,詳見 DECISIONS_ADR097.md。
 from brokers.sinopac import SinopacBroker
+# 【ADR-139】永豐 API 測試 (模擬環境的登入/下單測試) 用的一次性連線型別。
+# 刻意整個模組匯入而不是只匯入類別:診斷要能 monkeypatch
+# sinopac.SinopacApiTestSession,只匯入名稱的話換不掉。
+from brokers import sinopac
 # 【ADR-111】凱基 adapter。HAS_KGI 為 False 代表套件沒裝或載不起來
 # (Python 3.14 就是這種情況),主程式照常運作,只是沒有凱基這個選項。
 from brokers.kgi import KGIBroker, HAS_KGI
@@ -1955,6 +1961,292 @@ class StockTradingAppPro(tk.Tk):
             threading.Thread(target=self.process_broker_login, args=(api, sec, pid, ca_p, ca_pw), daemon=True).start()
 
         tk.Button(dlg, text="驗證憑證並連線", bg="#FF9100", fg="black", font=('微軟正黑體', 10, 'bold'), command=do_login).pack(pady=15)
+        # 【ADR-139】永豐要求先在模擬環境跑過登入測試 + 證券/期貨下單測試,
+        # 正式環境的下單權限才會開通。入口放在這裡是因為使用者會在「登入不成功
+        # /沒有下單權限」的時候來開這個視窗,答案就在旁邊。
+        tk.Button(dlg, text="🧪 API 測試 (證券/期貨下單測試)", bg="#00ACC1", fg="black",
+                  font=('微軟正黑體', 9, 'bold'), relief="flat",
+                  command=self.open_api_test_dialog).pack(pady=(0, 10))
+
+    # ==================================================================
+    # 【ADR-139】永豐 API 測試:模擬環境的登入測試 + 證券/期貨下單測試
+    # ==================================================================
+    # 規格出處:https://sinotrade.github.io/zh/tutor/prepare/terms/
+    #
+    # 判斷規則全部在 core/api_test.py(離線可測);模擬連線與送單在
+    # brokers/sinopac.SinopacApiTestSession(唯一可以碰 SDK 的層)。
+    # 這裡只負責:收使用者輸入 → 跳確認視窗 → 丟背景執行緒 → safe_after 回 UI。
+
+    def open_api_test_dialog(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("永豐 API 測試 (模擬環境)")
+        dlg.configure(bg="#1A2026")
+        self.center_window(dlg, 640, 620)
+        dlg.transient(self)
+
+        tk.Label(dlg, text="永豐 API 測試 (模擬環境,不會有真實委託)",
+                 bg="#1A2026", fg="#00E5FF", font=('微軟正黑體', 11, 'bold')).pack(pady=(10, 2))
+        tk.Label(dlg, text=("永豐要求:簽署條款後要在模擬環境跑過「登入測試」與「下單測試」,"
+                            "證券、期貨兩個帳戶分別測,通過後正式環境的下單權限才會開通。\n"
+                            "測試時間:週一~五 08:00~20:00(18:00 之後僅限台灣 IP)。"
+                            "兩筆測試單之間會自動間隔 1.5 秒(官方要求 1 秒以上)。"),
+                 bg="#12181F", fg="#8A99AD", font=('微軟正黑體', 8), wraplength=600,
+                 justify='left').pack(fill=tk.X, padx=12, pady=(2, 8))
+
+        form = tk.Frame(dlg, bg="#1A2026"); form.pack(fill=tk.X, padx=12)
+
+        def _lbl(parent, text, fg="white"):
+            return tk.Label(parent, text=text, bg="#1A2026", fg=fg, font=('微軟正黑體', 9))
+
+        def _ent(parent, value, width=22, show=None):
+            e = tk.Entry(parent, bg="#2A323D", fg="white", justify="center",
+                         width=width, show=show)
+            e.insert(0, str(value))
+            return e
+
+        _lbl(form, "API Key:").grid(row=0, column=0, sticky='w', pady=3)
+        e_key = _ent(form, self.saved_api_key, 34, show="*")
+        e_key.grid(row=0, column=1, columnspan=3, sticky='w', padx=4, pady=3)
+        _lbl(form, "Secret Key:").grid(row=1, column=0, sticky='w', pady=3)
+        e_sec = _ent(form, self.saved_secret_key, 34, show="*")
+        e_sec.grid(row=1, column=1, columnspan=3, sticky='w', padx=4, pady=3)
+        tk.Label(form, text="※ 此 API Key 必須已開通「交易」權限,否則下單測試會被拒絕。",
+                 bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8)).grid(
+                 row=2, column=0, columnspan=4, sticky='w', pady=(0, 6))
+
+        ttk.Separator(form, orient='horizontal').grid(row=3, column=0, columnspan=4,
+                                                      sticky='ew', pady=6)
+
+        var_stk = tk.BooleanVar(value=True)
+        tk.Checkbutton(form, text="證券下單測試", variable=var_stk, bg="#1A2026",
+                       fg="#00E676", selectcolor="#2A323D", activebackground="#1A2026",
+                       font=('微軟正黑體', 9, 'bold')).grid(row=4, column=0, sticky='w')
+        _lbl(form, "代碼").grid(row=4, column=1, sticky='e')
+        e_stk_code = _ent(form, api_test.DEFAULT_STOCK['code'], 8)
+        e_stk_code.grid(row=4, column=2, sticky='w', padx=4)
+        _lbl(form, "價格 / 數量(張)").grid(row=5, column=1, sticky='e')
+        _stk_px = tk.Frame(form, bg="#1A2026"); _stk_px.grid(row=5, column=2, columnspan=2, sticky='w', padx=4)
+        e_stk_price = _ent(_stk_px, api_test.DEFAULT_STOCK['price'], 8); e_stk_price.pack(side=tk.LEFT)
+        e_stk_qty = _ent(_stk_px, api_test.DEFAULT_STOCK['qty'], 5); e_stk_qty.pack(side=tk.LEFT, padx=(6, 0))
+
+        var_fut = tk.BooleanVar(value=True)
+        tk.Checkbutton(form, text="期貨下單測試", variable=var_fut, bg="#1A2026",
+                       fg="#00E676", selectcolor="#2A323D", activebackground="#1A2026",
+                       font=('微軟正黑體', 9, 'bold')).grid(row=6, column=0, sticky='w', pady=(6, 0))
+        _lbl(form, "商品").grid(row=6, column=1, sticky='e', pady=(6, 0))
+        e_fut_code = _ent(form, api_test.DEFAULT_FUTURES['code'], 8)
+        e_fut_code.grid(row=6, column=2, sticky='w', padx=4, pady=(6, 0))
+        tk.Label(form, text="(月份自動抓最近月)", bg="#1A2026", fg="#8A99AD",
+                 font=('微軟正黑體', 8)).grid(row=6, column=3, sticky='w')
+        _lbl(form, "價格 / 數量(口)").grid(row=7, column=1, sticky='e')
+        _fut_px = tk.Frame(form, bg="#1A2026"); _fut_px.grid(row=7, column=2, columnspan=2, sticky='w', padx=4)
+        e_fut_price = _ent(_fut_px, api_test.DEFAULT_FUTURES['price'], 8); e_fut_price.pack(side=tk.LEFT)
+        e_fut_qty = _ent(_fut_px, api_test.DEFAULT_FUTURES['qty'], 5); e_fut_qty.pack(side=tk.LEFT, padx=(6, 0))
+
+        tk.Label(form, text=("※ 價格請填「當日漲跌停之內」的合理價,否則會被交易所退單。"
+                             "這裡刻意不自動抓現價 —— 那會打到報價快照的流量上限(鐵則5)。"),
+                 bg="#1A2026", fg="#FFCA28", font=('微軟正黑體', 8), wraplength=600,
+                 justify='left').grid(row=8, column=0, columnspan=4, sticky='w', pady=(6, 0))
+
+        out = tk.Text(dlg, height=13, bg="#0D1115", fg="#D0D8E0",
+                      font=('Consolas', 9), wrap='word')
+        out.pack(fill=tk.BOTH, expand=True, padx=12, pady=(10, 4))
+
+        def _write(text, clear=False):
+            try:
+                if not dlg.winfo_exists():
+                    return
+                if clear:
+                    out.delete('1.0', tk.END)
+                out.insert(tk.END, str(text) + "\n")
+                out.see(tk.END)
+            except Exception:
+                pass
+
+        btns = tk.Frame(dlg, bg="#1A2026"); btns.pack(pady=(0, 10))
+        btn_run = tk.Button(btns, text="▶ 開始測試", bg="#00ACC1", fg="black", relief="flat",
+                            font=('微軟正黑體', 10, 'bold'), padx=16, pady=3)
+        btn_run.pack(side=tk.LEFT, padx=6)
+        tk.Button(btns, text="🔍 查詢測試狀態", bg="#2A323D", fg="white", relief="flat",
+                  font=('微軟正黑體', 10), padx=14, pady=3,
+                  command=lambda: _write(self._api_test_signed_text(), clear=True)).pack(side=tk.LEFT, padx=6)
+        tk.Button(btns, text="關閉", bg="#2A323D", fg="white", relief="flat",
+                  font=('微軟正黑體', 10), padx=18, pady=3,
+                  command=dlg.destroy).pack(side=tk.LEFT, padx=6)
+
+        def _start():
+            plan = {
+                'api_key': e_key.get().strip(),
+                'secret_key': e_sec.get().strip(),
+                'stock': {'on': bool(var_stk.get()), 'code': e_stk_code.get().strip(),
+                          'price': e_stk_price.get().strip(), 'qty': e_stk_qty.get().strip()},
+                'futures': {'on': bool(var_fut.get()), 'code': e_fut_code.get().strip().upper(),
+                            'price': e_fut_price.get().strip(), 'qty': e_fut_qty.get().strip()},
+            }
+            ok, why = self._api_test_validate(plan)
+            if not ok:
+                _write(f"❌ {why}", clear=True)
+                return
+            # 【鐵則14】即使是模擬環境,送出任何委託之前一律先跳確認視窗,
+            # 而且把「實際會送出什麼」逐欄位攤開給使用者看過。
+            if not messagebox.askyesno("確認 API 測試", self._api_test_confirm_text(plan)):
+                _write("已取消,沒有送出任何東西。", clear=True)
+                return
+            btn_run.config(state='disabled', text="⏳ 測試中…")
+            _write("開始測試…", clear=True)
+            threading.Thread(target=self._api_test_worker,
+                             args=(plan, _write, btn_run), daemon=True).start()
+
+        btn_run.config(command=_start)
+        _write(self._api_test_preflight_text())
+
+    def _api_test_validate(self, plan):
+        """送出前的本地驗證(鐵則 9:不靠券商回錯誤才知道欄位不對)。"""
+        if not plan['api_key'] or not plan['secret_key']:
+            return False, "API Key 與 Secret Key 都要填"
+        if not (plan['stock']['on'] or plan['futures']['on']):
+            return False, "至少要勾一項測試"
+        for kind, key in (('證券', 'stock'), ('期貨', 'futures')):
+            leg = plan[key]
+            if not leg['on']:
+                continue
+            ok, why = api_test.validate_order(kind, leg['code'], leg['price'], leg['qty'])
+            if not ok:
+                return False, f"{kind}:{why}"
+        return True, ""
+
+    def _api_test_confirm_text(self, plan):
+        lines = ["即將在**模擬環境**送出以下測試委託:", ""]
+        if plan['stock']['on']:
+            lines.append(f"  證券  買進  {plan['stock']['code']}  "
+                         f"限價 {plan['stock']['price']}  {plan['stock']['qty']} 張  ROD/現股")
+        if plan['futures']['on']:
+            lines.append(f"  期貨  買進  {plan['futures']['code']}(最近月)  "
+                         f"限價 {plan['futures']['price']}  {plan['futures']['qty']} 口  ROD/自動")
+        lines += ["", "這是 simulation=True 的連線,不會有真實成交,",
+                  "也不會影響你目前的正式連線(另開一條臨時連線,測完即斷)。",
+                  "", "確定送出?"]
+        return "\n".join(lines)
+
+    def _api_test_preflight_text(self):
+        sdk = ""
+        try:
+            sdk = self.brokers['sinopac'].sdk_version()
+        except Exception:
+            sdk = getattr(sj, '__version__', '') if HAS_SJ else ''
+        _ok, lines = api_test.preflight(sdk, True, True)
+        head = ["【開始前檢查】", ""]
+        tail = ["", "(帳戶有沒有真的存在,要登入模擬環境之後才知道 —— 上面兩項",
+                " 先當作有,實際跑的時候會照真實結果跳過對應的測試。)"]
+        return "\n".join(head + lines + tail)
+
+    def _api_test_signed_text(self):
+        """查詢是否通過 API 測試 —— 官方指定看**正式模式**登入後的 accounts.signed。"""
+        if not (self.api_logged_in and HAS_SJ):
+            return ("請先以正式模式登入券商 API,再查詢測試狀態。\n"
+                    "(官方的判定依據是正式環境 accounts 的 signed 欄位,"
+                    "模擬環境查不到這個結果。)")
+        try:
+            return api_test.signed_summary(self.brokers['sinopac'].signed_rows())
+        except Exception as e:
+            return f"查詢失敗:{e}"
+
+    def _api_test_worker(self, plan, write, btn):
+        """背景執行緒跑完整個測試流程。所有 UI 更新一律走 safe_after(鐵則 13)。"""
+        results = []
+
+        def say(text):
+            self.safe_after(0, write, text)
+
+        session = None
+        try:
+            session = sinopac.SinopacApiTestSession()
+            say("已建立模擬環境連線 (simulation=True)。")
+
+            # ---- 步驟一:登入測試 ----
+            try:
+                accounts = session.login(plan['api_key'], plan['secret_key'])
+                results.append({'step': '登入測試 login', 'ok': True,
+                                'detail': f"取得 {len(accounts)} 個帳戶"})
+                say("✅ 登入測試通過。")
+            except Exception as e:
+                results.append({'step': '登入測試 login', 'ok': False, 'detail': str(e)})
+                say(f"❌ 登入測試失敗:{e}")
+                return
+
+            has_stk = session.stock_account() is not None
+            has_fut = session.futopt_account() is not None
+            if plan['stock']['on'] and not has_stk:
+                results.append({'step': '證券下單測試', 'ok': False,
+                                'detail': '這組金鑰底下沒有證券帳戶'})
+                say("⚠️ 找不到證券帳戶,跳過證券下單測試。")
+            if plan['futures']['on'] and not has_fut:
+                results.append({'step': '期貨下單測試', 'ok': False,
+                                'detail': '這組金鑰底下沒有期貨帳戶'})
+                say("⚠️ 找不到期貨帳戶,跳過期貨下單測試。")
+
+            sent_any = False
+
+            # ---- 步驟二:證券下單測試 ----
+            if plan['stock']['on'] and has_stk:
+                try:
+                    contract = session.stock_contract(plan['stock']['code'])
+                    if contract is None:
+                        raise ValueError(f"模擬環境查無證券合約 {plan['stock']['code']}")
+                    trade = session.place_stock_test_order(
+                        contract, float(plan['stock']['price']), int(plan['stock']['qty']))
+                    results.append({'step': '證券下單測試 place_order', 'ok': True,
+                                    'detail': self._api_test_trade_text(trade)})
+                    say("✅ 證券下單測試已送出。")
+                    sent_any = True
+                except Exception as e:
+                    results.append({'step': '證券下單測試 place_order', 'ok': False,
+                                    'detail': str(e)})
+                    say(f"❌ 證券下單測試失敗:{e}")
+
+            # ---- 官方:兩筆測試單需間隔 1 秒以上 ----
+            if sent_any and plan['futures']['on'] and has_fut:
+                say(f"等待 {api_test.ORDER_INTERVAL_SEC} 秒"
+                    "(官方要求兩筆測試單間隔 1 秒以上,以利系統留存測試紀錄)…")
+                time.sleep(api_test.ORDER_INTERVAL_SEC)
+
+            # ---- 步驟三:期貨下單測試 ----
+            if plan['futures']['on'] and has_fut:
+                try:
+                    symbol = plan['futures']['code']
+                    code = api_test.pick_near_month(session.futures_months(symbol))
+                    if not code:
+                        raise ValueError(f"模擬環境挑不出 {symbol} 的最近月合約")
+                    contract = session.futures_contract(symbol, code)
+                    if contract is None:
+                        raise ValueError(f"模擬環境查無期貨合約 {code}")
+                    say(f"期貨最近月合約:{code}")
+                    trade = session.place_futures_test_order(
+                        contract, float(plan['futures']['price']), int(plan['futures']['qty']))
+                    results.append({'step': f'期貨下單測試 place_order ({code})', 'ok': True,
+                                    'detail': self._api_test_trade_text(trade)})
+                    say("✅ 期貨下單測試已送出。")
+                except Exception as e:
+                    results.append({'step': '期貨下單測試 place_order', 'ok': False,
+                                    'detail': str(e)})
+                    say(f"❌ 期貨下單測試失敗:{e}")
+        except Exception as e:
+            results.append({'step': '建立模擬連線', 'ok': False, 'detail': str(e)})
+            say(f"❌ 無法建立模擬環境連線:{e}")
+        finally:
+            if session is not None:
+                session.close()
+            report = api_test.format_report(results)
+            self.safe_after(0, write, "\n" + report)
+            self.safe_after(0, self.log_message,
+                            "【API測試】" + report.replace("\n", " / "))
+            self.safe_after(0, lambda: btn.config(state='normal', text="▶ 開始測試"))
+
+    def _api_test_trade_text(self, trade):
+        try:
+            return self.brokers['sinopac'].order_status_text(trade)
+        except Exception:
+            return '已送出'
 
     # ================= ✨ v1 串流監聽 (單軌架構,以官方 intraday_odd 欄位精準分流) =================
     # 【修正說明】原先同時註冊 v0 set_quote_callback 與 v1 callbacks,

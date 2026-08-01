@@ -15,6 +15,7 @@ import os
 import sys
 import json
 import tempfile
+import datetime
 import unittest
 import urllib.parse
 
@@ -50,6 +51,7 @@ from core import kbars_plan
 from core import fibonacci
 from core import jae
 from core import palette
+from core import api_test
 from core import regime_panel
 from core import chips_parser
 from core import chips_features
@@ -2317,6 +2319,186 @@ class TestBollingerSigmaMigration(unittest.TestCase):
             self.assertEqual(d['bb_std_up'], 1.5)
             self.assertEqual(d['bb_std_dn'], 1.5)
             self.assertEqual(d['bb_period'], 10)   # 其他欄位沒被弄壞
+
+
+class TestApiTestRules(unittest.TestCase):
+    """【ADR-139】永豐 API 測試(模擬環境的登入/下單測試)的純規則。
+
+    規格出處:https://sinotrade.github.io/zh/tutor/prepare/terms/
+    這裡測的每一條都對應官方文件上的一句話,不是我自己發明的限制。
+    """
+
+    # ---------- 版本下限:官方「版本 >= 1.2」 ----------
+
+    def test_parse_version(self):
+        self.assertEqual(api_test.parse_version('1.7.0'), (1, 7))
+        self.assertEqual(api_test.parse_version('v1.2'), (1, 2))
+        self.assertEqual(api_test.parse_version('1'), (1, 0))
+        self.assertEqual(api_test.parse_version('1.2.0b1'), (1, 2))
+        for bad in ('', None, 'abc', 'x.y'):
+            self.assertIsNone(api_test.parse_version(bad), f"{bad!r} 不該解析成功")
+
+    def test_version_ok_boundary(self):
+        self.assertTrue(api_test.version_ok('1.2')[0], "1.2 是下限,要放行")
+        self.assertTrue(api_test.version_ok('1.7.0')[0])
+        self.assertFalse(api_test.version_ok('1.1.9')[0])
+        self.assertFalse(api_test.version_ok('0.9')[0])
+
+    def test_unknown_version_is_rejected_not_waved_through(self):
+        """讀不出版本時當作不符合。放行未知等於把判斷丟回給使用者從錯誤訊息猜。"""
+        ok, why = api_test.version_ok('???')
+        self.assertFalse(ok)
+        self.assertIn('1.2', why, "要講清楚官方要求的版本")
+
+    # ---------- 測試時段:週一~五 08:00~20:00,18:00 後僅限台灣 IP ----------
+
+    def _at(self, y, m, d, hh, mm):
+        return datetime.datetime(y, m, d, hh, mm)
+
+    def test_window_weekday_inside(self):
+        # 2026-08-03 是星期一
+        ok, why, tw = api_test.window_status(self._at(2026, 8, 3, 10, 0))
+        self.assertTrue(ok)
+        self.assertFalse(tw, "10:00 沒有地域限制")
+
+    def test_window_boundaries(self):
+        mon = lambda hh, mm: api_test.window_status(self._at(2026, 8, 3, hh, mm))
+        self.assertFalse(mon(7, 59)[0], "07:59 還沒開放")
+        self.assertTrue(mon(8, 0)[0], "08:00 整要放行(邊界)")
+        self.assertTrue(mon(19, 59)[0], "19:59 還在時段內")
+        self.assertFalse(mon(20, 0)[0], "20:00 整已結束(邊界)")
+
+    def test_window_tw_ip_only_flag(self):
+        """18:00 之後僅限台灣 IP。程式判斷不出使用者的 IP 在哪,
+        所以要誠實把這件事回報成一個旗標讓呼叫端提醒,不可以自己猜。"""
+        self.assertFalse(api_test.window_status(self._at(2026, 8, 3, 17, 59))[2])
+        self.assertTrue(api_test.window_status(self._at(2026, 8, 3, 18, 0))[2])
+        # 但仍然是「可以測」——僅限台灣 IP 不等於不能測
+        self.assertTrue(api_test.window_status(self._at(2026, 8, 3, 18, 30))[0])
+
+    def test_window_closed_at_weekend(self):
+        # 2026-08-01 星期六 / 2026-08-02 星期日
+        for d in (1, 2):
+            ok, why, _ = api_test.window_status(self._at(2026, 8, d, 10, 0))
+            self.assertFalse(ok, f"8/{d} 是週末,不該放行")
+            self.assertIn('星期', why)
+
+    # ---------- 間隔:官方「需間隔1秒以上」 ----------
+
+    def test_order_interval_is_above_one_second(self):
+        """官方說的是「1 秒**以上**」,取剛好 1.0 會落在邊界上。
+        這條測試釘住「不可以為了跑快一點把它調到 1 秒或更短」。"""
+        self.assertGreater(api_test.ORDER_INTERVAL_SEC, 1.0)
+
+    # ---------- 欄位驗證(鐵則9:不靠券商回錯誤才知道) ----------
+
+    def test_validate_order_accepts_the_official_examples(self):
+        """反向對照:官方文件自己的範例必須驗得過,否則等於把功能鎖死。"""
+        ok, why = api_test.validate_order('證券', '2890', 28, 1)
+        self.assertTrue(ok, why)
+        ok, why = api_test.validate_order('期貨', 'TXF', 37000, 1)
+        self.assertTrue(ok, why)
+
+    def test_validate_order_rejects_bad_fields(self):
+        cases = [
+            ('證券', '', 28, 1),          # 空代碼
+            ('證券', '289', 28, 1),       # 證券代碼不是 4 位
+            ('證券', '2890', 0, 1),       # 價格 0
+            ('證券', '2890', -1, 1),      # 負價
+            ('證券', '2890', 'abc', 1),   # 價格不是數字
+            ('證券', '2890', 28, 0),      # 數量 0
+            ('證券', '2890', 28, 'x'),    # 數量不是數字
+            ('股票', '2890', 28, 1),      # 不認得的種類
+        ]
+        for kind, code, px, qty in cases:
+            ok, why = api_test.validate_order(kind, code, px, qty)
+            self.assertFalse(ok, f"{(kind, code, px, qty)} 應該被擋下")
+            self.assertTrue(why, "被擋下就要講原因")
+
+    def test_quantity_capped_at_one(self):
+        """測試單刻意把數量上限壓死在 1。這是測試不是交易,量大只會讓
+        萬一環境接錯時的後果變嚴重。"""
+        ok, why = api_test.validate_order('證券', '2890', 28, 2)
+        self.assertFalse(ok)
+        self.assertIn('1', why)
+
+    # ---------- 最近月合約:不可以照抄官方範例的固定代碼 ----------
+
+    def test_pick_near_month(self):
+        rows = [('TXFH6', '2026/03/18'), ('TXFI6', '2026/09/16'),
+                ('TXFJ6', '2026/10/21'), ('TXFR1', '2026/08/19')]
+        got = api_test.pick_near_month(rows, today=datetime.date(2026, 8, 1))
+        self.assertEqual(got, 'TXFI6', "應該挑到今天之後最近的那個月份")
+
+    def test_pick_near_month_excludes_continuous_contracts(self):
+        """R1/R2 是報價用的連續合約,不是可下單的月份合約。
+        少了這條排除,它常常是日期最近的那一個而被選中。"""
+        rows = [('TXFR1', '2026/08/19'), ('TXFR2', '2026/09/16'),
+                ('TXFI6', '2026/09/16')]
+        self.assertEqual(api_test.pick_near_month(rows, today=datetime.date(2026, 8, 1)),
+                         'TXFI6')
+
+    def test_pick_near_month_skips_expired(self):
+        rows = [('TXFG6', '2026/07/15'), ('TXFI6', '2026/09/16')]
+        self.assertEqual(api_test.pick_near_month(rows, today=datetime.date(2026, 8, 1)),
+                         'TXFI6')
+
+    def test_pick_near_month_handles_junk(self):
+        self.assertIsNone(api_test.pick_near_month([]))
+        self.assertIsNone(api_test.pick_near_month(None))
+        self.assertIsNone(api_test.pick_near_month([('TXFG6', 'not-a-date')]))
+        self.assertIsNone(api_test.pick_near_month([('TXFG6', '2026/07/15')],
+                                                   today=datetime.date(2026, 8, 1)))
+
+    def test_pick_near_month_accepts_several_date_formats(self):
+        for fmt in ('2026/09/16', '2026-09-16', '20260916'):
+            self.assertEqual(
+                api_test.pick_near_month([('TXFI6', fmt)], today=datetime.date(2026, 8, 1)),
+                'TXFI6', f"{fmt} 應該解析得出來")
+
+    # ---------- preflight / 報告 ----------
+
+    def test_preflight_blocks_on_bad_version_or_time(self):
+        ok, lines = api_test.preflight('1.1', True, True,
+                                       now=self._at(2026, 8, 3, 10, 0))
+        self.assertFalse(ok)
+        ok, lines = api_test.preflight('1.7', True, True,
+                                       now=self._at(2026, 8, 1, 10, 0))   # 週六
+        self.assertFalse(ok)
+
+    def test_preflight_passes_when_everything_is_fine(self):
+        """反向對照:條件都滿足時一定要放行,不然這個檢查等於把功能鎖死。"""
+        ok, lines = api_test.preflight('1.7.0', True, True,
+                                       now=self._at(2026, 8, 3, 10, 0))
+        self.assertTrue(ok, "\n".join(lines))
+
+    def test_preflight_missing_one_account_is_not_fatal(self):
+        """有人只簽證券或只簽期貨。缺一個要標出來並跳過,不是整個流程拒跑。"""
+        ok, lines = api_test.preflight('1.7', True, False,
+                                       now=self._at(2026, 8, 3, 10, 0))
+        self.assertTrue(ok)
+        self.assertTrue(any('期貨' in x for x in lines))
+        # 但兩個都沒有就真的沒東西可測
+        ok2, _ = api_test.preflight('1.7', False, False,
+                                    now=self._at(2026, 8, 3, 10, 0))
+        self.assertFalse(ok2)
+
+    def test_format_report_distinguishes_pass_and_fail(self):
+        good = api_test.format_report([{'step': '登入測試', 'ok': True, 'detail': ''}])
+        self.assertIn('✅', good)
+        self.assertIn('審核', good, "全過時要提醒還要等審核")
+        bad = api_test.format_report([{'step': '登入測試', 'ok': False, 'detail': '金鑰錯'}])
+        self.assertIn('❌', bad)
+        self.assertIn('金鑰錯', bad)
+        self.assertNotIn('審核', bad, "沒過就不該說『等審核』")
+
+    def test_signed_summary(self):
+        txt = api_test.signed_summary([('1234567', 'S', True), ('7654321', 'F', False)])
+        self.assertIn('1234567', txt)
+        self.assertIn('❌', txt)
+        allpass = api_test.signed_summary([('1234567', 'S', True)])
+        self.assertIn('全部帳戶都已通過', allpass)
+        self.assertEqual(api_test.signed_summary([]).count('查不到'), 1)
 
 
 class TestPalette255(unittest.TestCase):
