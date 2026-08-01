@@ -259,6 +259,19 @@ class SinopacApiTestSession:
         self.accounts = self.api.login(api_key=api_key, secret_key=secret_key) or []
         return self.accounts
 
+    def account_rows(self):
+        """把登入回傳的帳戶攤平成 [(帳號, 種類, signed), ...] 純資料。
+
+        排版留給 core.api_test.accounts_text() —— adapter 只負責取欄位。
+        """
+        rows = []
+        for acc in (self.accounts or []):
+            kind = getattr(getattr(acc, 'account_type', None), 'value', None) \
+                or str(getattr(acc, 'account_type', '') or '')
+            rows.append((str(getattr(acc, 'account_id', '') or ''), kind,
+                         bool(getattr(acc, 'signed', False))))
+        return rows
+
     def stock_account(self):
         return getattr(self.api, 'stock_account', None)
 

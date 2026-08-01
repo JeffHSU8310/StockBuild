@@ -260,6 +260,25 @@ def format_report(results, now=None):
     return "\n".join(lines)
 
 
+def accounts_text(rows):
+    """【ADR-139 追記】登入成功後,把回傳的帳戶列出來。
+
+    使用者問「帳號&API KEY 還是要我手動先輸入嗎」——
+    **API Key / Secret Key 要手動輸入,帳號不用**:帳號是登入成功後永豐回傳的,
+    這個函式就是把它印出來讓使用者確認「券商那邊認得的是這些帳號」。
+
+    rows 是 [(帳號, 種類, signed), ...] 的純資料(取欄位留在 adapter)。
+    """
+    rows = list(rows or [])
+    if not rows:
+        return "登入成功,但沒有回傳任何帳戶 —— 請確認這組金鑰有綁到帳號。"
+    lines = [f"登入成功,永豐回傳 {len(rows)} 個帳戶:"]
+    for acc_id, kind, signed in rows:
+        lines.append(f"    {kind or '?'}  {acc_id or '?'}"
+                     + ("  (已通過 API 測試)" if signed else "  (尚未通過 API 測試)"))
+    return "\n".join(lines)
+
+
 def signed_summary(accounts):
     """把正式環境登入後的 accounts 整理成「哪個帳戶通過測試了」。
 

@@ -2492,6 +2492,24 @@ class TestApiTestRules(unittest.TestCase):
         self.assertIn('金鑰錯', bad)
         self.assertNotIn('審核', bad, "沒過就不該說『等審核』")
 
+    def test_accounts_text_lists_what_the_broker_returned(self):
+        """【ADR-139 追記】使用者問「帳號&API KEY 還是要我手動先輸入嗎」——
+        金鑰要手動輸入,**帳號不用**:帳號是登入成功後永豐回傳的。
+        這個函式就是把回傳的帳戶印出來讓使用者確認券商端認得哪些帳號。"""
+        txt = api_test.accounts_text([('1234567', 'S', True), ('7654321', 'F', False)])
+        self.assertIn('1234567', txt)
+        self.assertIn('7654321', txt)
+        self.assertIn('2', txt, "要講出回傳幾個帳戶")
+        self.assertIn('已通過', txt)
+        self.assertIn('尚未通過', txt)
+
+    def test_accounts_text_says_so_when_empty(self):
+        """登入成功卻沒有帳戶是真實會發生的狀況(金鑰沒綁帳號),
+        要講清楚而不是印一片空白。"""
+        for empty in ([], None):
+            txt = api_test.accounts_text(empty)
+            self.assertIn('沒有回傳', txt)
+
     def test_signed_summary(self):
         txt = api_test.signed_summary([('1234567', 'S', True), ('7654321', 'F', False)])
         self.assertIn('1234567', txt)
