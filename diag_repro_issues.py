@@ -6033,6 +6033,7 @@ def _sinopac_api_test_139():
         fail_login = False
         no_stock = False
         no_futopt = False
+        last_creds = None
 
         def __init__(self):
             self.simulation = True
@@ -6043,7 +6044,11 @@ def _sinopac_api_test_139():
             if FakeSession.fail_login:
                 raise RuntimeError("金鑰錯誤")
             events.append('login')
+            FakeSession.last_creds = (api_key, secret_key)
             return ['acc1', 'acc2']
+
+        def account_rows(self):
+            return [('1234567', 'S', False), ('7654321', 'F', False)]
 
         def stock_account(self): return None if FakeSession.no_stock else object()
         def futopt_account(self): return None if FakeSession.no_futopt else object()
@@ -6075,7 +6080,7 @@ def _sinopac_api_test_139():
     orig_broker = app.brokers.get('sinopac')
 
     def _plan(**over):
-        p = {'api_key': 'K', 'secret_key': 'S',
+        p = {'api_key': 'K', 'secret_key': 'S', 'conn_only': False,
              'stock': {'on': True, 'code': '2890', 'price': '28', 'qty': '1'},
              'futures': {'on': True, 'code': 'TXF', 'price': '37000', 'qty': '1'}}
         p.update(over)
@@ -6148,10 +6153,54 @@ def _sinopac_api_test_139():
         app.flush_after()
         assert [x[0] for x in sent] == ['證券']
         assert _at.ORDER_INTERVAL_SEC not in slept, "只有一筆單時不需要等待"
+
+        # ---- M. 【追記】只測連線:登入完就停,不可以送出任何委託 ----
+        sent.clear(); events.clear(); lines.clear(); slept.clear()
+        app._api_test_worker(_plan(conn_only=True), lines.append,
+                             _types.SimpleNamespace(config=lambda **k: None))
+        app.flush_after()
+        assert 'login' in events, "只測連線也要真的登入 (券商端才收得到連線訊息)"
+        assert not sent, "勾了「只測連線」就不可以送出任何委託"
+        assert events[-1] == 'close', "只測連線也要把臨時連線關掉"
+        # 帳號是登入後回傳的,要列出來 —— 使用者才知道券商端認得哪些帳號
+        assert any('1234567' in str(x) for x in lines), \
+            "登入成功後要列出永豐回傳的帳戶 (帳號不必手動填,就是這個來源)"
+        # 反向對照:沒勾的時候照樣要送單 (少了這條,把功能寫死成永不送單也會綠)
+        sent.clear()
+        app._api_test_worker(_plan(), lines.append,
+                             _types.SimpleNamespace(config=lambda **k: None))
+        app.flush_after()
+        assert [x[0] for x in sent] == ['證券', '期貨'], "沒勾「只測連線」時要照常送兩筆"
+
+        # ---- N. 只測連線時,委託欄位填壞了也不該擋住 (根本用不到) ----
+        _ok, _why = app._api_test_validate(
+            _plan(conn_only=True,
+                  stock={'on': True, 'code': 'XXXX', 'price': '-1', 'qty': '99'}))
+        assert _ok, f"只測連線不看委託欄位 (實際被擋:{_why})"
+        # 但金鑰還是要填 (那是這條路唯一需要的東西)
+        assert not app._api_test_validate(_plan(conn_only=True, api_key=''))[0], \
+            "只測連線也要填金鑰"
     finally:
         sinopac_mod.SinopacApiTestSession = orig_session
         stock_app_pro.time.sleep = orig_sleep
         app.log_message = orig_log
+
+    # ---- O. 【追記】金鑰欄位一律空白,不自動帶入已存的那組 ----
+    # 使用者的原話:「關於相關的帳號&API KEY,還是要我手動先輸入」。
+    # 而且這樣才合理 —— 這個視窗要測的是「這一組金鑰能不能連上」,
+    # 自動帶入等於在測另一組,測完你不知道剛剛測的到底是哪一組。
+    assert 'e_key = _ent(form, "", 34' in _seg, \
+        "API Key 欄位預設必須是空的 (手動輸入)"
+    assert 'e_sec = _ent(form, "", 34' in _seg, \
+        "Secret Key 欄位預設必須是空的 (手動輸入)"
+    assert 'self.saved_api_key' not in _seg.split('def _fill_saved')[0], \
+        "打開視窗時不可以自動帶入已存的金鑰"
+    # 但要留一個「明確按下去才帶入」的按鈕 (那是使用者動作,不是自動)
+    assert 'def _fill_saved' in _seg and '帶入已存的金鑰' in _seg, \
+        "要提供『按下去才帶入』的按鈕,省去重打一次"
+    # 確認視窗要說明「只測連線不會送單」
+    _ct_conn = app._api_test_confirm_text(_plan(conn_only=True))
+    assert '不會送出任何委託' in _ct_conn, "只測連線的確認視窗要講明不會送單"
 
     # ---- J. 查詢測試狀態:未登入正式環境時要講清楚,不可以亂回答 ----
     _orig_login = app.api_logged_in
@@ -6171,7 +6220,7 @@ def _sinopac_api_test_139():
     assert not _grid_overlaps('open_api_test_dialog'), "API 測試對話框有 grid 撞格"
 
 
-run_case("ADR-139: 永豐 API 測試 (模擬環境登入+證券/期貨下單測試,確認視窗/模擬閘門/1秒間隔)",
+run_case("ADR-139: 永豐 API 測試 (只測連線/金鑰手動輸入/確認視窗/模擬閘門/1秒間隔/最近月)",
          _sinopac_api_test_139)
 
 

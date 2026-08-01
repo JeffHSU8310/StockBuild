@@ -1993,6 +1993,11 @@ class StockTradingAppPro(tk.Tk):
                  bg="#12181F", fg="#8A99AD", font=('微軟正黑體', 8), wraplength=600,
                  justify='left').pack(fill=tk.X, padx=12, pady=(2, 8))
 
+        # 【ADR-139 追記】金鑰一律**手動輸入**,不自動帶入已存的那組。
+        # 使用者的原話:「關於相關的帳號&API KEY,還是要我手動先輸入」。
+        # 這也比較合理 —— 這個視窗要測的是「這一組金鑰能不能連上」,
+        # 自動帶入等於在測另一組,而且測完你不會知道剛剛測的到底是哪一組。
+
         form = tk.Frame(dlg, bg="#1A2026"); form.pack(fill=tk.X, padx=12)
 
         def _lbl(parent, text, fg="white"):
@@ -2005,17 +2010,47 @@ class StockTradingAppPro(tk.Tk):
             return e
 
         _lbl(form, "API Key:").grid(row=0, column=0, sticky='w', pady=3)
-        e_key = _ent(form, self.saved_api_key, 34, show="*")
-        e_key.grid(row=0, column=1, columnspan=3, sticky='w', padx=4, pady=3)
+        e_key = _ent(form, "", 34, show="*")      # 空的 —— 手動輸入
+        e_key.grid(row=0, column=1, columnspan=2, sticky='w', padx=4, pady=3)
         _lbl(form, "Secret Key:").grid(row=1, column=0, sticky='w', pady=3)
-        e_sec = _ent(form, self.saved_secret_key, 34, show="*")
-        e_sec.grid(row=1, column=1, columnspan=3, sticky='w', padx=4, pady=3)
-        tk.Label(form, text="※ 此 API Key 必須已開通「交易」權限,否則下單測試會被拒絕。",
-                 bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8)).grid(
+        e_sec = _ent(form, "", 34, show="*")      # 空的 —— 手動輸入
+        e_sec.grid(row=1, column=1, columnspan=2, sticky='w', padx=4, pady=3)
+
+        def _fill_saved():
+            """把已存的那組帶進來 —— **只在使用者按這個按鈕時**才發生。
+
+            這是明確的使用者動作,不是「打開視窗就自動填好」,所以不違反
+            「手動輸入」這件事,只是省去重打一次。沒存過就什麼都不做並說明。
+            """
+            if not (self.saved_api_key and self.saved_secret_key):
+                _write("目前沒有已存的金鑰可以帶入,請直接手動輸入。")
+                return
+            e_key.delete(0, tk.END); e_key.insert(0, self.saved_api_key)
+            e_sec.delete(0, tk.END); e_sec.insert(0, self.saved_secret_key)
+            _write("已帶入你先前存過的那組金鑰。")
+
+        tk.Button(form, text="帶入已存的金鑰", bg="#2A323D", fg="#8A99AD", relief="flat",
+                  font=('微軟正黑體', 8), command=_fill_saved).grid(
+                  row=1, column=3, sticky='w', padx=(4, 0))
+        tk.Label(form, text=("※ 金鑰請**手動輸入**(不會自動帶入),測完不留在這個視窗裡。\n"
+                             "※ 此 API Key 必須已開通「交易」權限,否則下單測試會被拒絕。\n"
+                             "※ 證券/期貨**帳號不必填** —— 登入成功後由永豐回傳,下面會列出來。"),
+                 bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8), justify='left').grid(
                  row=2, column=0, columnspan=4, sticky='w', pady=(0, 6))
 
         ttk.Separator(form, orient='horizontal').grid(row=3, column=0, columnspan=4,
                                                       sticky='ew', pady=6)
+
+        # 【ADR-139 追記】只測連線(登入)不送單。使用者的原話:「這個功能主要
+        # 測試連線功能是否正常,可以讓券商那邊收到正確的連線訊息」。
+        # 先確認連得上、帳號抓得到,再決定要不要送那兩筆測試單 —— 這一段
+        # 完全不會有任何委託送出去,是最安全的第一步。
+        var_conn_only = tk.BooleanVar(value=False)
+        tk.Checkbutton(form, text="只測連線 (只做登入測試,完全不送任何委託)",
+                       variable=var_conn_only, bg="#1A2026", fg="#29B6F6",
+                       selectcolor="#2A323D", activebackground="#1A2026",
+                       font=('微軟正黑體', 9, 'bold')).grid(
+                       row=9, column=0, columnspan=4, sticky='w', pady=(8, 0))
 
         var_stk = tk.BooleanVar(value=True)
         tk.Checkbutton(form, text="證券下單測試", variable=var_stk, bg="#1A2026",
@@ -2078,6 +2113,7 @@ class StockTradingAppPro(tk.Tk):
             plan = {
                 'api_key': e_key.get().strip(),
                 'secret_key': e_sec.get().strip(),
+                'conn_only': bool(var_conn_only.get()),
                 'stock': {'on': bool(var_stk.get()), 'code': e_stk_code.get().strip(),
                           'price': e_stk_price.get().strip(), 'qty': e_stk_qty.get().strip()},
                 'futures': {'on': bool(var_fut.get()), 'code': e_fut_code.get().strip().upper(),
@@ -2103,9 +2139,12 @@ class StockTradingAppPro(tk.Tk):
     def _api_test_validate(self, plan):
         """送出前的本地驗證(鐵則 9:不靠券商回錯誤才知道欄位不對)。"""
         if not plan['api_key'] or not plan['secret_key']:
-            return False, "API Key 與 Secret Key 都要填"
+            return False, "API Key 與 Secret Key 都要填(這兩項一律手動輸入)"
+        if plan.get('conn_only'):
+            # 只測連線:不會送出任何委託,所以委託欄位完全不看。
+            return True, ""
         if not (plan['stock']['on'] or plan['futures']['on']):
-            return False, "至少要勾一項測試"
+            return False, "至少要勾一項測試(或改勾「只測連線」)"
         for kind, key in (('證券', 'stock'), ('期貨', 'futures')):
             leg = plan[key]
             if not leg['on']:
@@ -2116,6 +2155,13 @@ class StockTradingAppPro(tk.Tk):
         return True, ""
 
     def _api_test_confirm_text(self, plan):
+        if plan.get('conn_only'):
+            # 只測連線這條路不會送出任何委託,但確認視窗照跳 ——
+            # 讓「走到送單流程之前一定問過使用者」這個不變式沒有例外,
+            # 不必再去分辨哪一條路需要問、哪一條不用(鐵則14 的精神)。
+            return ("即將對**模擬環境**做連線(登入)測試。\n\n"
+                    "只會登入並列出永豐回傳的帳戶,**不會送出任何委託**。\n"
+                    "也不會影響你目前的正式連線。\n\n確定開始?")
         lines = ["即將在**模擬環境**送出以下測試委託:", ""]
         if plan['stock']['on']:
             lines.append(f"  證券  買進  {plan['stock']['code']}  "
@@ -2168,10 +2214,19 @@ class StockTradingAppPro(tk.Tk):
                 accounts = session.login(plan['api_key'], plan['secret_key'])
                 results.append({'step': '登入測試 login', 'ok': True,
                                 'detail': f"取得 {len(accounts)} 個帳戶"})
-                say("✅ 登入測試通過。")
+                say("✅ 登入測試通過(券商端已收到這次連線)。")
+                # 帳號是**登入後由永豐回傳的**,不必手動填 —— 列出來讓使用者
+                # 確認「券商那邊認得的是這些帳號」。
+                say(api_test.accounts_text(session.account_rows()))
             except Exception as e:
                 results.append({'step': '登入測試 login', 'ok': False, 'detail': str(e)})
                 say(f"❌ 登入測試失敗:{e}")
+                return
+
+            if plan.get('conn_only'):
+                say("「只測連線」已完成,沒有送出任何委託。")
+                say("要讓正式環境的下單權限開通,還需要取消勾選「只測連線」"
+                    "再跑一次證券/期貨下單測試。")
                 return
 
             has_stk = session.stock_account() is not None
