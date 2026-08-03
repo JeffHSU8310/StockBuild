@@ -73,6 +73,9 @@ PITFALLS P-27）。它們存在的唯一理由就是「可離線單元測試」�
    `_apply_chart_margins`/版面微調對話框。深度依賴 widget 物件本身。
 
 ### 核心邏輯層：`core/`
+- `chart_viewport.py`（ADR-140）：主圖畫布的 K 棒數上限與尾端視窗。
+  以畫布實際像素寬度避免建立肉眼無法分辨的 Matplotlib artist，
+  但不改變完整歷史的指標計算範圍。
 - `tick_rules.py`：`get_tick(price, asset_type, raw_symbol)`、
   `fmt_price(...)`、`round_to_tick(...)`。顯式吃參數，不讀 `self`。
 - `indicators.py`：`calculate_indicators(...)`，顯式吃 MA/BB/MACD/RSI/KDJ/DMI

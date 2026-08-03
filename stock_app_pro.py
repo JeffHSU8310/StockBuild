@@ -29,6 +29,7 @@ import urllib.parse
 # 跟 tkinter/shioaji 完全無關的計算與檔案存取邏輯。
 from core import tick_rules
 from core import indicators as core_indicators
+from core import chart_viewport
 from core import futures_session
 from core import order_rules
 # 【ADR-110 階段1】券商中立的委託意圖:讓價/檔位/限市價的判斷從這裡出來,
@@ -5950,7 +5951,10 @@ class StockTradingAppPro(tk.Tk):
 
     def draw_chart(self, raw_df):
         try:
+            _draw_total_t0 = time.perf_counter()
+            _phase_t0 = _draw_total_t0
             df = self.calculate_custom_indicators(raw_df)
+            _indicator_ms = (time.perf_counter() - _phase_t0) * 1000.0
             for i in range(6):
                 col = f"MA_CUSTOM_{i}"
                 if col in df.columns:
@@ -5962,15 +5966,17 @@ class StockTradingAppPro(tk.Tk):
                     df.loc[df[col].isna() | diff.isna(), trend_col] = ''
             self.full_calculated_df = df
             txt_fmt_char = self.timeframe_var.get()
-            # 【ADR-082 繪圖效能極速化】限制畫布一次渲染的 K 棒數量上限:
-            # 分K最長 1200 根 (約 7.5 天), 日/周/月K 最長 1000 根。
+            # 【ADR-082/140】限制畫布一次渲染的 K 棒數量上限，再依
+            # 畫布實際像素寬度自適應。完整 df 仍用來算指標，不用畫面
+            # 切片回算，所以 MA240 等長週期指標不會有 warm-up 誤差。
             # 原本傳 9399+ 根K棒到 matplotlib, 單次渲染需 1657 ms (1.65秒/幀);
             # 限制渲染根數至 1200 根後, 單次渲染降至 ~80 ms, 縮放與平移流暢度提升 15+ 倍!
-            max_bars = 1200 if ("K" in txt_fmt_char and "日" not in txt_fmt_char and "周" not in txt_fmt_char and "月" not in txt_fmt_char) else 1000
-            if len(df) > max_bars:
-                self.plot_df = df.iloc[-max_bars:].copy()
-            else:
-                self.plot_df = df.copy() 
+            try:
+                _chart_px = self.chart_frame.winfo_width()
+            except Exception:
+                _chart_px = None
+            self.plot_df, max_bars = chart_viewport.tail_window(
+                df, txt_fmt_char, _chart_px)
             df = self.plot_df 
             
             if getattr(self, 'current_canvas', None) is not None:
@@ -6091,6 +6097,7 @@ class StockTradingAppPro(tk.Tk):
             fig_w = (frame_w / dpi) if frame_w > 100 else 11
             fig_h = (frame_h / dpi) if frame_h > 100 else 8
 
+            _phase_t0 = time.perf_counter()
             fig, axlist = mpf.plot(
                 df, type='candle', volume=True, style=xq_style, returnfig=True, 
                 figsize=(fig_w, fig_h), tight_layout=False, addplot=apds if apds else None, 
@@ -6104,6 +6111,7 @@ class StockTradingAppPro(tk.Tk):
                 # 不會互相重疊，卻能明顯縮小底部日期區塊佔用的版面。
                 xrotation=0
             )
+            _mpf_ms = (time.perf_counter() - _phase_t0) * 1000.0
             # 【第五輪修正:找到白邊真正的根因】前四輪都用 figsize / tight_layout /
             # subplots_adjust 想消除圖表四周留白,全都沒效——根本原因是 mplfinance
             # 的每個面板是用 fig.add_axes([固定矩形]) 建立的,而 fig.subplots_adjust()
@@ -6279,20 +6287,23 @@ class StockTradingAppPro(tk.Tk):
             # 只做「還原底圖+畫十字線/文字+blit」(毫秒級),不再整張圖重畫。
             self._hover_bg = None
             self.current_canvas.mpl_connect('draw_event', self._on_canvas_draw)
-            _draw_t0 = time.time()
+            _draw_t0 = time.perf_counter()
             self.current_canvas.draw()
-            _draw_ms = (time.time() - _draw_t0) * 1000.0
+            _canvas_ms = (time.perf_counter() - _draw_t0) * 1000.0
+            _total_ms = (time.perf_counter() - _draw_total_t0) * 1000.0
 
             self.current_canvas.mpl_connect('scroll_event', self.on_scroll_zoom)
             self.current_canvas.mpl_connect('button_press_event', self.on_mouse_press)
             self.current_canvas.mpl_connect('button_release_event', self.on_mouse_release)
             self.current_canvas.mpl_connect('motion_notify_event', self.on_mouse_move)
-            # 【效能診斷】單次繪圖 (mpf.plot + canvas.draw) 的實際渲染毫秒數;偏高時
-            # 才記一行 (>350ms),讓使用者回報時能看出「切換/縮放平移慢」是不是卡在
-            # matplotlib 渲染本身 (K 棒數量、面板數、視窗越大越慢)。不洗版。
-            if _draw_ms > 350:
-                self.log_message(f"[{txt_fmt_char}] 載入成功 ({display_title}) — 本次繪圖渲染 {_draw_ms:.0f} ms "
-                                 f"({len(df)} 根K棒);若切換/縮放偏慢多半卡在此。")
+            # 【ADR-140】過去只量 canvas.draw，卻把日誌稱為 mpf.plot +
+            # canvas.draw，會誤判 C++ 是否有幫助。現在分開指標、建圖、
+            # raster draw 與總時間；只在總時間偏高時記錄，不洗版。
+            if _total_ms > 350:
+                self.log_message(
+                    f"[{txt_fmt_char}] 載入成功 ({display_title}) — 繪圖 {_total_ms:.0f} ms "
+                    f"(指標 {_indicator_ms:.0f} / 建圖 {_mpf_ms:.0f} / 畫布 {_canvas_ms:.0f} ms; "
+                    f"{len(df)}/{len(raw_df)} 根K棒，上限 {max_bars})")
             else:
                 self.log_message(f"[{txt_fmt_char}] 載入成功 ({display_title})")
         except Exception as e: self.log_message(f"畫布繪製失敗: {e}")
