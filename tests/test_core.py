@@ -34,6 +34,7 @@ from core import order_intent
 from core import sj_compat
 from core import unit_format
 from core import indicators
+from core import chart_viewport
 from core import strategy_engine
 from core import backtest
 from core import custom_strategy
@@ -63,6 +64,34 @@ from data import config_store
 from data import taifex_store
 from data import chips_store
 from data import market_store
+
+
+class TestChartViewport(unittest.TestCase):
+    def test_unlaid_out_canvas_keeps_adr082_caps(self):
+        self.assertEqual(chart_viewport.render_limit("5分K", 1), 1200)
+        self.assertEqual(chart_viewport.render_limit("日K", None), 1000)
+
+    def test_pixel_width_reduces_invisible_artist_count(self):
+        self.assertEqual(chart_viewport.render_limit("5分K", 640), 800)
+        self.assertEqual(chart_viewport.render_limit("日K", 640), 800)
+        self.assertEqual(chart_viewport.render_limit("5分K", 300), 375)
+
+    def test_limits_never_exceed_existing_safety_caps(self):
+        self.assertEqual(chart_viewport.render_limit("1分K", 4000), 1200)
+        self.assertEqual(chart_viewport.render_limit("周K", 4000), 1000)
+
+    def test_small_canvas_still_has_usable_history(self):
+        self.assertEqual(chart_viewport.render_limit("15分K", 200), 300)
+
+    def test_tail_window_preserves_full_input_and_returns_copy(self):
+        original = pd.DataFrame({'Close': np.arange(2000)})
+        plotted, limit = chart_viewport.tail_window(original, "5分K", 640)
+        self.assertEqual(limit, 800)
+        self.assertEqual(len(plotted), 800)
+        self.assertEqual(len(original), 2000)
+        self.assertEqual(plotted.iloc[0]['Close'], 1200)
+        plotted.iloc[-1, 0] = -1
+        self.assertEqual(original.iloc[-1]['Close'], 1999)
 
 
 class TestTickRules(unittest.TestCase):
