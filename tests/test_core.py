@@ -34,6 +34,8 @@ from core import order_intent
 from core import sj_compat
 from core import unit_format
 from core import indicators
+from core import chart_viewport
+from core import history_policy
 from core import strategy_engine
 from core import backtest
 from core import custom_strategy
@@ -63,6 +65,98 @@ from data import config_store
 from data import taifex_store
 from data import chips_store
 from data import market_store
+from data import kbars_store
+
+
+class TestChartViewport(unittest.TestCase):
+    def test_unlaid_out_canvas_keeps_adr082_caps(self):
+        self.assertEqual(chart_viewport.render_limit("5分K", 1), 1200)
+        self.assertEqual(chart_viewport.render_limit("日K", None), 3000)
+
+    def test_pixel_width_reduces_invisible_artist_count(self):
+        self.assertEqual(chart_viewport.render_limit("5分K", 640), 800)
+        self.assertEqual(chart_viewport.render_limit("日K", 640), 2600)
+        self.assertEqual(chart_viewport.render_limit("5分K", 300), 375)
+
+    def test_limits_never_exceed_existing_safety_caps(self):
+        self.assertEqual(chart_viewport.render_limit("1分K", 4000), 1200)
+        self.assertEqual(chart_viewport.render_limit("周K", 4000), 650)
+
+    def test_long_timeframes_keep_at_least_ten_years(self):
+        self.assertGreaterEqual(chart_viewport.render_limit("日K", 640), 2600)
+        self.assertGreaterEqual(chart_viewport.render_limit("周K", 640), 530)
+        self.assertGreaterEqual(chart_viewport.render_limit("月K", 640), 125)
+
+    def test_small_canvas_still_has_usable_history(self):
+        self.assertEqual(chart_viewport.render_limit("15分K", 200), 300)
+
+    def test_tail_window_preserves_full_input_and_returns_copy(self):
+        original = pd.DataFrame({'Close': np.arange(2000)})
+        plotted, limit = chart_viewport.tail_window(original, "5分K", 640)
+        self.assertEqual(limit, 800)
+        self.assertEqual(len(plotted), 800)
+        self.assertEqual(len(original), 2000)
+        self.assertEqual(plotted.iloc[0]['Close'], 1200)
+        plotted.iloc[-1, 0] = -1
+        self.assertEqual(original.iloc[-1]['Close'], 1999)
+
+
+class TestHistoryPolicy(unittest.TestCase):
+    def test_deep_history_is_at_least_ten_years(self):
+        self.assertEqual(history_policy.MIN_HISTORY_YEARS, 10)
+        self.assertGreaterEqual(history_policy.DEEP_HISTORY_DAYS, 3653)
+
+    def test_only_long_timeframes_request_deep_history(self):
+        for tf in ("日K", "周K", "月K"):
+            self.assertTrue(history_policy.needs_deep_history(tf), tf)
+        for tf in ("1分K", "5分K", "60分K"):
+            self.assertFalse(history_policy.needs_deep_history(tf), tf)
+
+    def test_us_request_has_more_than_ten_year_boundary(self):
+        self.assertEqual(history_policy.US_HISTORY_PERIOD, "20y")
+
+    def test_first_shioaji_backfill_requests_maximum_practical_range(self):
+        self.assertEqual(history_policy.SHIOAJI_MAX_REQUEST_DAYS, 7300)
+
+
+class TestKbarsSqliteStore(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmp.name, 'nested', 'kbars.sqlite3')
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _df(self, closes=(100.0, 101.0)):
+        idx = pd.to_datetime(['2026-07-31', '2026-08-01'])
+        return pd.DataFrame({'Open': closes, 'High': closes, 'Low': closes,
+                             'Close': closes, 'Volume': [10, 20]}, index=idx)
+
+    def test_initialize_creates_database_and_schema(self):
+        self.assertEqual(kbars_store.initialize(self.db), self.db)
+        self.assertTrue(os.path.exists(self.db))
+
+    def test_upsert_and_load_round_trip(self):
+        self.assertEqual(kbars_store.upsert(self.db, '2330', 'stock', '日K', self._df()), 2)
+        got = kbars_store.load(self.db, '2330', 'stock', '日K')
+        self.assertEqual(len(got), 2)
+        self.assertEqual(float(got.iloc[-1]['Close']), 101.0)
+
+    def test_same_bar_is_updated_not_duplicated(self):
+        kbars_store.upsert(self.db, '2330', 'stock', '日K', self._df())
+        kbars_store.upsert(self.db, '2330', 'stock', '日K', self._df((100.0, 999.0)))
+        got = kbars_store.load(self.db, '2330', 'stock', '日K')
+        self.assertEqual(len(got), 2)
+        self.assertEqual(float(got.iloc[-1]['Close']), 999.0)
+
+    def test_symbols_and_timeframes_are_isolated(self):
+        kbars_store.upsert(self.db, '2330', 'stock', '日K', self._df())
+        self.assertIsNone(kbars_store.load(self.db, '0050', 'stock', '日K'))
+        self.assertIsNone(kbars_store.load(self.db, '2330', 'stock', '周K'))
+        first, last, count = kbars_store.coverage(self.db, '2330', 'stock', '日K')
+        self.assertEqual(count, 2)
+        self.assertTrue(first.startswith('2026-07-31'))
+        self.assertTrue(last.startswith('2026-08-01'))
 
 
 class TestTickRules(unittest.TestCase):
