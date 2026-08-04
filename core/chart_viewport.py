@@ -6,7 +6,14 @@ matplotlib，因此可以離線單元測試。完整歷史仍由呼叫端保留�
 """
 
 INTRADAY_CAP = 1200
-LONG_TERM_CAP = 1000
+# 長週期的上限不能共用一個「看起來快」的 1000 根：台股一年
+# 約 250 個交易日，1000 根只有約 4 年。ADR-141 改成依週期保證
+# 畫布本身就能容納至少 10 年，不再把已載入的舊資料切掉。
+LONG_TERM_LIMITS = {
+    "日K": (2600, 3000),
+    "周K": (530, 650),
+    "月K": (125, 180),
+}
 MIN_RENDER_BARS = 300
 BARS_PER_PIXEL = 1.25
 
@@ -24,14 +31,16 @@ def render_limit(timeframe, pixel_width=None):
     可信尺寸，這時回到 ADR-082 的固定上限。正常時每像素最多
     保留 1.25 根，避免在實際無法分辨的寬度上建立太多 artist。
     """
-    cap = INTRADAY_CAP if is_intraday(timeframe) else LONG_TERM_CAP
+    text = str(timeframe or "")
+    minimum, cap = ((MIN_RENDER_BARS, INTRADAY_CAP) if is_intraday(text)
+                    else LONG_TERM_LIMITS.get(text, (MIN_RENDER_BARS, 1000)))
     try:
         width = int(pixel_width)
     except (TypeError, ValueError, OverflowError):
         return cap
     if width < 200:
         return cap
-    adaptive = max(MIN_RENDER_BARS, int(width * BARS_PER_PIXEL))
+    adaptive = max(minimum, int(width * BARS_PER_PIXEL))
     return min(cap, adaptive)
 
 

@@ -30,6 +30,7 @@ import urllib.parse
 from core import tick_rules
 from core import indicators as core_indicators
 from core import chart_viewport
+from core import history_policy
 from core import futures_session
 from core import order_rules
 # 【ADR-110 階段1】券商中立的委託意圖:讓價/檔位/限市價的判斷從這裡出來,
@@ -72,6 +73,7 @@ from core import fundamental_parser
 from core import market_screener
 from core import screener_backtest
 from data import market_store
+from data import kbars_store
 from data import config_store
 from data import taifex_store
 from data import chips_store
@@ -272,6 +274,9 @@ class StockTradingAppPro(tk.Tk):
         # 【ADR-072】一般 App 設定 (零股開盤時刻、自動重連/自動登入偏好)。
         self.app_settings_file = app_path("app_settings.json")
         self.app_settings = config_store.load_app_settings(self.app_settings_file)
+        # ADR-142:SQLite 自動建庫；後續每次載入的長週期 K 線都做增量 upsert。
+        self.kbars_db_file = app_path("data", "kbars.sqlite3")
+        kbars_store.initialize(self.kbars_db_file)
         # 套用盤中零股開盤時刻到 market_session (預設 09:10,可設定)。
         market_session.set_odd_lot_open_hhmm(self.app_settings.get('odd_lot_open', '09:10'))
         # 【ADR-120】主圖【盤勢判斷】的設定。正規化在 core/regime_panel,
@@ -4032,11 +4037,12 @@ class StockTradingAppPro(tk.Tk):
     #   3. 期貨/指數的日K以上採「兩段式」:先抓小範圍秒出圖,背景補全歷史再更新;
     #   4. fetch 序號防 race (見 start_fetch_thread)。
     SJ_DAYS = {"1分K": 15, "5分K": 60, "15分K": 120, "30分K": 120, "60分K": 180,
-               "日K": 365, "周K": 1095, "月K": 1825}
-    # 【ADR-069】兩段式第一段的小範圍。日/周/月K 特別小:因為日K以上的「深歷史」
-    # 是由 yahoo(股票 20年)/期交所(期貨) 在同一次 _publish 裡延伸補上的,shioaji
-    # 只需供「最近幾根」的即時新鮮度,不必抓 45~600 天的 1 分 K 回來重採樣 (那才是
-    # 日K 切換要等十幾二十秒的主因)。窗口小 → 搶先出圖近乎即時,完整深歷史照樣有。
+               "日K": history_policy.SHIOAJI_MAX_REQUEST_DAYS,
+               "周K": history_policy.SHIOAJI_MAX_REQUEST_DAYS,
+               "月K": history_policy.SHIOAJI_MAX_REQUEST_DAYS}
+    # 【ADR-069/142】兩段式第一段仍用小範圍搶先出圖；首次建庫時
+    # 背景段會向 shioaji 請求最長實用範圍，並用 Yahoo/期交所補充。
+    # 建庫後只回抓最新一週，舊歷史由 SQLite 提供。
     QUICK_DAYS = {"1分K": 2, "5分K": 5, "15分K": 10, "30分K": 15, "60分K": 20, "日K": 7, "周K": 45, "月K": 120}
     CACHE_TTL_MIN_TF = 30    # 分K類快取視為新鮮的秒數
     CACHE_TTL_DAY_TF = 300   # 日K以上快取視為新鮮的秒數
@@ -4409,12 +4415,12 @@ class StockTradingAppPro(tk.Tk):
         【ADR-080】max_days:選填,合併完成後只保留「最後一根往前 max_days 天」
         的範圍。回測/最佳化呼叫這個函式時不帶這個參數 (None=不裁切,維持原本
         的完整深度,不受影響);主圖 (_publish) 只在需要深歷史時 (MA240 開啟
-        或週期為周K/月K) 才呼叫,且固定帶 max_days 裁到約 3 年,避免把 20 年
-        全部攤開在圖上拖慢渲染/縮放 (ADR-079 的教訓)。"""
+        或週期為周K/月K) 才呼叫。ADR-141 後主圖固定帶 max_days
+        保留至少 10 年；渲染成本不再藉刪掉歷史解決。"""
         try:
             if pub_df is None or pub_df.empty: return pub_df
             sym = sym or getattr(self, 'current_symbol', '')
-            if not sym or not sym[0].isdigit(): return pub_df
+            if not sym: return pub_df
 
             yf_params = {"日K": ("20y", "1d"), "周K": ("20y", "1wk"), "月K": ("20y", "1mo")}
             if tf not in yf_params: return pub_df
@@ -4422,8 +4428,10 @@ class StockTradingAppPro(tk.Tk):
 
             import yfinance as yf
             df_yf = pd.DataFrame()
-            for suffix in [".TW", ".TWO"]:
-                df_yf = yf.Ticker(f"{sym}{suffix}").history(period=period, interval=interval, auto_adjust=False)
+            candidates = ([f"{sym}.TW", f"{sym}.TWO"] if sym[0].isdigit()
+                          else [sym] if sym in ("^TWII", "^TWOII") else [])
+            for yf_symbol in candidates:
+                df_yf = yf.Ticker(yf_symbol).history(period=period, interval=interval, auto_adjust=False)
                 if not df_yf.empty:
                     break
             if df_yf.empty: return pub_df
@@ -4487,8 +4495,8 @@ class StockTradingAppPro(tk.Tk):
                 self.safe_after(0, self.log_message,
                                 f"【期交所歷史】{tx_id} 已用官方每日行情往前延伸至 {out.index[0]:%Y-%m-%d}"
                                 f" (盤別:{'只用日盤' if session == 'day' else '近全'};重疊日期以 shioaji 為準)。")
-            # 【ADR-080】max_days:主圖只需要「一段」深歷史 (MA240/周K/月K 的情境),
-            # 不需要期交所全 series (可能長達 20+ 年);裁到最近 max_days 天。
+            # 【ADR-080/141】max_days:主圖保留使用者要求的至少 10 年，
+            # 但不必無上限放入期交所 20+ 年全 series。
             # 回測/最佳化呼叫時不帶這個參數,拿到的仍是完整延伸序列,不受影響。
             if max_days is not None and not out.empty:
                 cutoff = out.index[-1] - pd.Timedelta(days=int(max_days))
@@ -5518,7 +5526,7 @@ class StockTradingAppPro(tk.Tk):
 
     def _fetch_data_worker_impl(self, raw_sym, tf, seq=None, market="台股", ma240_on=False):
         try:
-            yf_params = {"1分K": ("5d", "1m"), "5分K": ("30d", "5m"), "15分K": ("30d", "15m"), "30分K": ("30d", "30m"), "60分K": ("90d", "60m"), "日K": ("10y", "1d"), "周K": ("10y", "1wk"), "月K": ("10y", "1mo")}
+            yf_params = {"1分K": ("5d", "1m"), "5分K": ("30d", "5m"), "15分K": ("30d", "15m"), "30分K": ("30d", "30m"), "60分K": ("90d", "60m"), "日K": (history_policy.US_HISTORY_PERIOD, "1d"), "周K": (history_policy.US_HISTORY_PERIOD, "1wk"), "月K": (history_policy.US_HISTORY_PERIOD, "1mo")}
             period, interval = yf_params.get(tf, ("1y", "1d"))
 
             contract = None; search_sym = raw_sym; stock_name = ""
@@ -5645,25 +5653,43 @@ class StockTradingAppPro(tk.Tk):
             #   使用者看到的視窗不會跳動。
             _pub_state = {'n': None}  # 上次實際發布的K棒根數
 
-            # 【ADR-080】max_days 已經限制在 3 年,速度非常快。
+            # 【ADR-141】主圖日/周/月K一律保留至少 10 年。近期段仍由
+            # shioaji 保證新鮮度，早期股票/指數由既有 Yahoo 深層歷史、
+            # 期貨由期交所官方日行情接齊；不把 10 年份 1 分K全壓給券商 API。
             # 絕對不能略過期交所資料的拼接,因為 _taifex_plan_download 已經把券商下載
             # 範圍縮減到最近幾天了 (依靠期交所補足);若略過拼接,圖上會只剩下 3 根 K 棒！
-            EXT_MAX_DAYS = 1095  # 約 3 年
+            EXT_MAX_DAYS = history_policy.DEEP_HISTORY_DAYS
 
             def _publish(pub_df, full_ui=True, prev_len=None, note="", allow_extend=False):
                 if seq is not None and seq != self._fetch_seq:
                     return False  # 已有更新的查詢,放棄發布
+                is_deep_tf = history_policy.needs_deep_history(tf)
+                # 所有週期都合併 SQLite：分K 也是高成本資料，不應重複下載。
+                stored = kbars_store.load(self.kbars_db_file, search_sym,
+                                          self.asset_type, tf)
+                if stored is not None and not stored.empty:
+                    pub_df = pd.concat([stored, pub_df]).sort_index()
+                    pub_df = pub_df[~pub_df.index.duplicated(keep='last')]
                 if allow_extend:
-                    if self.asset_type == "future" and tf in ("日K", "周K", "月K"):
+                    target_start = pd.Timestamp.now().tz_localize(None) - pd.Timedelta(
+                        days=history_policy.DEEP_HISTORY_DAYS)
+                    has_ten_years = (is_deep_tf and not pub_df.empty
+                                     and pd.Timestamp(pub_df.index[0]).tz_localize(None) <= target_start)
+                    if self.asset_type == "future" and is_deep_tf and not has_ten_years:
                         pub_df = self._extend_with_taifex(pub_df, tf, max_days=EXT_MAX_DAYS)
-                    elif self.asset_type == "stock" and tf in ("日K", "周K", "月K"):
-                        # 台股的 Yahoo 延伸比較慢，維持原本的 want_deep 邏輯 (只有大週期或 MA240 才抓)
-                        want_deep = tf in ("周K", "月K") or bool(ma240_on)
-                        if want_deep:
-                            pub_df = self._extend_with_yahoo(pub_df, tf, sym=search_sym, max_days=EXT_MAX_DAYS)
+                    elif self.asset_type == "stock" and is_deep_tf and not has_ten_years:
+                        pub_df = self._extend_with_yahoo(pub_df, tf, sym=search_sym, max_days=EXT_MAX_DAYS)
+                    elif self.asset_type == "index_tw" and is_deep_tf and not has_ten_years:
+                        pub_df = self._extend_with_yahoo(pub_df, tf, sym=search_sym, max_days=EXT_MAX_DAYS)
                 pub_df = pub_df.dropna(subset=['Open', 'High', 'Low', 'Close'])
                 if pub_df.empty:
                     return False
+                try:
+                    kbars_store.upsert(self.kbars_db_file, search_sym,
+                                       self.asset_type, tf, pub_df)
+                except Exception as e:
+                    self.safe_after(0, self.log_message,
+                                    f"【SQLite】K線增量儲存失敗: {e}")
                 # 【ADR-049】記錄實際發布根數。背景補全的 prev_len 必須用
                 # 「上次實際發布的根數」計算平移量,xlim 才不會跳離原視角。
                 _pub_state['n'] = len(pub_df)
@@ -5745,11 +5771,14 @@ class StockTradingAppPro(tk.Tk):
                         earliest_dt = datetime.combine(earliest, datetime.min.time())
                         if start_dt < earliest_dt:
                             start_dt = earliest_dt
-                else:
-                    max_sj_lookback = end_dt - timedelta(days=1095)
-                    if start_dt < max_sj_lookback:
-                        start_dt = max_sj_lookback
                 cache_key = search_sym
+                # ADR-142:DB 已有歷史後，券商只回抓最新一週（含重疊
+                # 修正形成中 K 棒）；舊歷史由 _publish 從 SQLite 合併。
+                _db_first, _db_last, _db_count = kbars_store.coverage(
+                    self.kbars_db_file, search_sym, self.asset_type, tf)
+                if _db_count and _db_last:
+                    start_dt = max(start_dt, pd.Timestamp(_db_last).to_pydatetime()
+                                   - timedelta(days=7))
 
                 # ---- 第一優先:快取涵蓋範圍 → 立即重採樣出圖 (秒開) ----
                 cached_raw, cache_fresh = self._kbars_cache_get(cache_key, start_dt)
@@ -5871,9 +5900,8 @@ class StockTradingAppPro(tk.Tk):
                 self._kbars_cache_put(cache_key, start_dt, raw, tf)
                 df_full = self._resample_sj_df(raw, tf)
                 prev = quick_len if quick_len is not None else cached_len
-                # 【ADR-080】完整段 (背景補全) allow_extend=True:want_deep 成立時
-                # (MA240 開啟或周K/月K) 在這裡延伸並裁到約 3 年;不成立就是 ADR-079
-                # 的純 SJ_DAYS 原生範圍,行為不變。
+                # 【ADR-141】完整段一律 allow_extend=True，日/周/月K 由各商品
+                # 對應的深層資料源補到至少 10 年；分K 不延伸。
                 if prev is not None:
                     _publish(df_full, full_ui=False, prev_len=prev, allow_extend=True,
                              note=f"【背景補全】完整歷史已更新 (共 {len(df_full)} 根,總耗時 {time.time()-_t0:.1f} 秒)。")
@@ -5886,7 +5914,16 @@ class StockTradingAppPro(tk.Tk):
                 self.data_source = "yfinance"
                 self.safe_after(0, self.log_message, f"正在透過 YFinance 載入 {raw_sym} 歷史數據 (美股)...")
                 try:
-                    df = yf.Ticker(raw_sym).history(period=period, interval=interval, auto_adjust=adjust_flag)
+                    _db_first, _db_last, _db_count = kbars_store.coverage(
+                        self.kbars_db_file, raw_sym, self.asset_type, tf)
+                    if _db_count and _db_last:
+                        _inc_start = (pd.Timestamp(_db_last) - pd.Timedelta(days=7)).date()
+                        df = yf.Ticker(raw_sym).history(
+                            start=str(_inc_start), interval=interval,
+                            auto_adjust=adjust_flag)
+                    else:
+                        df = yf.Ticker(raw_sym).history(
+                            period=period, interval=interval, auto_adjust=adjust_flag)
                     if not df.empty and df.index.tz is not None:
                         df.index = df.index.tz_convert('Asia/Taipei').tz_localize(None)
                 except Exception:

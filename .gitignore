@@ -1,6 +1,9 @@
 __pycache__/
 *.pyc
 *.log
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 
 # 券商 API 憑證與私鑰 (broker_config.json 內含真實 api_key/secret_key/pid;
 # 永豐API/ 內含 Sinopac.pfx 私鑰憑證與明碼帳密筆記) —— 絕不可進版控。

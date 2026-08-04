@@ -75,7 +75,8 @@ PITFALLS P-27）。它們存在的唯一理由就是「可離線單元測試」�
 ### 核心邏輯層：`core/`
 - `chart_viewport.py`（ADR-140）：主圖畫布的 K 棒數上限與尾端視窗。
   以畫布實際像素寬度避免建立肉眼無法分辨的 Matplotlib artist，
-  但不改變完整歷史的指標計算範圍。
+  但不改變完整歷史的指標計算範圍。ADR-141 後長週期分別
+  保留至少十年所需的日／週／月 K 根數，不可為了渲染速度刪掉舊資料。
 - `tick_rules.py`：`get_tick(price, asset_type, raw_symbol)`、
   `fmt_price(...)`、`round_to_tick(...)`。顯式吃參數，不讀 `self`。
 - `indicators.py`：`calculate_indicators(...)`，顯式吃 MA/BB/MACD/RSI/KDJ/DMI
@@ -136,6 +137,8 @@ PITFALLS P-27）。它們存在的唯一理由就是「可離線單元測試」�
   來源（含台股常用的次級分割律 0.191／0.809）。
 
 ### 設定存取層：`data/`
+- `kbars_store.py`（ADR-142）：SQLite 長週期 K 線庫。程式啟動自動建庫，
+  所有週期以商品+市場類型+週期+時間為複合主鍵增量 upsert。
 - `config_store.py`：`load_broker_config`/`save_broker_config`、
   `load_watchlists`/`save_watchlists`、`DEFAULT_CHART_LAYOUT` +
   `load_chart_layout`/`save_chart_layout`。路徑顯式參數傳入，不讀 `self`。
