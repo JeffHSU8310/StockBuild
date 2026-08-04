@@ -159,6 +159,34 @@ class TestKbarsSqliteStore(unittest.TestCase):
         self.assertTrue(last.startswith('2026-08-01'))
 
 
+class TestChartViewport(unittest.TestCase):
+    def test_unlaid_out_canvas_keeps_adr082_caps(self):
+        self.assertEqual(chart_viewport.render_limit("5分K", 1), 1200)
+        self.assertEqual(chart_viewport.render_limit("日K", None), 1000)
+
+    def test_pixel_width_reduces_invisible_artist_count(self):
+        self.assertEqual(chart_viewport.render_limit("5分K", 640), 800)
+        self.assertEqual(chart_viewport.render_limit("日K", 640), 800)
+        self.assertEqual(chart_viewport.render_limit("5分K", 300), 375)
+
+    def test_limits_never_exceed_existing_safety_caps(self):
+        self.assertEqual(chart_viewport.render_limit("1分K", 4000), 1200)
+        self.assertEqual(chart_viewport.render_limit("周K", 4000), 1000)
+
+    def test_small_canvas_still_has_usable_history(self):
+        self.assertEqual(chart_viewport.render_limit("15分K", 200), 300)
+
+    def test_tail_window_preserves_full_input_and_returns_copy(self):
+        original = pd.DataFrame({'Close': np.arange(2000)})
+        plotted, limit = chart_viewport.tail_window(original, "5分K", 640)
+        self.assertEqual(limit, 800)
+        self.assertEqual(len(plotted), 800)
+        self.assertEqual(len(original), 2000)
+        self.assertEqual(plotted.iloc[0]['Close'], 1200)
+        plotted.iloc[-1, 0] = -1
+        self.assertEqual(original.iloc[-1]['Close'], 1999)
+
+
 class TestTickRules(unittest.TestCase):
     def test_future_always_one_point(self):
         self.assertEqual(tick_rules.get_tick(46281, "future", "TXF"), 1.0)
