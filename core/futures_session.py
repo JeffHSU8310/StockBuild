@@ -21,6 +21,47 @@ DAY_SESSION_OPEN_MIN = 8 * 60 + 45    # 08:45
 DAY_SESSION_CLOSE_MIN = 13 * 60 + 45  # 13:45
 
 
+#: 夜盤最早開始時間 (15:00)。判斷「這份資料裡有沒有夜盤 K 棒」用。
+NIGHT_SESSION_OPEN_MIN = 15 * 60
+
+
+def session_date_of(ts):
+    """單一時間點 → 交易日 (ADR-007 的規則:時間 > 13:45 的夜盤歸屬**下一個**交易日)。
+
+    `resample_future_session()` 是對整個 index 向量化做同一件事;這個函式是給
+    「一根一根看」的呼叫端用的(ADR-140 的當日漲跌幅要分辨哪幾根 K 棒屬於
+    同一個交易日)。規則只有這一份,改這裡兩邊一起改(P-67)。
+    """
+    t = pd.Timestamp(ts)
+    base = t.normalize()
+    if t.hour * 60 + t.minute > DAY_SESSION_CLOSE_MIN:
+        return (base + pd.Timedelta(days=1)).date()
+    return base.date()
+
+
+def has_night_session_bars(index) -> bool:
+    """這份 index 裡有沒有夜盤時段的 K 棒 —— 用來決定要不要照交易日分組。
+
+    兩道判斷缺一不可:
+
+      1. **全部都是 00:00 就直接回 False**。日K/週K/月K 的索引都被正規化到
+         午夜,而午夜正好落在「早於 08:45」的夜盤延續時段裡 —— 少了這一道,
+         每一份日K都會被誤判成含夜盤。
+      2. 剩下的才看時間:>= 15:00 或 < 08:45 才算夜盤。股票的分K永遠落在
+         09:00~13:30,不會誤判;期貨含夜盤的分K一定會踩到。
+
+    刻意用「看資料」而不是「看策略設定的商品別」:條件函式只拿得到 df,
+    拿不到策略;而且看資料比看設定可靠 —— 設定可能跟實際載進來的資料不符。
+    """
+    try:
+        mins = [pd.Timestamp(t).hour * 60 + pd.Timestamp(t).minute for t in index]
+    except Exception:
+        return False
+    if not any(m != 0 for m in mins):
+        return False
+    return any(m >= NIGHT_SESSION_OPEN_MIN or m < DAY_SESSION_OPEN_MIN for m in mins)
+
+
 def resample_future_session(sj_df: pd.DataFrame, tf: str, agg_dict: dict,
                             session_basis: str = 'all') -> pd.DataFrame:
     """

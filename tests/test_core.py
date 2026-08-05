@@ -2321,6 +2321,217 @@ class TestBollingerSigmaMigration(unittest.TestCase):
             self.assertEqual(d['bb_period'], 10)   # 其他欄位沒被弄壞
 
 
+class TestDayPctChangeConditions(unittest.TestCase):
+    """【ADR-140】當日(盤中)漲跌幅條件:「A 跌超過 X% 就買 B、漲超過 Y% 就賣 B」。
+
+    使用者的原話:
+      「一樣看A做B,當A盤中跌幅超過X%,就買進B。(支援股票整張、零股、期貨)
+        X為參數,可自行輸入。當A盤中漲幅超過Y%,就賣出B。Y為參數,可自行輸入。」
+    """
+
+    def _df(self, rows):
+        idx = pd.to_datetime([r[0] for r in rows])
+        return pd.DataFrame(
+            {'Open': [r[1] for r in rows], 'High': [r[2] for r in rows],
+             'Low': [r[3] for r in rows], 'Close': [r[4] for r in rows],
+             'Volume': [1000] * len(rows)}, index=idx)
+
+    def _intraday(self):
+        """昨收 100;今天最低 96.5(-3.5%)、最高 101.5(+1.5%)、收盤 98(-2%)。"""
+        return self._df([
+            ('2026-08-04 13:00', 100, 100, 100, 100.0),
+            ('2026-08-04 13:30', 100, 100, 100, 100.0),   # 昨收 = 這一根
+            ('2026-08-05 09:00', 99, 101.5, 97.0, 98.5),
+            ('2026-08-05 09:05', 98.5, 99.0, 96.5, 98.0),
+        ])
+
+    # ---------- 基準價 ----------
+
+    def test_reference_is_previous_trading_days_last_close(self):
+        """昨收 = **前一交易日最後一根**的收盤,不是「前一根」——
+        在 5分K 上「前一根」是 5 分鐘前的價格,那不是漲跌幅。"""
+        self.assertEqual(strategy_engine._day_ref_price(self._intraday(), '昨收'), 100.0)
+
+    def test_reference_today_open(self):
+        self.assertEqual(strategy_engine._day_ref_price(self._intraday(), '今開'), 99.0)
+
+    def test_no_previous_day_returns_none_not_a_made_up_number(self):
+        """只有當天的資料 → 算不出昨收就回 None,條件不成立。
+        絕不可以退而求其次拿前一根收盤充數(那會算出一個看似合理的錯數字)。"""
+        only_today = self._df([('2026-08-05 09:00', 99, 100, 97, 98.5),
+                               ('2026-08-05 09:05', 98.5, 99, 96.5, 98.0)])
+        self.assertIsNone(strategy_engine._day_ref_price(only_today, '昨收'))
+        self.assertFalse(strategy_engine._c_day_drop_over(only_today, {'value': 1.0}))
+        self.assertFalse(strategy_engine._c_day_rise_over(only_today, {'value': 1.0}))
+
+    # ---------- 觸價 vs 收盤價 ----------
+
+    def test_touch_uses_the_days_extreme_close_uses_the_bar(self):
+        df = self._intraday()
+        self.assertAlmostEqual(
+            strategy_engine.day_pct_change(df, '昨收', '盤中觸價', 'down'), -3.5)
+        self.assertAlmostEqual(
+            strategy_engine.day_pct_change(df, '昨收', '收盤價', 'down'), -2.0)
+        self.assertAlmostEqual(
+            strategy_engine.day_pct_change(df, '昨收', '盤中觸價', 'up'), 1.5)
+
+    def test_touch_scans_the_whole_day_not_just_the_last_bar(self):
+        """最低點出現在**今天稍早**那一根時也要算得到 ——
+        只看最後一根的話,盤中曾經跌 3.5% 這件事會整個漏掉。"""
+        df = self._df([
+            ('2026-08-04 13:30', 100, 100, 100, 100.0),
+            ('2026-08-05 09:00', 99, 99.5, 96.0, 97.0),   # 最低在這一根 (-4%)
+            ('2026-08-05 09:05', 97, 99.0, 98.5, 99.0),   # 已經拉回
+        ])
+        self.assertAlmostEqual(
+            strategy_engine.day_pct_change(df, '昨收', '盤中觸價', 'down'), -4.0)
+        self.assertTrue(strategy_engine._c_day_drop_over(df, {'value': 3.0}))
+        # 反向對照:改用收盤價就不該成立 (收在 -1%)
+        self.assertFalse(
+            strategy_engine._c_day_drop_over(df, {'value': 3.0, 'use': '收盤價'}))
+
+    def test_yesterdays_extreme_is_not_counted(self):
+        """昨天跌很多不算今天的 —— 少了這條,「當日」兩個字就沒有意義。"""
+        df = self._df([
+            ('2026-08-04 09:00', 100, 100, 80.0, 100.0),   # 昨天最低 80
+            ('2026-08-04 13:30', 100, 100, 100, 100.0),
+            ('2026-08-05 09:00', 100, 100.5, 99.5, 100.0),  # 今天幾乎沒動
+        ])
+        self.assertAlmostEqual(
+            strategy_engine.day_pct_change(df, '昨收', '盤中觸價', 'down'), -0.5)
+        self.assertFalse(strategy_engine._c_day_drop_over(df, {'value': 3.0}))
+
+    # ---------- X / Y 門檻 ----------
+
+    def test_threshold_boundary_and_sign(self):
+        df = self._intraday()      # 當日觸價 -3.5%
+        self.assertTrue(strategy_engine._c_day_drop_over(df, {'value': 3.5}), "剛好等於門檻要成立")
+        self.assertTrue(strategy_engine._c_day_drop_over(df, {'value': 3.0}))
+        self.assertFalse(strategy_engine._c_day_drop_over(df, {'value': 3.6}))
+
+    def test_threshold_takes_absolute_value(self):
+        """使用者說「跌幅超過 X%」,X 在他腦中就是正數。既有的
+        pct_change_below 要求填負數是個已知會踩的坑,這裡兩種寫法一律當成
+        同一件事。
+
+        關鍵是**門檻沒到的時候也要一致**——只比對「都成立」的情況是空殼:
+        少了 abs(),填 -3 會變成 `chg <= 3`,那等於「只要不是漲超過 3% 就成立」,
+        任何一天都會觸發,而使用者完全不會發現(突變測試抓到的)。"""
+        big = self._intraday()          # 當日觸價 -3.5%
+        self.assertTrue(strategy_engine._c_day_drop_over(big, {'value': 3.0}))
+        self.assertTrue(strategy_engine._c_day_drop_over(big, {'value': -3.0}))
+
+        mild = self._df([               # 當日只跌 1%
+            ('2026-08-04 13:30', 100, 100, 100, 100.0),
+            ('2026-08-05 09:00', 100, 100.2, 99.0, 99.5),
+        ])
+        self.assertFalse(strategy_engine._c_day_drop_over(mild, {'value': 3.0}))
+        self.assertFalse(strategy_engine._c_day_drop_over(mild, {'value': -3.0}),
+                         "填負數不可以讓門檻失效變成『幾乎永遠成立』")
+
+        mild_up = self._df([            # 當日只漲 1%
+            ('2026-08-04 13:30', 100, 100, 100, 100.0),
+            ('2026-08-05 09:00', 100, 101.0, 99.8, 100.5),
+        ])
+        self.assertFalse(strategy_engine._c_day_rise_over(mild_up, {'value': 3.0}))
+        self.assertFalse(strategy_engine._c_day_rise_over(mild_up, {'value': -3.0}),
+                         "漲幅條件同理")
+
+    def test_rise_condition_mirrors_the_drop_one(self):
+        up = self._df([
+            ('2026-08-04 13:30', 100, 100, 100, 100.0),
+            ('2026-08-05 09:00', 101, 104.0, 100.5, 103.0),
+        ])
+        self.assertTrue(strategy_engine._c_day_rise_over(up, {'value': 4.0}))
+        self.assertFalse(strategy_engine._c_day_rise_over(up, {'value': 4.1}))
+        # 漲的一天不該觸發「跌幅」條件 (反向對照:兩個條件不可以接反)
+        self.assertFalse(strategy_engine._c_day_drop_over(up, {'value': 1.0}))
+
+    # ---------- 日K 上要自然退化 ----------
+
+    def test_daily_bars_degrade_to_previous_close(self):
+        """日K 的「前一根」就是前一個交易日,不必特別處理就該正確。"""
+        daily = self._df([('2026-08-03', 100, 100, 100, 100.0),
+                          ('2026-08-04', 100, 101, 95.0, 96.0)])
+        self.assertEqual(strategy_engine._day_ref_price(daily, '昨收'), 100.0)
+        self.assertAlmostEqual(
+            strategy_engine.day_pct_change(daily, '昨收', '盤中觸價', 'down'), -5.0)
+        self.assertAlmostEqual(
+            strategy_engine.day_pct_change(daily, '昨收', '收盤價', 'down'), -4.0)
+
+    # ---------- 期貨夜盤:交易日不是自然日 ----------
+
+    def test_futures_night_session_belongs_to_the_next_trading_day(self):
+        """【ADR-007 的規則】15:00 之後的夜盤算下一個交易日。
+        用自然日分組的話「當日」會從半夜被切成兩半,跌幅整個算錯。"""
+        fut = self._df([
+            ('2026-08-04 13:45', 20000, 20000, 20000, 20000.0),   # 交易日 8/4 收盤
+            ('2026-08-04 15:00', 20000, 20010, 19900, 19950.0),   # 夜盤 → 交易日 8/5
+            ('2026-08-05 09:00', 19950, 19960, 19300, 19400.0),   # 日盤 → 交易日 8/5
+        ])
+        self.assertEqual(strategy_engine._day_ref_price(fut, '昨收'), 20000.0)
+        self.assertAlmostEqual(
+            strategy_engine.day_pct_change(fut, '昨收', '盤中觸價', 'down'),
+            (19300 / 20000 - 1) * 100)
+
+    def test_stock_intraday_is_not_treated_as_having_a_night_session(self):
+        """反向對照:股票分K(09:00~13:30)不可以被誤判成含夜盤,
+        否則交易日規則會把資料整個錯位。"""
+        idx = pd.to_datetime(['2026-08-05 09:00', '2026-08-05 13:30'])
+        self.assertFalse(futures_session.has_night_session_bars(idx))
+        # 日K 的索引都是午夜,午夜落在「早於 08:45」裡 —— 少了那道判斷會誤判
+        self.assertFalse(futures_session.has_night_session_bars(
+            pd.to_datetime(['2026-08-04', '2026-08-05'])))
+        # 真的有夜盤才回 True
+        self.assertTrue(futures_session.has_night_session_bars(
+            pd.to_datetime(['2026-08-04 15:00', '2026-08-05 09:00'])))
+
+    def test_session_date_of_matches_the_vectorised_rule(self):
+        """單根版與 resample_future_session 的向量版必須是同一條規則(P-67)。"""
+        self.assertEqual(futures_session.session_date_of('2026-08-04 13:45'),
+                         datetime.date(2026, 8, 4))
+        self.assertEqual(futures_session.session_date_of('2026-08-04 13:46'),
+                         datetime.date(2026, 8, 5))
+        self.assertEqual(futures_session.session_date_of('2026-08-05 03:00'),
+                         datetime.date(2026, 8, 5))
+
+    # ---------- 註冊到條件庫 (GUI 才選得到) ----------
+
+    def test_registered_in_the_condition_library(self):
+        for key in ('day_drop_over', 'day_rise_over'):
+            self.assertIn(key, strategy_engine.CONDITIONS, f"{key} 沒有註冊,GUI 選不到")
+            name, spec, fn = strategy_engine.CONDITIONS[key]
+            self.assertTrue(name)
+            keys = [strategy_engine.spec_parts(x)[0] for x in spec]
+            self.assertEqual(keys, ['value', 'base', 'use'])
+            # 基準與用價都要是下拉選單 (自由輸入會打錯字,打錯就靜默退回預設)
+            for item in spec[1:]:
+                self.assertIsNotNone(strategy_engine.spec_parts(item)[3],
+                                     "參考價/用哪個價要是下拉選單")
+
+    def test_condition_label_is_readable(self):
+        lab = strategy_engine.condition_label(
+            {'type': 'day_drop_over', 'params': {'value': 3.0}})
+        self.assertIn('跌幅', lab)
+        self.assertIn('3.0', lab)
+
+    def test_bad_params_do_not_blow_up_the_whole_evaluation(self):
+        """一條條件寫壞只能讓那一條變 False (ADR-065),不可以連累其他條件。"""
+        df = self._intraday()
+        ok, results = strategy_engine.eval_conditions(
+            df, [{'type': 'day_drop_over', 'params': {'value': 'abc'}},
+                 {'type': 'day_drop_over', 'params': {'value': 3.0}}], 'OR')
+        self.assertTrue(ok, "第二條是好的,整組 OR 要成立")
+        self.assertFalse(results[0][1])
+        self.assertTrue(results[1][1])
+
+    def test_unknown_base_or_use_falls_back_instead_of_crashing(self):
+        df = self._intraday()
+        # 認不得的基準 → 走「昨收」那條路 (base 只有 '今開' 是特例)
+        self.assertTrue(strategy_engine._c_day_drop_over(
+            df, {'value': 3.0, 'base': '亂寫', 'use': '亂寫'}))
+
+
 class TestApiTestRules(unittest.TestCase):
     """【ADR-139】永豐 API 測試(模擬環境的登入/下單測試)的純規則。
 
