@@ -160,18 +160,57 @@ class TestKbarsSqliteStore(unittest.TestCase):
 
 
 class TestChartViewport(unittest.TestCase):
-    def test_unlaid_out_canvas_keeps_adr082_caps(self):
-        self.assertEqual(chart_viewport.render_limit("5分K", 1), 1200)
-        self.assertEqual(chart_viewport.render_limit("日K", None), 1000)
+    """ADR-140 的視窗規則,**上限在 ADR-141 被改過**。
+
+    這三條原本寫的是 ADR-082/140 的舊上限(日K 1000、寬度 640 時 800、
+    周K 1000),而 ADR-141 已經明確改成「長週期畫布本身就要容得下 10 年」
+    (日 2,600 / 週 530 / 月 125,見 core/history_policy.py 與
+    core/chart_viewport.LONG_TERM_LIMITS)。實作照 ADR-141 走,測試沒跟著改,
+    於是 main 上這三條一直是紅的。這裡把期望值更新成 ADR-141 的決定,
+    並改用常數而不是再抄一次數字 —— 下次調整上限就不會再分歧一次(P-67)。
+    """
+
+    def test_unlaid_out_canvas_falls_back_to_the_cap(self):
+        """Tk 還沒排版時寬度不可信,退回該週期的上限。"""
+        self.assertEqual(chart_viewport.render_limit("5分K", 1),
+                         chart_viewport.INTRADAY_CAP)
+        self.assertEqual(chart_viewport.render_limit("日K", None),
+                         chart_viewport.LONG_TERM_LIMITS["日K"][1])
 
     def test_pixel_width_reduces_invisible_artist_count(self):
+        """分K 會依畫布寬度縮減 artist 數量(ADR-140 的本意)。"""
         self.assertEqual(chart_viewport.render_limit("5分K", 640), 800)
-        self.assertEqual(chart_viewport.render_limit("日K", 640), 800)
         self.assertEqual(chart_viewport.render_limit("5分K", 300), 375)
 
-    def test_limits_never_exceed_existing_safety_caps(self):
-        self.assertEqual(chart_viewport.render_limit("1分K", 4000), 1200)
-        self.assertEqual(chart_viewport.render_limit("周K", 4000), 1000)
+    def test_long_period_never_drops_below_ten_years(self):
+        """【ADR-141】長週期**不論畫布多窄**都不可以被砍到只剩幾年 ——
+        那正是 P-119 記錄的坑(使用者載了十年卻只看得到四年)。
+
+        這裡斷言的是**不變式**而不是某個寬度的確切數字:窄畫布時
+        `max(下限, 寬度×1.25)` 保住下限、寬畫布時 `min(上限, ...)` 壓住上限,
+        兩者之間隨寬度變動 —— 挑一個寬度硬比等於把實作細節抄進測試。"""
+        for tf in ("日K", "周K", "月K"):
+            floor_, cap = chart_viewport.LONG_TERM_LIMITS[tf]
+            for w in (None, 1, 200, 640, 1920, 40000):
+                got = chart_viewport.render_limit(tf, w)
+                self.assertGreaterEqual(got, floor_,
+                                        f"{tf} 寬度={w} 時掉到 10 年下限以下 ({got})")
+                self.assertLessEqual(got, cap, f"{tf} 寬度={w} 時超過上限 ({got})")
+            self.assertEqual(chart_viewport.render_limit(tf, 40000), cap,
+                             f"{tf} 夠寬時要吃滿上限")
+        # 分K 沒有 10 年的問題,維持 ADR-082 的 1200 上限
+        self.assertEqual(chart_viewport.render_limit("1分K", 4000),
+                         chart_viewport.INTRADAY_CAP)
+
+    def test_ten_year_floor_really_covers_ten_years(self):
+        """反向對照:下限的數字要真的夠 10 年,不是隨手填的
+        (台股一年約 250 個交易日 / 52 週 / 12 個月)。"""
+        self.assertGreaterEqual(chart_viewport.LONG_TERM_LIMITS["日K"][0],
+                                250 * history_policy.MIN_HISTORY_YEARS)
+        self.assertGreaterEqual(chart_viewport.LONG_TERM_LIMITS["周K"][0],
+                                52 * history_policy.MIN_HISTORY_YEARS)
+        self.assertGreaterEqual(chart_viewport.LONG_TERM_LIMITS["月K"][0],
+                                12 * history_policy.MIN_HISTORY_YEARS)
 
     def test_small_canvas_still_has_usable_history(self):
         self.assertEqual(chart_viewport.render_limit("15分K", 200), 300)
