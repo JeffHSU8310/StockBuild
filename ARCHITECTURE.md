@@ -73,6 +73,10 @@ PITFALLS P-27）。它們存在的唯一理由就是「可離線單元測試」�
    `_apply_chart_margins`/版面微調對話框。深度依賴 widget 物件本身。
 
 ### 核心邏輯層：`core/`
+- `chart_viewport.py`（ADR-143）：主圖畫布的 K 棒數上限與尾端視窗。
+  以畫布實際像素寬度避免建立肉眼無法分辨的 Matplotlib artist，
+  但不改變完整歷史的指標計算範圍。ADR-141 後長週期分別
+  保留至少十年所需的日／週／月 K 根數，不可為了渲染速度刪掉舊資料。
 - `tick_rules.py`：`get_tick(price, asset_type, raw_symbol)`、
   `fmt_price(...)`、`round_to_tick(...)`。顯式吃參數，不讀 `self`。
 - `indicators.py`：`calculate_indicators(...)`，顯式吃 MA/BB/MACD/RSI/KDJ/DMI
@@ -127,7 +131,7 @@ PITFALLS P-27）。它們存在的唯一理由就是「可離線單元測試」�
   （20 色相 × 12 階 + 15 灰）。`resolve()` 對「標籤不在色盤裡」容錯：
   從標籤內嵌的 `#RRGGBB` 解析回來，色盤日後再調整也不會讓舊設定變色。
 - `strategy_engine.py` 的條件庫（ADR-057 起）新增一組**當日（盤中）漲跌幅**
-  （ADR-140）：`day_drop_over` / `day_rise_over`。與既有的 `pct_change_above/below`
+  （ADR-143）：`day_drop_over` / `day_rise_over`。與既有的 `pct_change_above/below`
   不同 —— 那兩個是「**單根**相對前一根」（5分K 上就是 5 分鐘的變化），這一組是
   「**當日**相對昨收」，也就是台股講漲跌幅的那個數字。配合看A做B 就成立
   「A 跌 X% 買 B、A 漲 Y% 賣 B」，引擎不需要知道 B 的存在。
@@ -141,6 +145,8 @@ PITFALLS P-27）。它們存在的唯一理由就是「可離線單元測試」�
   來源（含台股常用的次級分割律 0.191／0.809）。
 
 ### 設定存取層：`data/`
+- `kbars_store.py`（ADR-142）：SQLite 長週期 K 線庫。程式啟動自動建庫，
+  所有週期以商品+市場類型+週期+時間為複合主鍵增量 upsert。
 - `config_store.py`：`load_broker_config`/`save_broker_config`、
   `load_watchlists`/`save_watchlists`、`DEFAULT_CHART_LAYOUT` +
   `load_chart_layout`/`save_chart_layout`。路徑顯式參數傳入，不讀 `self`。
