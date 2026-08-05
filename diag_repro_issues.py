@@ -61,6 +61,16 @@ app.flush_after = getattr(app, "flush_after")  # 來自 _Tk mock
 # 【ADR-115 延伸 / ADR-120】app_settings.json 也是使用者的真實設定檔
 # (盤勢判斷面板的偏好存在裡面),診斷案例會存檔,同樣改指到暫存目錄。
 app.app_settings_file = os.path.join(_diag_tmp, "app_settings.json")
+# 【ADR-115 延伸 / ADR-142】K 線 SQLite 也一樣 —— 而且這一份比設定檔更嚴重:
+# 診斷用的是**假的 kbars**(FApi.make_kbars 生出來的測試資料),寫進去之後
+# 主圖會把它當成真歷史合併到圖上 (_publish 會 concat SQLite 的內容)。
+# 也就是說,跑一次診斷就可能讓使用者的 K 線圖裡混進假 K 棒,而且完全無聲。
+app.kbars_db_file = os.path.join(_diag_tmp, "kbars.sqlite3")
+try:
+    from data import kbars_store as _diag_kbars_store
+    _diag_kbars_store.initialize(app.kbars_db_file)
+except Exception:
+    pass
 
 
 
@@ -421,6 +431,7 @@ def _perf_cache_progressive_and_seq_guard():
         assert len(api.chart_calls())>=1, f"首載應至少下載1次,實際{len(api.chart_calls())}"
         starts=[c[1] for c in api.chart_calls()]
         assert len(starts)==len(set(starts)), f"分段下載不應重複抓同一起點: {starts}"
+
         n_first=len(api.chart_calls())
         subs=api.quote.chart_subs()
         app._fetch_seq=2; app.fetch_data_worker('0050','5分K',2); app.flush_after()
@@ -437,6 +448,31 @@ def _perf_cache_progressive_and_seq_guard():
         d0=draws['n']; app._fetch_seq=99
         app.fetch_data_worker('0050','日K',5); app.flush_after()
         assert draws['n']==d0, "過期查詢竟然出圖 (序號防護失效)"
+        # 【ADR-142 修正】**DB 已經有歷史之後**才是真正會重複的情境:
+        # `start_dt = max(start_dt, db_last - 7天)` 把完整段縮成最近一週,
+        # 跟快速段 (日K QUICK_DAYS=7) 的窗口幾乎一樣 → 同一個窗口打兩次。
+        # 上面那條在「DB 是空的」時抓不到這件事 (診斷用的是每次重建的暫存 DB),
+        # 所以這裡刻意先把資料寫進 DB 再跑一次。
+        from data import kbars_store as _ks24
+        _seed = make_kbars(
+            (datetime.now() - stock_app_pro.timedelta(days=30)).strftime('%Y-%m-%d'),
+            datetime.now().strftime('%Y-%m-%d'))
+        _seed_daily = app._resample_sj_df(_pd.DataFrame(
+            {'Open': _seed['open'], 'High': _seed['high'], 'Low': _seed['low'],
+             'Close': _seed['close'], 'Volume': _seed['volume']},
+            index=_pd.to_datetime(_seed['ts'])), '日K')
+        _ks24.upsert(app.kbars_db_file, '0050', 'stock', '日K', _seed_daily)
+        _f0, _l0, _c0 = _ks24.coverage(app.kbars_db_file, '0050', 'stock', '日K')
+        assert _c0 > 0, "前置條件:DB 要先有資料"
+        api.calls.clear(); api.call_src.clear()
+        app._kbars_raw_cache.clear(); app.current_contract=None; app._last_fetch_raw_sym=None
+        app._fetch_seq += 1
+        app.fetch_data_worker('0050','日K',app._fetch_seq); app.flush_after()
+        starts2=[c[1] for c in api.chart_calls()]
+        assert len(starts2)==len(set(starts2)), \
+            f"DB 已有歷史時,快速段與完整段不可以抓同一個窗口 (白打一次 API): {starts2}"
+        assert len(starts2) >= 1, "DB 已有歷史時仍要向券商更新最近的 K 棒 (形成中的那根會變)"
+        app._kbars_raw_cache.clear(); app.current_contract=None; app._last_fetch_raw_sym=None
     finally:
         app.draw_chart=orig
 

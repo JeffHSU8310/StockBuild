@@ -5808,6 +5808,22 @@ class StockTradingAppPro(tk.Tk):
                 # 上千~上萬根的 yahoo/期交所延伸資料。
                 quick_len = None
                 want_quick = self.asset_type in ("future", "index_tw", "stock")
+                # 【ADR-142 修正】SQLite 建庫之後,上面那道
+                # `start_dt = max(start_dt, db_last - 7天)` 會把「完整段」縮成
+                # 最近一週 —— 那跟快速段的窗口幾乎一樣 (日K 的 QUICK_DAYS 也是 7)。
+                # 結果是**每一次載入都對同一個窗口打兩次 kbars**:快速段一次、
+                # 完整段再一次,兩次拿回來的東西完全相同。診斷的
+                # 「分段下載不應重複抓同一起點」就是抓到這件事。
+                #
+                # 完整段沒有比快速段更深的時候,快速段就沒有存在的理由 ——
+                # 它的用途是「先給一小段搶先出圖,大範圍在背景慢慢補」,
+                # 而現在完整段本身就只有一小段,直接跑它就好。
+                # 比的是**日期**不是 datetime:送給 kbars 的是 '%Y-%m-%d' 字串,
+                # 兩個時間點只要落在同一天,對券商而言就是同一個請求。
+                if want_quick and tf in self.QUICK_DAYS:
+                    _q_start_probe = end_dt - timedelta(days=self.QUICK_DAYS[tf])
+                    if start_dt.date() >= _q_start_probe.date():
+                        want_quick = False
                 if (not published_from_cache) and want_quick and tf in self.QUICK_DAYS:
                     try:
                         q_days = self.QUICK_DAYS[tf]
