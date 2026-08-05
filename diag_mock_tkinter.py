@@ -313,7 +313,35 @@ def _build_ttk():
     ttk.Frame = _MockWidget
     ttk.Separator = _MockWidget
     ttk.Scrollbar = _MockWidget
-    ttk.Notebook = _MockWidget
+    class _MockNotebook(_MockWidget):
+        """【ADR-144】ttk.Notebook 的分頁 API。原本直接指向 _MockWidget,
+        所以任何用到分頁的視窗一開就 AttributeError('add')。"""
+        def __init__(self, master=None, **kw):
+            super().__init__(master, **kw)
+            self._tabs = []
+        def add(self, child, **kw):
+            self._tabs.append((child, dict(kw)))
+            return child
+        def tabs(self):
+            return [c for c, _ in self._tabs]
+        def tab(self, item, option=None, **kw):
+            for c, opts in self._tabs:
+                if c is item:
+                    if option:
+                        return opts.get(str(option).lstrip('-'))
+                    opts.update(kw)
+                    return opts
+            return {}
+        def select(self, item=None):
+            if item is None:
+                return self._tabs[0][0] if self._tabs else None
+            return item
+        def index(self, item):
+            for i, (c, _) in enumerate(self._tabs):
+                if c is item:
+                    return i
+            return 0
+    ttk.Notebook = _MockNotebook
     ttk.PanedWindow = type("PanedWindow", (_MockWidget,), {
         "add": lambda self, child, **kw: None,
         "sashpos": lambda self, *a, **k: 0,

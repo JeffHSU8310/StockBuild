@@ -765,6 +765,12 @@ def new_strategy():
         'take_profit_pct': 0.0,       # 停利 % (0=停用)
         'stop_loss_abs': 0.0,         # 【ADR-043】停損 絕對價格(股票)/點數(期貨) (0=停用)
         'take_profit_abs': 0.0,       # 【ADR-043】停利 絕對價格/點數 (0=停用)
+        # 【ADR-144】一段部位最多可以分幾次進場 (加碼/分批建倉)。
+        # 1 = 舊行為:買了就不准再買,一定要先平倉。使用者原話:
+        # 「只要你買了(狀態變成 LONG),在你把股票賣掉之前,我就絕對不准你買
+        #   第二筆」—— 那正是回測一年只買一次的元兇。
+        # 預設仍是 1,既有策略行為**完全不變**;要分批/加碼才自己調大。
+        'max_entries': 1,
         'max_trades_per_day': 3,      # 每日最多進場次數
         'cooldown_sec': 300,          # 兩次下單間最短間隔 (秒)
         'daily_loss_limit': 0.0,      # 每日虧損熔斷 (價差×數量, 0=停用)
@@ -977,6 +983,13 @@ def new_runtime():
                                        # 給期貨即時停損/停利用 (entry_price 是A的價,
                                        # 看A做B時跟B不同尺度,不能拿來跟B的即時價比較)
         'qty': 0,
+        # 【ADR-144】目前這一段部位已經進場幾次 (分批/加碼)。平倉歸零。
+        # 舊 runtime 沒有這個 key → entries_of() 會用 qty>0 推導成 1,
+        # 不必遷移存檔就是對的 (同 intrabar_stop 的處理哲學)。
+        'entries': 0,
+        # 【ADR-144】最近一次評估時,進場條件成立卻被擋下的原因 (給回測的
+        # 「訊息紀錄」用)。沒有被擋就是空字串。
+        'blocked_entry': '',
         'last_bar_ts': '',            # 同一根K棒不重複評估的閘門
         'trades_today': 0,
         'day': '',
@@ -1132,6 +1145,85 @@ def eval_conditions(df, conds, logic='AND', errors=None):
     return any(r for _, r in results), results
 
 
+# ---------------------------------------------------------------------------
+# 【ADR-144】分批進場 / 加碼
+#
+# 使用者的原話:
+#   「回測引擎非常『死腦筋』。它的底層邏輯是:『只要你買了(狀態變成 LONG),
+#     在你把股票賣掉之前,我就絕對不准你買第二筆。』造成回測時一年只買一次
+#     的元兇:純粹是因為這套回測系統的底層有著嚴格的『部位狀態機』限制。」
+#
+# 診斷正確:`evaluate_strategy()` 只在 `state == 'FLAT'` 時評估進場條件,
+# 持倉中那條路整段跳過進場,所以一段部位一輩子只買得到一筆。
+#
+# 解法不是拆掉狀態機 —— 狀態機本身是對的 (它讓停損停利、風控、對帳有依據)。
+# 解法是讓「一段部位」可以由**多筆進場**組成:加一個上限 `max_entries`,
+# 持倉中且還沒達到上限時照樣評估進場條件。
+#
+# 預設 1 = **完全維持舊行為**,既有策略一個字都不用改。
+# ---------------------------------------------------------------------------
+
+#: 加碼上限填 0 或負數時視為不限 (實務上仍受 max_trades_per_day / 資金限制)
+UNLIMITED_ENTRIES = 10 ** 9
+
+
+def max_entries_of(strategy):
+    """一段部位最多可以分幾次進場。回傳 >= 1 的整數。
+
+    「買進持有(累積/定期定額)」本來就是無限累積 (ADR-061/062),
+    不受這個上限影響 —— 那是它的定義,不是設定。
+    """
+    s = strategy or {}
+    if s.get('buy_and_hold') and str(s.get('bnh_mode', 'accumulate')) != 'single':
+        return UNLIMITED_ENTRIES
+    v = s.get('max_entries', 1)
+    if v is None or v == '':
+        return 1
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return 1
+    if n <= 0:
+        return UNLIMITED_ENTRIES
+    return n
+
+
+def entries_of(runtime):
+    """目前這一段部位已經進場幾次。
+
+    舊 runtime 沒有 'entries' 這個 key:有部位就當作 1 次、沒部位當作 0 次。
+    這樣**不必遷移存檔**,既有策略的行為與加這個功能之前一模一樣
+    (max_entries 預設 1 → 有部位就已達上限 → 不會加碼)。
+    """
+    rt = runtime or {}
+    if 'entries' in rt:
+        try:
+            return max(0, int(rt.get('entries') or 0))
+        except (TypeError, ValueError):
+            return 0
+    return 1 if int(rt.get('qty', 0) or 0) > 0 else 0
+
+
+def can_scale_in(strategy, runtime):
+    """持倉中還能不能再進一筆。回傳 (可否, 擋下的原因)。
+
+    原因字串是要給使用者看的 —— 回測的「訊息紀錄」分頁會直接印出來,
+    那正是「為什麼一年只買一次」這個問題最需要的答案。
+    """
+    rt = runtime or {}
+    state = str(rt.get('state', 'FLAT'))
+    if state == 'FLAT':
+        return True, ''
+    used = entries_of(rt)
+    cap = max_entries_of(strategy)
+    if used >= cap:
+        if cap == 1:
+            return False, ('已持倉,且「可分批進場次數」是 1 —— '
+                           '要先平倉才能再進場。想分批/加碼請把它調大。')
+        return False, f'已持倉,分批進場次數已達上限 ({used}/{cap})。'
+    return True, ''
+
+
 def evaluate_strategy(strategy, runtime, df_closed, now_ts, today_str):
     """
     策略主評估:傳入「只含已收盤K棒」的 df。
@@ -1243,6 +1335,7 @@ def evaluate_strategy(strategy, runtime, df_closed, now_ts, today_str):
         return filter_intents_by_time(intents, strategy, bar_ts, runtime=runtime)
 
     if state == 'FLAT':
+        runtime['blocked_entry'] = ''
         ok, details = eval_conditions(df_closed, strategy.get('entry', []), 'AND', errors=cond_errors)
         runtime['condition_errors'] = list(cond_errors)
         if ok:
@@ -1257,6 +1350,7 @@ def evaluate_strategy(strategy, runtime, df_closed, now_ts, today_str):
         return filter_intents_by_time(intents, strategy, bar_ts, runtime=runtime)
 
     # 持倉中:先看停損/停利,再看出場訊號
+    runtime['blocked_entry'] = ''
     _stop = check_bar_stop(strategy, runtime, close)
     if _stop is not None:
         intents.append(_stop)
@@ -1266,6 +1360,35 @@ def evaluate_strategy(strategy, runtime, df_closed, now_ts, today_str):
     if ok:
         hit = " 或 ".join(lab for lab, r in details if r)
         intents.append(_close_intent(runtime, close, f"出場訊號: {hit}"))
+        return filter_intents_by_time(intents, strategy, bar_ts, runtime=runtime)
+
+    # 【ADR-144】沒有要出場 → 看看能不能「再進一筆」(分批建倉 / 加碼)。
+    #
+    # 這一段就是使用者說的那個「死腦筋」的解藥:舊版持倉中完全不評估進場條件,
+    # 一段部位一輩子只買得到一筆。現在只要還沒達到 max_entries 就照樣評估。
+    #
+    # 順序刻意是「停損停利 → 出場訊號 → 加碼」:要走的時候就該走,
+    # 不可以在同一根 K 棒上一邊喊出場一邊加碼。
+    _e_ok, _e_details = eval_conditions(df_closed, strategy.get('entry', []), 'AND',
+                                        errors=cond_errors)
+    runtime['condition_errors'] = list(cond_errors)
+    if _e_ok:
+        _can, _why = can_scale_in(strategy, runtime)
+        if _can:
+            # 方向必須跟現有部位一致 —— 這裡是「加碼」不是「反手」。
+            # 反手是另一件事 (自訂策略的 decision_to_intents 才做),
+            # 混在一起會讓使用者在完全沒設定反手的情況下被反向開倉。
+            action = '買進' if runtime.get('state') == 'LONG' else '賣出'
+            reason = (f"加碼 (第 {entries_of(runtime) + 1} 筆): "
+                      + " 且 ".join(lab for lab, _ in _e_details))
+            intents.append({'kind': 'OPEN', 'action': action,
+                            'qty': int(strategy.get('qty', 1)), 'price': close,
+                            'reason': reason})
+        else:
+            # 條件成立卻沒買 —— 這正是使用者看不懂「為什麼一年只買一次」的
+            # 那一刻。把原因留在 runtime,回測的「訊息紀錄」分頁會印出來。
+            runtime['blocked_entry'] = _why
+
     intents = filter_intents_by_time(intents, strategy, bar_ts, runtime=runtime)
     return intents
 
@@ -1400,8 +1523,15 @@ def apply_fill(strategy, runtime, intent, now_ts, exec_price=None):
         # 舊版直接覆蓋 entry_price/qty,在累積模型下會讓成本基礎完全失真。
         exec_px = float(exec_price) if exec_price is not None else float(intent['price'])
         prev_qty = int(runtime.get('qty', 0) or 0)
-        if (strategy.get('buy_and_hold') and prev_qty > 0
-                and runtime.get('state') == new_state):
+        # 【ADR-061 → ADR-144】同方向再次開倉 = **加碼**:數量累加、進場價改成
+        # 加權平均成本,不是把前一筆蓋掉。原本只有「買進持有(累積)」走這條;
+        # ADR-144 讓一般策略也能分批進場,所以判斷改成「這是不是加碼」——
+        # 有部位、方向相同,就是加碼,與 buy_and_hold 無關。
+        #
+        # 蓋掉前一筆的後果很嚴重:停損停利是拿 entry_price 算的,
+        # 第二筆把成本蓋成新價格,等於第一筆的損益憑空消失。
+        _is_scale_in = (prev_qty > 0 and runtime.get('state') == new_state)
+        if _is_scale_in:
             add_qty = int(intent['qty'])
             prev_px = float(runtime.get('entry_price', 0) or 0)
             prev_exec_px = float(runtime.get('exec_entry_price', 0) or 0)
@@ -1411,10 +1541,12 @@ def apply_fill(strategy, runtime, intent, now_ts, exec_price=None):
             runtime['exec_entry_price'] = ((prev_exec_px * prev_qty + exec_px * add_qty)
                                            / total_qty) if total_qty else 0.0
             runtime['qty'] = total_qty
+            runtime['entries'] = entries_of(runtime) + 1
         else:
             runtime['entry_price'] = float(intent['price'])
             runtime['exec_entry_price'] = exec_px
             runtime['qty'] = int(intent['qty'])
+            runtime['entries'] = 1
         runtime['state'] = new_state
         runtime['trades_today'] = int(runtime.get('trades_today', 0)) + 1
     else:
@@ -1426,6 +1558,9 @@ def apply_fill(strategy, runtime, intent, now_ts, exec_price=None):
         runtime['entry_price'] = 0.0
         runtime['exec_entry_price'] = 0.0
         runtime['qty'] = 0
+        # 【ADR-144】平倉 = 這一段部位結束,分批計數歸零,下一段重新算。
+        runtime['entries'] = 0
+        runtime['blocked_entry'] = ''
 
 
 def position_mismatch(strategy, runtime, acct_position):

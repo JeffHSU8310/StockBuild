@@ -110,8 +110,38 @@ def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
     total_fee_sum = [0.0]
     total_tax_sum = [0.0]
     total_gross_sum = [0.0]
-    open_trade = None
+    # 【ADR-144】一段部位可以由**多筆**進場組成 (分批建倉/加碼)。
+    # 舊版只有一個 open_trade 槽位,所以「買了就不准再買」——那正是使用者說的
+    # 「回測一年只買一次」的元兇。改成 lot 清單:每一次進場一筆,平倉時逐筆
+    # 結算成獨立的交易明細列 (使用者才看得到自己買在哪幾個價位)。
+    # max_entries 預設 1 → 清單最多一筆 → 與舊行為逐筆相同。
+    open_lots = []
+    # 回測的「訊息紀錄」(ADR-144):逐根記下發生了什麼、以及**什麼沒發生**。
+    log_rows = []
     realized = 0.0
+
+    def _log(ts, kind, text, collapse=False):
+        """寫一列訊息紀錄。
+
+        collapse=True 時,**連續重複的同一句話會合併成一列並累計次數** ——
+        「條件成立但已持倉」在死腦筋的舊行為下每一根都會發生一次,逐根印出來
+        會有幾萬列,使用者反而看不到重點。合併之後看到的是
+        「(連續 237 根) 已持倉,且可分批進場次數是 1…」,一眼就懂。
+        """
+        text = str(text)
+        if collapse and log_rows:
+            last = log_rows[-1]
+            if last.get('kind') == kind and last.get('_raw') == text:
+                last['n'] = int(last.get('n', 1)) + 1
+                last['ts_end'] = ts
+                last['text'] = f"(連續 {last['n']} 根) {text}"
+                return
+        if len(log_rows) < LOG_MAX_ROWS:
+            log_rows.append({'ts': ts, 'kind': kind, 'text': text,
+                             '_raw': text, 'n': 1})
+        elif len(log_rows) == LOG_MAX_ROWS:
+            log_rows.append({'ts': ts, 'kind': '截斷', 'n': 1, '_raw': '',
+                             'text': f'訊息過多,只保留前 {LOG_MAX_ROWS} 筆。'})
 
     def _fill_price(intent_price, action):
         px = float(intent_price)
@@ -152,7 +182,7 @@ def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
                 decision, _ctx = custom_fn.run_on_bar(
                     s['source_code'], eval_window, rt.get('state', 'FLAT'), s.get('custom_params', {}),
                     state=custom_state, entry_price=rt.get('entry_price', 0.0),
-                    bars_in_position=(now_ts_eval - open_trade['entry_i']) if open_trade else 0,
+                    bars_in_position=(now_ts_eval - open_lots[0]['entry_i']) if open_lots else 0,
                     return_ctx=True, full_df=df)
                 custom_state = _ctx.state
                 param_usage.update(getattr(_ctx, 'param_reads', {}) or {})
@@ -178,7 +208,7 @@ def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
         # 【ADR-136】即時停損的回測模型:勾了「停損停利即時觸發」的策略,實盤是
         # **盤中觸價就走**;回測若只看收盤價會低估停損次數,兩邊對不上。
         # 這裡在成交那一根 K 棒上用高低點判斷觸價,優先於當根的其他 intent。
-        if (open_trade is not None
+        if (open_lots
                 and strategy_engine.intrabar_stop_enabled(s)
                 and not any(it.get('kind') == 'CLOSE' for it in intents)):
             _touch = strategy_engine.bar_touch_exit(
@@ -232,49 +262,60 @@ def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
                     markers.append({'ts': ts, 'price': fill,
                                     'kind': 'buy_open' if action == '買進' else 'sell_open'})
                     continue
-                open_trade = {
+                # 【ADR-144】分批進場:每一次進場都是一筆獨立的 lot,
+                # 不覆蓋前一筆。平倉時逐筆結算成獨立的交易明細列。
+                open_lots.append({
                     'entry_ts': ts, 'entry_price': fill,
                     'direction': open_dir,
-                    'qty': qty, 'entry_i': i,
-                }
+                    'qty': int(intent.get('qty', qty) or qty), 'entry_i': i,
+                })
+                _log(ts, '進場' if len(open_lots) == 1 else '加碼',
+                     f"{action} @ {fill:g} (第 {len(open_lots)} 筆) — {intent.get('reason', '')}")
                 markers.append({'ts': ts, 'price': fill,
                                 'kind': 'buy_open' if action == '買進' else 'sell_open'})
             else:  # CLOSE
-                mult = 1.0 if open_trade and open_trade['direction'] == '做多' else -1.0
-                entry_px = open_trade['entry_price'] if open_trade else fill
-                # 【ADR-043】乘上單位規模:股票×1000、零股×1、期貨×契約乘數
-                gross = (fill - entry_px) * mult * qty * contract_size
-                # 【ADR-050】真實成本:手續費 + 交易稅 (舊版 fee_rate 被呼叫端寫死 0,
-                # 導致回測「總成本」恆為 0、績效系統性高估)。
-                if apply_cost_model:
-                    _c = _cost_model.round_trip_cost(
-                        tt, str(s.get('symbol', '')), entry_px, fill, qty, contract_size,
-                        direction=(open_trade.get('direction') if open_trade else '做多'),
-                        params=cost_params)
-                    fee, tax_ = _c['fee'], _c['tax']
-                else:
-                    fee = (abs(entry_px) + abs(fill)) * qty * contract_size * float(fee_rate)
-                    tax_ = 0.0
-                cost = fee + tax_
-                pnl = gross - cost
-                realized += pnl
-                total_fee_sum[0] += fee
-                total_tax_sum[0] += tax_
-                total_gross_sum[0] += gross
-                strategy_engine.apply_fill(s, rt, intent, now_ts)
-                if open_trade:
-                    bars = i - open_trade['entry_i']
-                    denom = abs(entry_px) * qty * contract_size
+                # 【ADR-144】一次平掉所有 lot,逐筆算損益 —— 使用者才看得到
+                # 自己是買在哪幾個價位、各賺賠多少。
+                _closed_n = len(open_lots)
+                _sum_pnl = 0.0
+                for _lot in open_lots:
+                    lot_qty = int(_lot['qty'])
+                    mult = 1.0 if _lot['direction'] == '做多' else -1.0
+                    entry_px = _lot['entry_price']
+                    # 【ADR-043】乘上單位規模:股票×1000、零股×1、期貨×契約乘數
+                    gross = (fill - entry_px) * mult * lot_qty * contract_size
+                    # 【ADR-050】真實成本:手續費 + 交易稅。
+                    if apply_cost_model:
+                        _c = _cost_model.round_trip_cost(
+                            tt, str(s.get('symbol', '')), entry_px, fill, lot_qty,
+                            contract_size, direction=_lot['direction'], params=cost_params)
+                        fee, tax_ = _c['fee'], _c['tax']
+                    else:
+                        fee = (abs(entry_px) + abs(fill)) * lot_qty * contract_size * float(fee_rate)
+                        tax_ = 0.0
+                    pnl = gross - (fee + tax_)
+                    realized += pnl
+                    _sum_pnl += pnl
+                    total_fee_sum[0] += fee
+                    total_tax_sum[0] += tax_
+                    total_gross_sum[0] += gross
+                    denom = abs(entry_px) * lot_qty * contract_size
                     trades.append({
-                        'entry_ts': open_trade['entry_ts'], 'entry_price': entry_px,
+                        'entry_ts': _lot['entry_ts'], 'entry_price': entry_px,
                         'exit_ts': ts, 'exit_price': fill,
-                        'direction': open_trade['direction'], 'qty': qty,
+                        'direction': _lot['direction'], 'qty': lot_qty,
                         'pnl': pnl, 'pnl_pct': (pnl / denom * 100.0) if denom else 0.0,
-                        'bars_held': bars, 'exit_reason': intent.get('reason', ''),
+                        'bars_held': i - _lot['entry_i'],
+                        'exit_reason': intent.get('reason', ''),
                     })
+                strategy_engine.apply_fill(s, rt, intent, now_ts)
+                if _closed_n:
+                    _log(ts, '出場',
+                         f"{action} @ {fill:g} 平掉 {_closed_n} 筆,合計損益 {_sum_pnl:,.0f}"
+                         f" — {intent.get('reason', '')}")
                 markers.append({'ts': ts, 'price': fill,
                                 'kind': 'buy_close' if action == '買進' else 'sell_close'})
-                open_trade = None
+                open_lots = []
         # 記錄權益曲線:已實現 + 目前未平倉浮動損益
         # 【ADR-075】看A做B 時浮動損益用 B 的收盤 (持有的是 B)。
         floating = 0.0
@@ -285,10 +326,17 @@ def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
             for lot in bnh_lots:
                 m = 1.0 if lot['direction'] == '做多' else -1.0
                 floating += (cur_px - lot['entry_price']) * m * int(lot['qty']) * contract_size
-        elif open_trade:
-            mult = 1.0 if open_trade['direction'] == '做多' else -1.0
-            floating = (cur_px - open_trade['entry_price']) * mult * qty * contract_size
+        else:
+            # 【ADR-144】浮動損益要涵蓋**每一筆** lot,不是只算最後一筆。
+            for _lot in open_lots:
+                m = 1.0 if _lot['direction'] == '做多' else -1.0
+                floating += (cur_px - _lot['entry_price']) * m * int(_lot['qty']) * contract_size
         equity.append((ts, realized + floating))
+        # 【ADR-144】條件成立卻沒進場 —— 把原因記進訊息紀錄。
+        # 這正是「為什麼一年只買一次」最需要的那一行字。
+        _blocked = rt.get('blocked_entry') or ''
+        if _blocked:
+            _log(ts, '未進場', _blocked, collapse=True)
 
     # ============================================================
     # 【ADR-059】回測期末結算 (settle_open_at_end)
@@ -340,43 +388,46 @@ def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
         settled_open = len(bnh_lots)
         if equity:
             equity[-1] = (equity[-1][0], realized)
-        open_trade = None
+        open_lots = []
 
-    if settle_open_at_end and open_trade is not None and len(df) > 0:
+    if settle_open_at_end and open_lots and len(df) > 0:
         last_ts = df.index[-1]
         last_px = float(_bdf['Close'].iloc[-1])  # 【ADR-075】看A做B 期末以 B 的最後收盤結算
-        mult = 1.0 if open_trade['direction'] == '做多' else -1.0
-        entry_px = open_trade['entry_price']
-        gross = (last_px - entry_px) * mult * qty * contract_size
-        if apply_cost_model:
-            _c = _cost_model.round_trip_cost(
-                tt, str(s.get('symbol', '')), entry_px, last_px, qty, contract_size,
-                direction=open_trade['direction'], params=cost_params)
-            fee, tax_ = _c['fee'], _c['tax']
-        else:
-            fee = (abs(entry_px) + abs(last_px)) * qty * contract_size * float(fee_rate)
-            tax_ = 0.0
-        pnl = gross - (fee + tax_)
-        realized += pnl
-        total_fee_sum[0] += fee
-        total_tax_sum[0] += tax_
-        total_gross_sum[0] += gross
-        denom = abs(entry_px) * qty * contract_size
-        trades.append({
-            'entry_ts': open_trade['entry_ts'], 'entry_price': entry_px,
-            'exit_ts': last_ts, 'exit_price': last_px,
-            'direction': open_trade['direction'], 'qty': qty,
-            'pnl': pnl, 'pnl_pct': (pnl / denom * 100.0) if denom else 0.0,
-            'bars_held': (len(df) - 1) - open_trade['entry_i'],
-            'exit_reason': '回測期末結算(未平倉,以最後收盤價計)',
-        })
-        markers.append({'ts': last_ts, 'price': last_px,
-                        'kind': 'buy_close' if open_trade['direction'] == '做空' else 'sell_close'})
-        settled_open = 1
+        # 【ADR-144】期末也要逐筆結算,不是只結算「最後一筆」。
+        for _lot in open_lots:
+            lot_qty = int(_lot['qty'])
+            mult = 1.0 if _lot['direction'] == '做多' else -1.0
+            entry_px = _lot['entry_price']
+            gross = (last_px - entry_px) * mult * lot_qty * contract_size
+            if apply_cost_model:
+                _c = _cost_model.round_trip_cost(
+                    tt, str(s.get('symbol', '')), entry_px, last_px, lot_qty, contract_size,
+                    direction=_lot['direction'], params=cost_params)
+                fee, tax_ = _c['fee'], _c['tax']
+            else:
+                fee = (abs(entry_px) + abs(last_px)) * lot_qty * contract_size * float(fee_rate)
+                tax_ = 0.0
+            pnl = gross - (fee + tax_)
+            realized += pnl
+            total_fee_sum[0] += fee
+            total_tax_sum[0] += tax_
+            total_gross_sum[0] += gross
+            denom = abs(entry_px) * lot_qty * contract_size
+            trades.append({
+                'entry_ts': _lot['entry_ts'], 'entry_price': entry_px,
+                'exit_ts': last_ts, 'exit_price': last_px,
+                'direction': _lot['direction'], 'qty': lot_qty,
+                'pnl': pnl, 'pnl_pct': (pnl / denom * 100.0) if denom else 0.0,
+                'bars_held': (len(df) - 1) - _lot['entry_i'],
+                'exit_reason': '回測期末結算(未平倉,以最後收盤價計)',
+            })
+            markers.append({'ts': last_ts, 'price': last_px,
+                            'kind': 'buy_close' if _lot['direction'] == '做空' else 'sell_close'})
+        _log(last_ts, '期末結算', f"未平倉 {len(open_lots)} 筆以最後收盤價 {last_px:g} 結算")
+        settled_open = len(open_lots)
         if equity:
             equity[-1] = (equity[-1][0], realized)
-        open_trade = None
-
+        open_lots = []
     _base_override = None
     if is_bnh and bnh_lots:
         # 累積買進:報酬率的分母 = 全部買進的總投入資金
@@ -406,10 +457,28 @@ def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
         metrics['bnh_total_invested_with_cost'] = 0.0
         metrics['bnh_final_price'] = 0.0
         metrics['bnh_final_value'] = 0.0
+    # 【ADR-144】跑完沒有任何交易時,訊息紀錄要能回答「為什麼」——
+    # 那正是使用者最需要看到的一行字,不是空白的分頁。
+    if not trades:
+        if not log_rows:
+            _log(df.index[-1] if len(df) else None, '總結',
+                 '整段回測沒有任何一根 K 棒讓進場條件成立 —— 條件可能太嚴,'
+                 '或資料範圍不含符合的行情。')
+        else:
+            _log(df.index[-1] if len(df) else None, '總結',
+                 '整段回測沒有完成任何一筆交易 (有進場但沒平倉,或全被擋下)。')
     return {'trades': trades, 'equity': equity, 'metrics': metrics, 'markers': markers,
+            # 【ADR-144】回測訊息紀錄:每一列 {ts, kind, text}
+            'log': log_rows,
             # 【ADR-055】param_given=餵進引擎的參數;param_usage=程式碼實際讀到的參數
             'param_given': dict(s.get('custom_params') or {}) if is_custom else {},
             'param_usage': param_usage}
+
+
+#: 【ADR-144】回測「訊息紀錄」最多留幾列。
+# 十年 5分K 有二十幾萬根,全留會吃光記憶體、Treeview 也塞不動;
+# 超過就截斷並在最後一列明說(不是靜默丟掉)。
+LOG_MAX_ROWS = 5000
 
 
 def _relax_realtime_guards(s):
@@ -421,7 +490,8 @@ def _relax_realtime_guards(s):
 
 
 def _empty_result():
-    return {'trades': [], 'equity': [], 'markers': [], 'param_given': {}, 'param_usage': {},
+    return {'trades': [], 'equity': [], 'markers': [], 'log': [],
+            'param_given': {}, 'param_usage': {},
             'metrics': {'total_pnl': 0.0, 'total_return_pct': 0.0, 'win_rate': 0.0,
                         'max_drawdown': 0.0, 'trades': 0, 'wins': 0, 'losses': 0,
                         'profit_factor': 0.0, 'avg_bars_held': 0.0,

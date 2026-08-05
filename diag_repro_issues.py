@@ -1737,7 +1737,11 @@ def _adr059_buy_and_hold_and_range():
     assert abs(m['total_return_pct'] - m['total_pnl'] / m['bnh_total_invested'] * 100.0) < 1e-6
     assert abs(m['total_return_pct']) < 500.0, f"報酬率不該荒謬: {m['total_return_pct']}"
 
-    # 5) 引擎加權平均成本 (累積) vs 一般策略 (覆蓋)
+    # 5) 引擎加權平均成本 —— 【ADR-144 起,一般策略也一樣】
+    # 原本這裡斷言「一般策略是覆蓋 (qty=3、成本=200)」。那個行為是錯的,
+    # 只是被「持倉中不評估進場條件」的閘門遮住了:一旦真的成交第二筆,
+    # 覆蓋會讓第一筆的成本基礎憑空消失,停損停利跟著算錯。
+    # ADR-144 開放分批進場之後這件事會真的發生,所以兩者一律加權平均。
     rt = _se.new_runtime()
     _se.apply_fill(bnh, rt, {'kind':'OPEN','action':'買進','qty':1,'price':100.0}, 1.0)
     _se.apply_fill(bnh, rt, {'kind':'OPEN','action':'買進','qty':3,'price':200.0}, 2.0)
@@ -1745,7 +1749,11 @@ def _adr059_buy_and_hold_and_range():
     rt2 = _se.new_runtime(); normal = dict(bnh); normal['buy_and_hold'] = False
     _se.apply_fill(normal, rt2, {'kind':'OPEN','action':'買進','qty':1,'price':100.0}, 1.0)
     _se.apply_fill(normal, rt2, {'kind':'OPEN','action':'買進','qty':3,'price':200.0}, 2.0)
-    assert rt2['qty'] == 3 and abs(rt2['entry_price'] - 200.0) < 1e-9, rt2
+    assert rt2['qty'] == 4 and abs(rt2['entry_price'] - 175.0) < 1e-9, rt2
+    # 反向對照:平倉之後的第一筆是全新部位,不可以跟上一段混在一起
+    _se.apply_fill(normal, rt2, {'kind':'CLOSE','action':'賣出','qty':4,'price':210.0}, 3.0)
+    _se.apply_fill(normal, rt2, {'kind':'OPEN','action':'買進','qty':1,'price':300.0}, 4.0)
+    assert rt2['qty'] == 1 and abs(rt2['entry_price'] - 300.0) < 1e-9, rt2
 
     # 5) 報告視窗可開啟且標題含期間
     app._qt_show_backtest_report(bnh, df, r); app.flush_after()
@@ -6511,6 +6519,120 @@ def _day_pct_watch_ab_140():
 
 run_case("ADR-143: 看A做B + 當日漲跌幅 (A跌X%買B / A漲Y%賣B,股票/零股/期貨)",
          _day_pct_watch_ab_140)
+
+
+def _scale_in_and_backtest_log_144():
+    """【ADR-144】拆掉「買了就不准再買」+ 回測的「訊息/紀錄」分頁。
+
+    使用者的原話:
+      1.「回測引擎非常『死腦筋』…只要你買了(狀態變成 LONG),在你把股票賣掉
+         之前,我就絕對不准你買第二筆…造成回測時一年只買一次的元兇…這個問題
+         要修改。」
+      2.「回測系統要有『訊息 / 紀錄 / Log』標籤頁可以看。」
+
+    純函式在 tests/test_core.py 釘死了。這個案例守的是**接線**:
+    編輯器存不存得進去、報告視窗開不開得出那個分頁、分頁裡有沒有東西。
+    """
+    import re as _re
+    import pandas as _pd
+    from core import strategy_engine as _se44
+    from core import backtest as _bt44
+
+    _src = open('stock_app_pro.py', encoding='utf-8').read()
+
+    # ---- A. 兩個編輯器都要有「可分批進場次數」,而且存檔要真的寫進去 ----
+    # 切片邊界用「下一個同縮排的 def」找 (P-109/P-110)。
+    for _fn, _label in (('_qt_open_editor', '內建策略'),
+                        ('_qt_open_custom_editor', '自訂策略')):
+        _i = _src.index(f'    def {_fn}(')
+        _m = _re.search(r'\n    def (?!' + _fn + r'\b)\w+', _src[_i:])
+        assert _m, f"找不到 {_fn} 的結尾"
+        _seg = _src[_i:_i + _m.start()]
+        assert '可分批進場次數' in _seg, f"{_label}編輯器要有「可分批進場次數」欄位"
+        assert "s['max_entries']" in _seg, f"{_label}編輯器存檔時要把 max_entries 寫進策略"
+
+    # ---- B. 版面不可撞格 (新欄位最容易踩 P-104) ----
+    for _dlg in ('_qt_open_editor', '_qt_open_custom_editor'):
+        assert not _grid_overlaps(_dlg), f"{_dlg} 有 grid 撞格,新欄位可能整個看不到"
+
+    # ---- C. 回測:預設仍只買一次 / 調大就分批 ----
+    _n = 40
+    _c = [100.0 + i for i in range(_n)]
+    _df44 = _pd.DataFrame(
+        {'Open': _c, 'High': [x + 1 for x in _c], 'Low': [x - 1 for x in _c],
+         'Close': _c, 'Volume': [1000] * _n},
+        index=_pd.date_range('2026-01-01', periods=_n, freq='D'))
+
+    def _mk44(**over):
+        st = _se44.new_strategy()
+        st.update({'name': '診斷ADR144', 'symbol': '2330', 'trade_type': '股票',
+                   'qty': 1, 'timeframe': '日K', 'direction': '做多',
+                   'stop_loss_pct': 0.0, 'take_profit_pct': 0.0,
+                   'entry': [{'type': 'always_true', 'params': {}}],
+                   'exit_signals': []})
+        st.update(over)
+        return st
+
+    _r1 = _bt44.run_backtest(_mk44(), _df44)
+    assert len(_r1['trades']) == 1, \
+        f"預設 (max_entries=1) 必須維持舊行為:只買一次,實際 {len(_r1['trades'])}"
+    _r3 = _bt44.run_backtest(_mk44(max_entries=3), _df44)
+    assert len(_r3['trades']) == 3, \
+        f"max_entries=3 應該買到 3 筆,實際 {len(_r3['trades'])} —— 狀態機還在擋"
+    assert len({t['entry_price'] for t in _r3['trades']}) == 3, \
+        "三筆的進場價要各不相同 (使用者要看到自己買在哪幾個價位)"
+
+    # ---- D. 訊息紀錄要說出「為什麼沒買」----
+    _blocked = [x for x in _r1['log'] if x['kind'] == '未進場']
+    assert _blocked, "預設情況下條件每根都成立卻只買一次,紀錄必須說明原因"
+    assert '可分批進場次數' in _blocked[0]['text'], \
+        f"原因要點名是哪個設定擋的,實際:{_blocked[0]['text']}"
+    assert _blocked[0].get('n', 1) > 1 and '連續' in _blocked[0]['text'], \
+        "連續相同的原因要合併成一列並標明次數"
+    # 反向對照:調大之後就不該再被擋 (少了這條,把訊息寫死也會綠)
+    _blocked3 = [x for x in _r3['log'] if x['kind'] == '未進場']
+    assert all('已達上限' in x['text'] for x in _blocked3), \
+        f"max_entries=3 時的擋下原因應是「已達上限」,實際 {[x['text'] for x in _blocked3]}"
+    assert [x['kind'] for x in _r3['log'] if x['kind'] == '加碼'], "加碼要留下紀錄"
+
+    # ---- E. 報告視窗開得起來,而且真的有那個分頁 ----
+    _calls = {'log_tab': 0}
+    _orig_tab = app._qt_build_backtest_log_tab
+
+    def _spy(parent, s_, result_):
+        _calls['log_tab'] += 1
+        _calls['rows'] = len(result_.get('log') or [])
+        return _orig_tab(parent, s_, result_)
+
+    try:
+        app._qt_build_backtest_log_tab = _spy
+        app._qt_show_backtest_report(_mk44(), _df44, _r1)
+        app.flush_after()
+    finally:
+        app._qt_build_backtest_log_tab = _orig_tab
+    assert _calls['log_tab'] == 1, "報告視窗要建出「訊息 / 紀錄」分頁"
+    assert _calls.get('rows', 0) > 0, "分頁拿到的紀錄不可以是空的"
+
+    # 分頁本體自己也要跑得起來 (Treeview 填得進去、篩選 callback 不炸)
+    _tab = stock_app_pro.tk.Frame(None)
+    app._qt_build_backtest_log_tab(_tab, _mk44(), _r1)
+    app.flush_after()
+
+    # 報告視窗真的用了 Notebook (不是只呼叫了那個函式卻沒放進分頁)
+    _i = _src.index('    def _qt_show_backtest_report(')
+    _m = _re.search(r'\n    def (?!_qt_show_backtest_report\b)\w+', _src[_i:])
+    _seg = _src[_i:_i + _m.start()]
+    assert 'ttk.Notebook' in _seg, "報告視窗要用分頁 (使用者要求的是『標籤頁』)"
+    assert '訊息 / 紀錄' in _seg, "分頁標題要看得出是訊息紀錄"
+
+    # ---- F. 空結果也要有 log 這個 key (報告視窗會讀它) ----
+    assert 'log' in _bt44._empty_result(), "_empty_result 缺 log,報告視窗會 KeyError"
+    app._qt_show_backtest_report(_mk44(), _df44, _bt44._empty_result())
+    app.flush_after()
+
+
+run_case("ADR-144: 分批進場/加碼 (拆掉『買了就不准再買』) + 回測訊息紀錄分頁",
+         _scale_in_and_backtest_log_144)
 
 
 print(f"{'案例':60s} 結果")
