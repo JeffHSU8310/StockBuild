@@ -6224,6 +6224,259 @@ run_case("ADR-139: 永豐 API 測試 (只測連線/金鑰手動輸入/確認視�
          _sinopac_api_test_139)
 
 
+def _day_pct_watch_ab_140():
+    """【ADR-140】看A做B + 當日漲跌幅:「A 跌超過 X% 買 B、漲超過 Y% 賣 B」。
+
+    使用者的原話:
+      「一樣看A做B,當A盤中跌幅超過X%,就買進B。(支援股票整張、零股、期貨)
+        X為參數,可自行輸入。當A盤中漲幅超過Y%,就賣出B。Y為參數,可自行輸入。」
+
+    純函式的算式已經在 tests/test_core.py 釘死了。這個案例守的是**接線**:
+    條件放進策略之後,走完整的 `_quant_eval_pass()`,B 那邊真的會收到
+    買進/賣出,而且三種商品別 (股票整張/零股/期貨) 都成立。
+    純函式對了但沒接上,是這個專案踩過最多次的坑 (P-64)。
+    """
+    import pandas as _pd
+    from core import strategy_engine as _se14
+
+    class FakeContract:
+        code = '2330'
+        symbol = '2330'
+
+    # A (被看的商品) 的 5分K:昨收 100;今天最低 96 (-4%)、最高 100.5。
+    _base_day = stock_app_pro.datetime.now().replace(
+        hour=0, minute=0, second=0, microsecond=0) - stock_app_pro.timedelta(days=1)
+
+    def _a_df(mode):
+        """A 的 5分K。昨收 100。
+
+          'drop' → 到 09:05 為止,當日最低 96 (**-4%**)
+          'rise' → 再接一根 09:10,當日最高 104 (**+4%**)
+          'flat' → 當日只動 ±0.3%
+
+        ※ 'rise' 一定要**多一根、時間更晚**的 K 棒:引擎有「同一根 K 棒不重複
+          評估」的閘門 (runtime['last_bar_ts'])。第一版兩種情境的最後一根是同一個
+          時間戳,於是進場後那一輪整個被閘門吃掉,出場永遠不會發生 —— 而失敗
+          訊息只會說「應該出場卻沒出場」,看不出是資料的問題。
+        """
+        y = _base_day.replace(hour=13, minute=30)
+        t0 = (_base_day + stock_app_pro.timedelta(days=1)).replace(hour=9, minute=0)
+        t1 = t0 + stock_app_pro.timedelta(minutes=5)
+        t2 = t0 + stock_app_pro.timedelta(minutes=10)
+        drop = [(y, 100, 100, 100, 100.0), (t0, 99, 99.5, 97.0, 98.0),
+                (t1, 98, 98.5, 96.0, 97.0)]
+        rows = {
+            'drop': drop,
+            # 跌完之後拉上去 —— 真實的一天就長這樣
+            'rise': drop + [(t2, 97, 104.0, 97.0, 103.0)],
+            'flat': [(y, 100, 100, 100, 100.0), (t0, 100, 100.3, 99.8, 100.0),
+                     (t1, 100, 100.4, 99.7, 100.1)],
+        }[mode]
+        return _pd.DataFrame(
+            {'Open': [r[1] for r in rows], 'High': [r[2] for r in rows],
+             'Low': [r[3] for r in rows], 'Close': [r[4] for r in rows],
+             'Volume': [1000] * len(rows)},
+            index=_pd.to_datetime([r[0] for r in rows]))
+
+    # B (實際下單的商品) 的 5分K —— 刻意用完全不同的價位,
+    # 這樣「下單價拿錯商品」一定會被抓到。
+    _b_df = _pd.DataFrame({'Open': [600.0], 'High': [600.0], 'Low': [600.0],
+                           'Close': [600.0], 'Volume': [1]},
+                          index=[stock_app_pro.datetime.now()])
+
+    mode = {'v': 'drop'}
+    orders = []
+    logs = []
+    orig_log = app.log_message
+    orig_resolve, orig_resolve_watch = app._qt_resolve, app._qt_resolve_watch
+    orig_fetch = app._qt_fetch_closed_bars
+    orig_place = app._place_strategy_order
+    orig_open = stock_app_pro.market_session.is_market_open
+    orig_just = stock_app_pro.market_session.just_opened
+    orig_running, orig_login, orig_api = app._qt_running, app.api_logged_in, app.sj_api
+    orig_strats, orig_rts = app.strategies, app.strategy_runtimes
+
+    def _fake_fetch(_s, _c, _a, tf=None, cache_sym=None, cache_market=None, **_k):
+        # 看A做B:A 用 watch_timeframe 抓、B 用 timeframe 抓。
+        # 這裡靠 cache_sym 分辨要給誰 —— 給錯的話下單價會變成 A 的價。
+        if str(cache_sym or '') == '^TWII':
+            return _a_df(mode['v'])
+        return _b_df
+
+    def _mk(trade_type, qty, x=3.0, y=3.0):
+        s = _se14.new_strategy()
+        s.update({
+            'name': f'診斷ADR140-{trade_type}', 'symbol': '2330',
+            'trade_type': trade_type,
+            'market': '台期貨' if trade_type == '期貨' else '台股',
+            'qty': qty, 'direction': '做多',
+            # 【實單模式】才會走 _place_strategy_order —— 模擬模式是記進模擬帳戶,
+            # 那條路測不到「下單價有沒有用 B 的價」。這裡的 _place_strategy_order
+            # 已經被換成假的,不會有任何東西送到券商。
+            'mode': '實單', 'enabled': True,
+            'timeframe': '5分K', 'session_gate': False,
+            'stop_loss_pct': 0.0, 'take_profit_pct': 0.0,
+            # 冷卻預設 300 秒會把「進場後馬上出場」擋掉 (風控擋單),
+            # 這個案例要測的是訊號接線,不是風控,所以關掉。
+            'cooldown_sec': 0, 'max_trades_per_day': 99,
+            'price_type': '限價' if trade_type == '零股' else '限價',
+            # 看A做B:A = 加權指數,B = 上面的 symbol
+            'watch_enabled': True, 'watch_symbol': '^TWII',
+            'watch_trade_type': '指數', 'watch_timeframe': '5分K',
+            'entry': [{'type': 'day_drop_over', 'params': {'value': x}}],
+            'exit_signals': [{'type': 'day_rise_over', 'params': {'value': y}}],
+        })
+        if trade_type == '期貨':
+            s['symbol'] = 'TXF'
+        return s
+
+    def _mount(s):
+        rt = _se14.new_runtime()
+        app.strategies = [s]
+        app.strategy_runtimes = {s['id']: rt}
+        app._qt_last_boundary = {}
+        app._qt_session_state = {}
+        return rt
+
+    def _pass():
+        app._qt_last_boundary = {}          # 每次都讓 K 棒邊界閘門放行
+        app._quant_eval_pass()
+        app.flush_after()
+
+    try:
+        app.log_message = lambda m: (logs.append(str(m)), orig_log(m))[0]
+        app._qt_resolve = lambda _s: (FakeContract(), 'stock')
+        app._qt_resolve_watch = lambda _s: (FakeContract(), 'index_tw', '^TWII', '台股')
+        app._qt_fetch_closed_bars = _fake_fetch
+        app._place_strategy_order = lambda s, it, c, k, exec_price=None, **kw: (
+            orders.append((s['trade_type'], it['action'], it['qty'], exec_price)), (True, ''))[1]
+        app.sj_api = object(); app.api_logged_in = True; app._qt_running = True
+        stock_app_pro.market_session.is_market_open = lambda *a, **k: True
+        stock_app_pro.market_session.just_opened = lambda *a, **k: False
+
+        # ---- 1. 三種商品別都要能「A 跌 4% → 買進 B」----
+        for _tt, _qty in (('股票', 1), ('零股', 100), ('期貨', 2)):
+            mode['v'] = 'drop'
+            s = _mk(_tt, _qty); rt = _mount(s)
+            orders.clear()
+            _pass()
+            assert rt['state'] == 'LONG', \
+                f"{_tt}:A 當日跌 4% > X=3% 應該進場買進 B (實際 state={rt['state']})"
+            assert orders and orders[-1][1] == '買進', f"{_tt}:應送出買進,實際 {orders}"
+            assert orders[-1][2] == _qty, \
+                f"{_tt}:數量應照策略設定的 {_qty},實際 {orders[-1][2]}"
+            # 【看A做B 的核心】下單價要用 B 的 600,不是 A 的 97
+            assert orders[-1][3] == 600.0, \
+                f"{_tt}:下單價要用 B 的價 (600),實際 {orders[-1][3]} —— 拿到 A 的價就是接錯線"
+
+            # ---- 2. 同一檔策略:A 轉為漲 4% → 賣出 B (出場) ----
+            mode['v'] = 'rise'
+            orders.clear()
+            _pass()
+            assert rt['state'] == 'FLAT', \
+                f"{_tt}:A 當日漲 4% > Y=3% 應該出場 (實際 state={rt['state']})"
+            assert orders and orders[-1][1] == '賣出', f"{_tt}:應送出賣出,實際 {orders}"
+            assert orders[-1][3] == 600.0, f"{_tt}:出場價也要用 B 的價"
+
+        # ---- 3. 反向對照:A 沒漲沒跌 → 什麼都不該做 ----
+        # 少了這條,把兩個條件寫成「永遠成立」上面全部照樣綠。
+        mode['v'] = 'flat'
+        s = _mk('股票', 1); rt = _mount(s)
+        orders.clear()
+        _pass()
+        assert rt['state'] == 'FLAT' and not orders, \
+            f"A 當日只動 0.3% 不該進場 (實際 state={rt['state']}, orders={orders})"
+
+        # ---- 4. X / Y 真的是「可自行輸入的參數」----
+        # 把門檻拉到 5% → 同樣跌 4% 的資料不該進場 (證明讀的是參數不是寫死的值)
+        mode['v'] = 'drop'
+        s = _mk('股票', 1, x=5.0); rt = _mount(s)
+        orders.clear()
+        _pass()
+        assert rt['state'] == 'FLAT', "X=5% 時,只跌 4% 不該進場 (X 沒有被真的讀取)"
+        # 門檻降到 2% → 要進場
+        s = _mk('股票', 1, x=2.0); rt = _mount(s)
+        orders.clear()
+        _pass()
+        assert rt['state'] == 'LONG', "X=2% 時,跌 4% 應該進場"
+
+        # Y 同理:進場後把 Y 拉高到 5%,漲 4% 不該出場
+        mode['v'] = 'rise'
+        s2 = _mk('股票', 1, x=2.0, y=5.0)
+        s2['id'] = s['id']
+        app.strategies = [s2]
+        orders.clear()
+        _pass()
+        assert app.strategy_runtimes[s2['id']]['state'] == 'LONG', \
+            "Y=5% 時,只漲 4% 不該出場 (Y 沒有被真的讀取)"
+
+        # ---- 5. 做空:方向要鏡像 (跌 → 放空進場、漲 → 回補) ----
+        # 內建引擎的 direction 語意本來就是這樣,這裡確認新條件沒有破壞它。
+        mode['v'] = 'drop'
+        s3 = _mk('期貨', 1); s3['direction'] = '做空'
+        rt3 = _mount(s3)
+        orders.clear()
+        _pass()
+        assert rt3['state'] == 'SHORT' and orders[-1][1] == '賣出', \
+            f"做空時 A 跌破 X 應該以賣出進場 (實際 {rt3['state']}, {orders})"
+    finally:
+        app.log_message = orig_log
+        app._qt_resolve, app._qt_resolve_watch = orig_resolve, orig_resolve_watch
+        app._qt_fetch_closed_bars = orig_fetch
+        app._place_strategy_order = orig_place
+        stock_app_pro.market_session.is_market_open = orig_open
+        stock_app_pro.market_session.just_opened = orig_just
+        app._qt_running, app.api_logged_in, app.sj_api = orig_running, orig_login, orig_api
+        app.strategies, app.strategy_runtimes = orig_strats, orig_rts
+        app._qt_last_boundary = {}
+        app._qt_session_state = {}
+
+    # ---- 6. 回測也要吃得下這兩個條件 (使用者很在意回測,ADR-136) ----
+    from core import backtest as _bt14
+    _n = 6 * 10
+    _rows = []
+    _d0 = stock_app_pro.datetime(2026, 3, 2, 9, 0)
+    for _d in range(10):
+        _day = _d0 + stock_app_pro.timedelta(days=_d)
+        # 每天 6 根 5分K;偶數天大跌、奇數天大漲
+        for _k in range(6):
+            _t = _day + stock_app_pro.timedelta(minutes=5 * _k)
+            _c = 100.0 - 5.0 * (_k / 5.0) if _d % 2 == 0 else 100.0 + 5.0 * (_k / 5.0)
+            _rows.append((_t, _c))
+    _bdf = _pd.DataFrame(
+        {'Open': [r[1] for r in _rows], 'High': [r[1] + 0.2 for r in _rows],
+         'Low': [r[1] - 0.2 for r in _rows], 'Close': [r[1] for r in _rows],
+         'Volume': [1000] * len(_rows)},
+        index=_pd.to_datetime([r[0] for r in _rows]))
+    _bs = _se14.new_strategy()
+    _bs.update({'symbol': '2330', 'trade_type': '股票', 'qty': 1,
+                'timeframe': '5分K', 'direction': '做多',
+                'stop_loss_pct': 0.0, 'take_profit_pct': 0.0,
+                'max_trades_per_day': 99, 'cooldown_sec': 0,
+                'entry': [{'type': 'day_drop_over', 'params': {'value': 3.0}}],
+                'exit_signals': [{'type': 'day_rise_over', 'params': {'value': 3.0}}]})
+    _res = _bt14.run_backtest(_bs, _bdf)
+    assert _res and _res.get('trades'), \
+        f"回測跑不出任何交易 —— 條件在回測路徑上沒有生效 ({_res and list(_res.keys())})"
+    # 反向對照:門檻拉到 50% 就不該有交易 (否則上面那條可能是別的原因造成的)
+    _bs2 = dict(_bs)
+    _bs2['entry'] = [{'type': 'day_drop_over', 'params': {'value': 50.0}}]
+    _res2 = _bt14.run_backtest(_bs2, _bdf)
+    assert not (_res2 or {}).get('trades'), \
+        "門檻 50% 不該有任何交易 (證明回測真的在讀這個參數)"
+
+    # ---- 7. 兩個條件都要出現在 GUI 的條件下拉裡 ----
+    for _key in ('day_drop_over', 'day_rise_over'):
+        assert _key in _se14.CONDITIONS, f"{_key} 沒註冊,編輯器選不到"
+    _src14 = open('stock_app_pro.py', encoding='utf-8').read()
+    assert 'strategy_engine.CONDITIONS' in _src14 or 'se.CONDITIONS' in _src14, \
+        "條件編輯器要從 CONDITIONS 取清單 (寫死清單的話新條件永遠不會出現)"
+
+
+run_case("ADR-140: 看A做B + 當日漲跌幅 (A跌X%買B / A漲Y%賣B,股票/零股/期貨)",
+         _day_pct_watch_ab_140)
+
+
 print(f"{'案例':60s} 結果")
 print("-" * 76)
 for name, st, msg in results:

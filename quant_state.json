@@ -1,28 +1,17 @@
 {
-  "5cf182598f": {
+  "92aa3b0afe": {
     "state": "LONG",
-    "entry_price": 90.0,
+    "entry_price": 97.0,
+    "exec_entry_price": 600.0,
     "qty": 1,
-    "last_bar_ts": "2026-05-03 00:00:00",
+    "last_bar_ts": "2026-08-05 09:05:00",
     "trades_today": 1,
-    "day": "2026-06-05",
-    "last_order_ts": 100.0,
+    "day": "2026-08-05",
+    "last_order_ts": 1785932346.4486384,
     "realized_pnl_today": 0.0,
     "error_count": 0,
     "condition_errors": [],
-    "time_window_skips": []
-  },
-  "d8c69683d1": {
-    "state": "LONG",
-    "entry_price": 90.0,
-    "qty": 1,
-    "last_bar_ts": "2026-05-03 00:00:00",
-    "trades_today": 1,
-    "day": "2026-06-05",
-    "last_order_ts": 100.0,
-    "realized_pnl_today": 0.0,
-    "error_count": 0,
-    "condition_errors": [],
-    "time_window_skips": []
+    "time_window_skips": [],
+    "data_error_count": 0
   }
 }

@@ -25,6 +25,8 @@ from core import sj_compat as _sjc
 # 【ADR-101】籌碼條件:籌碼在資料準備階段被併成 df 的 Chip* 欄位,
 # 條件函式簽名維持 func(df, params) 不變,實盤與回測因此自動共用同一條路。
 from core import chips_features as _cf
+# 【ADR-140】當日漲跌幅要照「交易日」分組 (期貨夜盤歸下一個交易日, ADR-007)。
+from core import futures_session as _fs
 
 
 class KBarsFetchError(Exception):
@@ -292,6 +294,131 @@ def _c_pct_change_below(df, p):
     chg = (float(df['Close'].iloc[-1]) / float(df['Close'].iloc[-2]) - 1.0) * 100.0
     return chg <= v
 
+# ---------------------------------------------------------------------------
+# 【ADR-140】當日(盤中)漲跌幅
+#
+# 使用者要的策略:「當 A 盤中跌幅超過 X% 就買進 B;當 A 盤中漲幅超過 Y%
+# 就賣出 B」。這是**逆勢**的一組條件,配合既有的看A做B機制就成立 ——
+# 引擎不必知道 B 的存在,這裡只負責回答「A 今天跌/漲了多少」。
+#
+# 與既有的 pct_change_above/below 完全不同:那兩個是「**單根**相對前一根」,
+# 在 5分K 上算的是 5 分鐘的變化;這裡算的是「**當日相對參考價**」,也就是
+# 台股講「漲跌幅」時的那個數字(漲跌停也是以它 ±10%)。
+# ---------------------------------------------------------------------------
+
+#: 當日漲跌幅的參考價基準
+DAY_PCT_BASES = ('昨收', '今開')
+#: 用哪個價格跟參考價比
+DAY_PCT_USES = ('盤中觸價', '收盤價')
+
+
+def _bar_dates(index):
+    """索引 → 每根 K 棒的「交易日」清單。轉不出來的位置放 None。
+
+    期貨夜盤要照 ADR-007 的交易日規則歸屬(15:00 之後算下一個交易日),
+    否則「當日」會從半夜切成兩半,跌幅整個算錯。是否套用這條規則由資料
+    本身決定(見 futures_session.has_night_session_bars)。
+    """
+    try:
+        use_session = _fs.has_night_session_bars(index)
+    except Exception:
+        use_session = False
+    out = []
+    for t in index:
+        try:
+            out.append(_fs.session_date_of(t) if use_session
+                       else pd.Timestamp(t).normalize().date())
+        except Exception:
+            out.append(None)
+    return out
+
+
+def _day_ref_price(df, base='昨收'):
+    """當日漲跌幅的參考價。找不到回 None。
+
+    昨收 = **前一個交易日最後一根**的收盤價。台股講「漲跌幅」就是相對這個
+           價格,所以這是預設值。
+    今開 = 當日**第一根**的開盤價。
+
+    找不到(df 只有當天、索引不是時間)一律回 None,呼叫端當條件不成立。
+    **不可以退而求其次拿「前一根收盤」充數**:在 5分K 上那是 5 分鐘前的價格,
+    算出來的「當日跌幅」跟使用者想的完全是兩回事,而且他不會發現
+    (鐵則 4 的精神:沒有的東西不要編一個出來)。
+
+    ※ 日K 上這個定義會自然退化成「前一根收盤」—— 前一根就是前一個交易日,
+       不需要特別處理。
+    """
+    if df is None or len(df) < 1 or 'Close' not in df.columns:
+        return None
+    dates = _bar_dates(df.index)
+    today = dates[-1] if dates else None
+    if today is None:
+        return None
+    if base == '今開':
+        if 'Open' not in df.columns:
+            return None
+        for i, d in enumerate(dates):
+            if d == today:
+                v = float(df['Open'].iloc[i])
+                return v if v > 0 else None
+        return None
+    for i in range(len(dates) - 1, -1, -1):
+        if dates[i] is not None and dates[i] != today:
+            v = float(df['Close'].iloc[i])
+            return v if v > 0 else None
+    return None
+
+
+def day_pct_change(df, base='昨收', use='盤中觸價', side='down'):
+    """當日漲跌幅 %(負數=跌)。算不出來回 None。
+
+    use='盤中觸價' → 拿**當日到目前為止**的最低價(side='down')或最高價
+        (side='up')去比。這是「盤中跌幅超過 X%」的字面意思:今天只要曾經
+        跌超過 X%,這件事就成立了,而不是「剛好收在 -X% 以下的那一根」。
+        它是一個**狀態**,不是事件 —— 重複進場由既有的「每日進場上限」
+        與「冷卻秒數」控制,不必在這裡再發明一套。
+    use='收盤價' → 拿當根收盤價比。想要「收盤確認」的人用這個。
+
+    兩種都只讀**已收盤的 K 棒**(呼叫端傳進來的就是 df_closed),
+    所以回測與實盤看到的是同一件事,沒有未來函數。
+    """
+    ref = _day_ref_price(df, base)
+    if ref is None or ref <= 0:
+        return None
+    if use == '收盤價':
+        px = float(df['Close'].iloc[-1])
+    else:
+        col = 'Low' if side == 'down' else 'High'
+        if col not in df.columns:
+            return None
+        dates = _bar_dates(df.index)
+        today = dates[-1] if dates else None
+        vals = [float(df[col].iloc[i]) for i, d in enumerate(dates) if d == today]
+        if not vals:
+            return None
+        px = min(vals) if side == 'down' else max(vals)
+    return (px / ref - 1.0) * 100.0
+
+
+def _c_day_drop_over(df, p):
+    """當日跌幅 >= X%。X 一律取絕對值,填 3 或 -3 都是「跌 3%」。
+
+    刻意吃絕對值:既有的 pct_change_below 要求使用者「填負數」,那是個
+    已知會踩到的坑(填 3 的話條件永遠成立,而且沒有任何提示)。
+    使用者說的是「跌幅超過 X%」,X 在他腦中就是正數。
+    """
+    v = abs(float(p.get('value', 3.0)))
+    chg = day_pct_change(df, p.get('base', '昨收'), p.get('use', '盤中觸價'), 'down')
+    return chg is not None and chg <= -v
+
+
+def _c_day_rise_over(df, p):
+    """當日漲幅 >= Y%。Y 一律取絕對值。"""
+    v = abs(float(p.get('value', 3.0)))
+    chg = day_pct_change(df, p.get('base', '昨收'), p.get('use', '盤中觸價'), 'up')
+    return chg is not None and chg >= v
+
+
 def _c_rsi_cross_up(df, p):
     """RSI 由下往上「穿越」門檻 (只在穿越那一根成立,與 rsi_above 狀態不同)。"""
     r = _rsi(df['Close'], p.get('n', 14))
@@ -557,6 +684,20 @@ CONDITIONS = {
     'inside_bar':          ("內包K棒 (高低被前根包住)", [], _c_inside_bar),
     'gap_up':              ("跳空上漲 (開盤>前根最高)", [('value', '額外門檻%', 0.0)], _c_gap_up),
     'gap_down':            ("跳空下跌 (開盤<前根最低)", [('value', '額外門檻%', 0.0)], _c_gap_down),
+
+    # ---- 【ADR-140】當日(盤中)漲跌幅:逆勢的「跌深買進 / 漲多賣出」 ----
+    # 與 pct_change_above/below 不同 —— 那兩個是「單根相對前一根」,
+    # 這兩個是「當日相對昨收」,也就是台股講漲跌幅的那個數字。
+    'day_drop_over':       ("當日跌幅≥X% (盤中,相對昨收) —— 跌深買進",
+                            [('value', '跌幅%(填正數)', 3.0),
+                             ('base', '參考價', '昨收', list(DAY_PCT_BASES)),
+                             ('use', '用哪個價', '盤中觸價', list(DAY_PCT_USES))],
+                            _c_day_drop_over),
+    'day_rise_over':       ("當日漲幅≥Y% (盤中,相對昨收) —— 漲多賣出",
+                            [('value', '漲幅%(填正數)', 3.0),
+                             ('base', '參考價', '昨收', list(DAY_PCT_BASES)),
+                             ('use', '用哪個價', '盤中觸價', list(DAY_PCT_USES))],
+                            _c_day_rise_over),
 
     # ---- 【ADR-101】籌碼條件 (僅日K以上;T日預設只讀得到T-1日以前的籌碼) ----
     'chip_foreign_buy_streak':  ("[籌碼] 外資連續買超N日", [('n', '連續日數', 3)], _c_chip_foreign_buy_streak),
