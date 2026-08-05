@@ -9815,6 +9815,10 @@ class StockTradingAppPro(tk.Tk):
         # 「看不見的預設值」的同一類問題。這次一併攤開來可設定。
         _risk2 = tk.Frame(top, bg="#1A2026")
         _risk2.grid(row=10, column=0, columnspan=7, sticky='w', pady=(6, 0))
+        # 【ADR-144】可分批進場次數:1 = 舊行為 (買了就不准再買,一定要先平倉)。
+        tk.Label(_risk2, text="可分批進場次數", bg="#1A2026", fg="#FFCA28",
+                 font=('微軟正黑體', 9, 'bold')).pack(side=tk.LEFT)
+        e_maxent2 = _ent(_risk2, s.get('max_entries', 1), 4); e_maxent2.pack(side=tk.LEFT, padx=(2, 8))
         tk.Label(_risk2, text="每日進場上限", bg="#1A2026", fg="white",
                  font=('微軟正黑體', 9)).pack(side=tk.LEFT)
         e_maxd = _ent(_risk2, s.get('max_trades_per_day', 3), 5); e_maxd.pack(side=tk.LEFT, padx=(2, 8))
@@ -9972,6 +9976,7 @@ class StockTradingAppPro(tk.Tk):
             s['stop_loss_abs'] = _f(e_sla)
             s['take_profit_abs'] = _f(e_tpa)
             s['slippage_ticks'] = _i(e_slip, 0)
+            s['max_entries'] = _i(e_maxent2, 1)
             s['max_trades_per_day'] = _i(e_maxd, 3)
             s['cooldown_sec'] = _i(e_cool, 300)
             s['futures_session'] = 'day' if cb_fsess.get() == '只做日盤' else 'day_night'
@@ -10868,6 +10873,15 @@ class StockTradingAppPro(tk.Tk):
         cb_bnh_mode.bind("<<ComboboxSelected>>", _on_bnh_mode)
         _on_bnh_mode()
         _lookup_name()
+        # 【ADR-144】可分批進場次數。放在「每日進場上限」旁邊 —— 兩者常被搞混:
+        # 「每日進場上限」限的是一天幾次,「可分批進場次數」限的是**同一段部位**
+        # 可以由幾筆組成。1 = 買了就不准再買,一定要先平倉 (舊行為)。
+        _lbl(top, "可分批進場次數").grid(row=15, column=0, sticky='w', pady=(6, 0))
+        e_maxent = _ent(top, s.get('max_entries', 1), 6)
+        e_maxent.grid(row=15, column=1, padx=4, pady=(6, 0))
+        tk.Label(top, text="1=買了就不准再買(要先平倉);填 2 以上可分批建倉/加碼;0=不限",
+                 bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8)).grid(
+                 row=15, column=2, columnspan=4, sticky='w', pady=(6, 0))
         _lbl(top, "每日進場上限").grid(row=3, column=0, sticky='w', pady=(6, 0))
         e_maxd = _ent(top, s.get('max_trades_per_day', 3), 6); e_maxd.grid(row=3, column=1, padx=4, pady=(6, 0))
         _lbl(top, "冷卻秒數").grid(row=3, column=2, sticky='w', padx=(10, 0), pady=(6, 0))
@@ -11129,6 +11143,8 @@ class StockTradingAppPro(tk.Tk):
             s['account_id'] = _ids2[cb_acct2.current()] if cb_acct2.current() >= 0 else 'default'
             # 【ADR-110階段2】實單要下到哪一家券商的哪一個帳號
             s['broker'], s['broker_account'] = _live_get()
+            try: s['max_entries'] = int(e_maxent.get().strip())
+            except (TypeError, ValueError): s['max_entries'] = 1
             try: s['max_trades_per_day'] = int(e_maxd.get().strip())
             except (TypeError, ValueError): s['max_trades_per_day'] = 3
             s['entry_time_start'] = e_en_st.get().strip()
@@ -12488,6 +12504,91 @@ class StockTradingAppPro(tk.Tk):
         self.log_message(f"【回測-驗算】「{s.get('name')}」{passed}/{total} 項一致。"
                          + ("" if all_ok else " 有不一致項目,請開驗算視窗檢視。"))
 
+    def _qt_build_backtest_log_tab(self, parent, s, result):
+        """【ADR-144】回測報告的「訊息 / 紀錄」分頁。
+
+        每一列 = 引擎在某一根 K 棒上做了什麼、或**沒做什麼以及為什麼**。
+        後者才是這個分頁真正的價值:使用者原本看到的是「一年只買一次」,
+        卻不知道原因;現在紀錄會直接寫著
+        「已持倉,且『可分批進場次數』是 1 —— 要先平倉才能再進場」。
+        """
+        rows = list(result.get('log') or [])
+        _kinds = {r.get('kind', '') for r in rows}
+
+        head = tk.Frame(parent, bg="#1A2026"); head.pack(fill=tk.X, padx=8, pady=(8, 2))
+        tk.Label(head, text="回測過程訊息紀錄", bg="#1A2026", fg="#FFCA28",
+                 font=('微軟正黑體', 10, 'bold')).pack(side=tk.LEFT)
+        tk.Label(head, text=f"共 {len(rows)} 列", bg="#1A2026", fg="#8A99AD",
+                 font=('微軟正黑體', 9)).pack(side=tk.LEFT, padx=(8, 0))
+
+        # 種類篩選:訊息一多,使用者通常只想看「未進場」或只想看成交
+        var_kind = tk.StringVar(value='全部')
+        tk.Label(head, text="只看", bg="#1A2026", fg="white",
+                 font=('微軟正黑體', 9)).pack(side=tk.LEFT, padx=(14, 2))
+        cb_kind = ttk.Combobox(head, textvariable=var_kind, width=10, state='readonly',
+                               style="BlackText.TCombobox",
+                               values=['全部'] + sorted(k for k in _kinds if k))
+        cb_kind.pack(side=tk.LEFT)
+
+        tk.Label(parent, text=("※「未進場」= 進場條件當根成立、但被部位狀態或風控擋下,"
+                               "括號裡的「連續 N 根」是同一個原因連續發生幾根。\n"
+                               "※ 想讓同一段部位可以買第二筆,請在策略編輯器把"
+                               "「可分批進場次數」調大 (1 = 買了就一定要先平倉)。"),
+                 bg="#12181F", fg="#8A99AD", font=('微軟正黑體', 8), wraplength=1080,
+                 justify='left').pack(fill=tk.X, padx=8, pady=(2, 6))
+
+        fr = tk.Frame(parent, bg="#1A2026"); fr.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        cols = ("ts", "kind", "text")
+        tvl = ttk.Treeview(fr, columns=cols, show="headings", style='Trades.Treeview')
+        for c, h, w in (("ts", "時間", 150), ("kind", "種類", 80), ("text", "訊息", 880)):
+            tvl.heading(c, text=h)
+            tvl.column(c, width=w, anchor=("center" if c != "text" else "w"))
+        tvl.tag_configure('k_open', foreground='#FF1744')
+        tvl.tag_configure('k_close', foreground='#00E676')
+        tvl.tag_configure('k_block', foreground='#FFCA28')
+        vsb = ttk.Scrollbar(fr, orient="vertical", command=tvl.yview)
+        tvl.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        tvl.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        def _fmt_ts(ts):
+            try:
+                return str(ts.strftime('%Y-%m-%d %H:%M')).replace(' 00:00', '')
+            except Exception:
+                return str(ts) if ts is not None else '--'
+
+        def _fill(*_a):
+            for iid in tvl.get_children():
+                tvl.delete(iid)
+            want = var_kind.get()
+            n = 0
+            for r in rows:
+                kind = str(r.get('kind', ''))
+                if want != '全部' and kind != want:
+                    continue
+                tag = ('k_open' if kind in ('進場', '加碼')
+                       else 'k_close' if kind in ('出場', '期末結算')
+                       else 'k_block' if kind in ('未進場', '截斷') else '')
+                tvl.insert("", tk.END, values=(_fmt_ts(r.get('ts')), kind,
+                                               str(r.get('text', ''))), tags=(tag,))
+                n += 1
+            if n == 0:
+                tvl.insert("", tk.END, values=("--", "", "(這個種類沒有任何紀錄)"))
+        cb_kind.bind("<<ComboboxSelected>>", _fill)
+        _fill()
+
+        def _copy_all():
+            try:
+                txt = "\n".join(f"{_fmt_ts(r.get('ts'))}\t{r.get('kind','')}\t{r.get('text','')}"
+                                for r in rows)
+                self.clipboard_clear(); self.clipboard_append(txt)
+                self.log_message(f"【回測-訊息紀錄】已複製 {len(rows)} 列到剪貼簿。")
+            except Exception as e:
+                self.log_message(f"【回測-訊息紀錄】複製失敗: {e}")
+        tk.Button(parent, text="📋 複製全部訊息", bg="#2A323D", fg="white", relief="flat",
+                  font=('微軟正黑體', 9), padx=12, command=_copy_all).pack(anchor='w',
+                                                                          padx=8, pady=(0, 8))
+
     def _qt_show_backtest_report(self, s, df, result):
         """回測報告視窗:績效數字 + 資金曲線 + K線標點 + 每筆交易明細。"""
         m = result['metrics']
@@ -12560,9 +12661,25 @@ class StockTradingAppPro(tk.Tk):
         except Exception:
             pass
 
+        # ============================================================
+        # 【ADR-144】分頁:績效/明細 一頁,訊息紀錄 一頁
+        # ============================================================
+        # 使用者要求:「回測系統要有『訊息 / 紀錄 / Log』標籤頁可以看」。
+        # 這一頁的價值不只是「有紀錄」—— 它要回答的是使用者真正的問題:
+        # 「為什麼一年只買一次?」。引擎現在會把「進場條件成立卻被擋下」
+        # 的原因寫進紀錄 (見 core/backtest.py 的 _log),打開分頁就看得到。
+        nb = ttk.Notebook(dlg)
+        nb.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 0))
+        _host = tk.Frame(nb, bg="#1A2026")
+        nb.add(_host, text="  📊 績效與交易明細  ")
+        tab_log = tk.Frame(nb, bg="#1A2026")
+        _log_rows = list(result.get('log') or [])
+        nb.add(tab_log, text=f"  📋 訊息 / 紀錄 ({len(_log_rows)})  ")
+        self._qt_build_backtest_log_tab(tab_log, s, result)
+
         # --- 上方:績效數字 ---
         pf = "∞" if m['profit_factor'] == float('inf') else f"{m['profit_factor']:.2f}"
-        summary = tk.Frame(dlg, bg="#12161A"); summary.pack(fill=tk.X, padx=10, pady=(10, 4))
+        summary = tk.Frame(_host, bg="#12161A"); summary.pack(fill=tk.X, padx=10, pady=(10, 4))
         cells = [
             ("淨損益(扣成本)", f"{_fmt_amt_signed(m['total_pnl'])}", '#FF1744' if m['total_pnl'] > 0 else ('#00E676' if m['total_pnl'] < 0 else 'white')),
             ("報酬率", f"{m['total_return_pct']:+.2f}%", '#FF1744' if m['total_return_pct'] > 0 else ('#00E676' if m['total_return_pct'] < 0 else 'white')),
@@ -12639,18 +12756,18 @@ class StockTradingAppPro(tk.Tk):
             cell = tk.Frame(summary, bg="#12161A"); cell.grid(row=3, column=i, padx=10, pady=(0, 6))
             tk.Label(cell, text=lab, bg="#12161A", fg="#8A99AD", font=('微軟正黑體', 8)).pack()
             tk.Label(cell, text=val, bg="#12161A", fg=col, font=('微軟正黑體', 11, 'bold')).pack()
-        tk.Label(dlg, text=("※「最大回撤」是資金曲線從歷史高點往下的最大跌幅 (可能由連續多筆虧損累積而成),"
+        tk.Label(_host, text=("※「最大回撤」是資金曲線從歷史高點往下的最大跌幅 (可能由連續多筆虧損累積而成),"
                             "不等於單筆最大虧損 —— 單筆極值請看「最大單筆獲利/虧損」。"),
                  bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8)).pack(anchor='w', padx=12)
         # 【ADR-059】期間資訊也顯示在報告內容裡 (標題列可能被視窗寬度截掉)
-        tk.Label(dlg, text=f"※ 回測期間:{_rng_txt}",
+        tk.Label(_host, text=f"※ 回測期間:{_rng_txt}",
                  bg="#1A2026", fg="#29B6F6", font=('微軟正黑體', 9, 'bold')).pack(anchor='w', padx=12, pady=(4, 0))
         # 【ADR-059】Buy & Hold / 期末結算的誠實揭露
         if m.get('buy_and_hold_mode'):
             # 【ADR-061】累積買進的核心數字獨立一列 —— 這就是使用者要拿來比較的
             # 「總持有成本」:總共買了幾次、投入多少、平均成本多少、現在值多少。
             _unit = '口' if str(s.get('market')) == '台期貨' else ('股' if strategy_engine.trade_type_of(s) == '零股' else '張')
-            tk.Label(dlg, text=(
+            tk.Label(_host, text=(
                 f"📌 累積買進彙總:買進 {m.get('bnh_buys', 0):,} 次 → 累計部位 {m.get('bnh_total_qty', 0):,} {_unit}"
                 f"　|　加權平均成本 {m.get('bnh_avg_cost', 0):,.2f}　|　期末價 {m.get('bnh_final_price', 0):,.2f}\n"
                 f"　　總持有成本(投入本金) {_fmt_amt(m.get('bnh_total_invested', 0))}"
@@ -12666,13 +12783,13 @@ class StockTradingAppPro(tk.Tk):
             else:
                 _bnh_note += ("\n　 ⚠ 本回測使用未還原權息的價格,長期持有的股利收益「未」計入,"
                               "真實報酬會比這裡高。")
-            tk.Label(dlg, text=_bnh_note, bg="#1A2026", fg="#FFCA28",
+            tk.Label(_host, text=_bnh_note, bg="#1A2026", fg="#FFCA28",
                      font=('微軟正黑體', 8), justify=tk.LEFT).pack(anchor='w', padx=12)
         elif m.get('settled_open_at_end'):
-            tk.Label(dlg, text=("※ 回測結束時仍有未平倉部位,已用最後一根收盤價結算為一筆交易 "
+            tk.Label(_host, text=("※ 回測結束時仍有未平倉部位,已用最後一根收盤價結算為一筆交易 "
                                 "(出場原因標示「回測期末結算」);若不結算,這段未實現損益會完全不出現在報告上。"),
                      bg="#1A2026", fg="#FFCA28", font=('微軟正黑體', 8), justify=tk.LEFT).pack(anchor='w', padx=12)
-        tk.Label(dlg, text=f"※ 成本計算:{m.get('cost_desc', '')};滑價 {s.get('slippage_ticks', 0)} 檔已計入成交價。",
+        tk.Label(_host, text=f"※ 成本計算:{m.get('cost_desc', '')};滑價 {s.get('slippage_ticks', 0)} 檔已計入成交價。",
                  bg="#1A2026", fg="#FFCA28", font=('微軟正黑體', 8)).pack(anchor='w', padx=12)
         # 【ADR-055】參數代入實證:直接顯示「策略程式碼實際讀到的參數與來源」,
         # 使用者不必靠猜判斷參數視窗有沒有生效 (拼錯 key 會被標成 ⚠)。
@@ -12680,16 +12797,16 @@ class StockTradingAppPro(tk.Tk):
             pu = custom_strategy.describe_param_usage(result.get('param_given'), result.get('param_usage'))
             if pu:
                 has_warn = '⚠' in pu
-                tk.Label(dlg, text=f"※ 參數實際代入:{pu}", bg="#1A2026",
+                tk.Label(_host, text=f"※ 參數實際代入:{pu}", bg="#1A2026",
                          fg="#FF5252" if has_warn else "#00E676",
                          font=('微軟正黑體', 8), justify=tk.LEFT, wraplength=1120).pack(anchor='w', padx=12)
         except Exception:
             pass
-        tk.Label(dlg, text="※ 回測採「委託視同成交、僅收盤評估」與實盤同一套邏輯;僅供參考,不代表未來績效。",
+        tk.Label(_host, text="※ 回測採「委託視同成交、僅收盤評估」與實盤同一套邏輯;僅供參考,不代表未來績效。",
                  bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8)).pack(anchor='w', padx=12)
 
         # --- 中間:K線+標點 與 資金曲線 (雙圖) ---
-        mid = tk.Frame(dlg, bg="#1A2026"); mid.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        mid = tk.Frame(_host, bg="#1A2026"); mid.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
         try:
             fig = plt.Figure(figsize=(10.2, 3.4), facecolor="#12161A")
             axp = fig.add_subplot(121); axe = fig.add_subplot(122)
@@ -12728,9 +12845,9 @@ class StockTradingAppPro(tk.Tk):
             tk.Label(mid, text=f"(圖表繪製失敗: {e})", bg="#1A2026", fg="#FF5252").pack()
 
         # --- 下方:每筆交易明細 ---
-        tk.Label(dlg, text="每筆交易明細:", bg="#1A2026", fg="#FFCA28",
+        tk.Label(_host, text="每筆交易明細:", bg="#1A2026", fg="#FFCA28",
                  font=('微軟正黑體', 9, 'bold')).pack(anchor='w', padx=12, pady=(4, 0))
-        tv_frame = tk.Frame(dlg, bg="#1A2026"); tv_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(2, 8))
+        tv_frame = tk.Frame(_host, bg="#1A2026"); tv_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(2, 8))
         cols = ("no", "dir", "entry_t", "entry_p", "exit_t", "exit_p", "pnl", "pnl_pct", "bars", "reason")
         heads = {"no": "#", "dir": "方向", "entry_t": "進場時間", "entry_p": "進場價",
                  "exit_t": "出場時間", "exit_p": "出場價", "pnl": "損益", "pnl_pct": "報酬%",
@@ -12762,7 +12879,7 @@ class StockTradingAppPro(tk.Tk):
                 i, t['direction'], _fmt_ts(t['entry_ts']), f"{t['entry_price']:g}",
                 exit_ts_str, f"{t['exit_price']:g}", f"{_fmt_amt_signed(t['pnl'])}",
                 f"{t['pnl_pct']:+.2f}%", t['bars_held'], t['exit_reason']), tags=(tag,))
-        tk.Button(dlg, text="關閉", bg="#2A323D", fg="white", relief="flat",
+        tk.Button(_host, text="關閉", bg="#2A323D", fg="white", relief="flat",
                   font=('微軟正黑體', 10), padx=20, pady=3, command=dlg.destroy).pack(pady=(0, 8))
 
     def _qt_open_paper_window(self):

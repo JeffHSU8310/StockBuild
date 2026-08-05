@@ -2482,6 +2482,255 @@ class TestBollingerSigmaMigration(unittest.TestCase):
             self.assertEqual(d['bb_period'], 10)   # 其他欄位沒被弄壞
 
 
+class TestScaleInADR144(unittest.TestCase):
+    """【ADR-144】分批進場 / 加碼 —— 拆掉「買了就不准再買」的限制。
+
+    使用者的原話:
+      「回測引擎非常『死腦筋』…只要你買了(狀態變成 LONG),在你把股票賣掉
+        之前,我就絕對不准你買第二筆…造成回測時一年只買一次的元兇。」
+    """
+
+    def _df(self, n=30, flat=True):
+        idx = pd.date_range('2026-01-01', periods=n, freq='D')
+        c = [100.0] * n if flat else [100.0 + i for i in range(n)]
+        return pd.DataFrame({'Open': c, 'High': [x + 1 for x in c],
+                             'Low': [x - 1 for x in c], 'Close': c,
+                             'Volume': [1000] * n}, index=idx)
+
+    def _strategy(self, **over):
+        s = strategy_engine.new_strategy()
+        s.update({'symbol': '2330', 'trade_type': '股票', 'qty': 1, 'timeframe': '日K',
+                  'direction': '做多', 'stop_loss_pct': 0.0, 'take_profit_pct': 0.0,
+                  'entry': [{'type': 'always_true', 'params': {}}],
+                  'exit_signals': []})
+        s.update(over)
+        return s
+
+    # ---------- max_entries 的語意 ----------
+
+    def test_default_is_one_so_existing_strategies_behave_exactly_as_before(self):
+        """預設 1 = 舊行為。這是整個 ADR 最重要的相容性保證。"""
+        self.assertEqual(strategy_engine.max_entries_of(strategy_engine.new_strategy()), 1)
+        self.assertEqual(strategy_engine.max_entries_of({}), 1)
+        self.assertEqual(strategy_engine.max_entries_of(None), 1)
+
+    def test_zero_or_negative_means_unlimited(self):
+        for v in (0, -1, -99):
+            self.assertEqual(strategy_engine.max_entries_of({'max_entries': v}),
+                             strategy_engine.UNLIMITED_ENTRIES, f"{v} 應視為不限")
+
+    def test_garbage_falls_back_to_one_not_unlimited(self):
+        """壞值一律退回 1(最保守),不可以退回「不限」——
+        那會讓一個打錯字的欄位變成無限加碼。"""
+        for v in ('abc', None, '', [], {}):
+            self.assertEqual(strategy_engine.max_entries_of({'max_entries': v}), 1,
+                             f"{v!r} 應退回 1")
+
+    def test_buy_and_hold_accumulate_is_unlimited_by_definition(self):
+        s = {'buy_and_hold': True, 'bnh_mode': 'accumulate', 'max_entries': 1}
+        self.assertEqual(strategy_engine.max_entries_of(s),
+                         strategy_engine.UNLIMITED_ENTRIES)
+        # 但「單筆長抱」不是累積,仍受 max_entries 管
+        self.assertEqual(
+            strategy_engine.max_entries_of({'buy_and_hold': True, 'bnh_mode': 'single'}), 1)
+
+    def test_entries_of_handles_old_runtimes_without_migration(self):
+        """舊 runtime 沒有 'entries':有部位算 1、沒部位算 0。
+        少了這條,既有策略重啟後會突然可以多買一筆。"""
+        self.assertEqual(strategy_engine.entries_of({'qty': 5}), 1)
+        self.assertEqual(strategy_engine.entries_of({'qty': 0}), 0)
+        self.assertEqual(strategy_engine.entries_of({}), 0)
+        self.assertEqual(strategy_engine.entries_of({'entries': 3, 'qty': 3}), 3)
+
+    # ---------- can_scale_in 的守門 + 原因 ----------
+
+    def test_flat_is_always_allowed(self):
+        ok, why = strategy_engine.can_scale_in({'max_entries': 1}, {'state': 'FLAT'})
+        self.assertTrue(ok)
+        self.assertEqual(why, '')
+
+    def test_blocked_reason_names_the_setting_the_user_has_to_change(self):
+        """使用者看到「一年只買一次」時最需要的就是這句話 ——
+        訊息裡必須點名是哪個設定擋的,不能只說「不行」。"""
+        ok, why = strategy_engine.can_scale_in(
+            {'max_entries': 1}, {'state': 'LONG', 'qty': 1, 'entries': 1})
+        self.assertFalse(ok)
+        self.assertIn('可分批進場次數', why)
+        ok2, why2 = strategy_engine.can_scale_in(
+            {'max_entries': 3}, {'state': 'LONG', 'qty': 3, 'entries': 3})
+        self.assertFalse(ok2)
+        self.assertIn('3', why2)
+        # 還沒到上限就要放行 (反向對照:否則等於功能沒開)
+        ok3, _ = strategy_engine.can_scale_in(
+            {'max_entries': 3}, {'state': 'LONG', 'qty': 2, 'entries': 2})
+        self.assertTrue(ok3)
+
+    # ---------- evaluate_strategy:持倉中要不要再進場 ----------
+
+    def _run(self, s, bars=6):
+        rt = strategy_engine.new_runtime()
+        df = self._df()
+        opens = 0
+        for i in range(bars):
+            rt['last_bar_ts'] = ''
+            for it in strategy_engine.evaluate_strategy(s, rt, df.iloc[:5 + i],
+                                                        float(i), '2026-01-01'):
+                if it['kind'] == 'OPEN':
+                    opens += 1
+                strategy_engine.apply_fill(s, rt, it, float(i))
+        return opens, rt
+
+    def test_default_still_buys_only_once(self):
+        """反向對照:預設值下行為必須跟以前一模一樣(只買一次)。"""
+        opens, rt = self._run(self._strategy())
+        self.assertEqual(opens, 1)
+        self.assertEqual(rt['qty'], 1)
+
+    def test_max_entries_three_buys_three_times_then_stops(self):
+        opens, rt = self._run(self._strategy(max_entries=3))
+        self.assertEqual(opens, 3, "設 3 就該買到 3 筆")
+        self.assertEqual(rt['qty'], 3)
+        self.assertEqual(rt['entries'], 3)
+
+    def test_blocked_reason_is_recorded_for_the_log_tab(self):
+        """引擎要把「為什麼沒買」留下來,回測的訊息紀錄分頁才印得出來。"""
+        _opens, rt = self._run(self._strategy())
+        self.assertTrue(rt.get('blocked_entry'), "條件成立卻沒買,必須留下原因")
+        self.assertIn('平倉', rt['blocked_entry'])
+
+    def test_scale_in_never_reverses_the_position(self):
+        """加碼的方向必須跟現有部位一致 —— 這裡是加碼不是反手。
+        接錯的話,使用者在完全沒設定反手的情況下會被反向開倉。"""
+        s = self._strategy(max_entries=3, direction='做空')
+        rt = strategy_engine.new_runtime()
+        df = self._df()
+        actions = []
+        for i in range(4):
+            rt['last_bar_ts'] = ''
+            for it in strategy_engine.evaluate_strategy(s, rt, df.iloc[:5 + i],
+                                                        float(i), '2026-01-01'):
+                actions.append(it['action'])
+                strategy_engine.apply_fill(s, rt, it, float(i))
+        self.assertEqual(actions, ['賣出'] * 3, f"做空的加碼要一律是賣出,實際 {actions}")
+        self.assertEqual(rt['state'], 'SHORT')
+
+    def test_exit_wins_over_scale_in_on_the_same_bar(self):
+        """同一根 K 棒上不可以一邊喊出場一邊加碼。"""
+        s = self._strategy(max_entries=5,
+                           exit_signals=[{'type': 'always_true', 'params': {}}])
+        rt = strategy_engine.new_runtime()
+        df = self._df()
+        rt['last_bar_ts'] = ''
+        strategy_engine.apply_fill(s, rt, strategy_engine.evaluate_strategy(
+            s, rt, df.iloc[:5], 0.0, '2026-01-01')[0], 0.0)
+        self.assertEqual(rt['state'], 'LONG')
+        rt['last_bar_ts'] = ''
+        ints = strategy_engine.evaluate_strategy(s, rt, df.iloc[:6], 1.0, '2026-01-01')
+        self.assertEqual([i['kind'] for i in ints], ['CLOSE'],
+                         f"出場那一根不可以同時加碼,實際 {ints}")
+
+    def test_stop_loss_uses_average_cost_after_scaling_in(self):
+        """加碼後停損要用**加權平均成本**判斷,不是最後一筆的價格。"""
+        s = self._strategy(max_entries=2, stop_loss_pct=5.0)
+        rt = strategy_engine.new_runtime()
+        strategy_engine.apply_fill(s, rt, {'kind': 'OPEN', 'action': '買進',
+                                           'qty': 1, 'price': 100.0}, 1.0)
+        strategy_engine.apply_fill(s, rt, {'kind': 'OPEN', 'action': '買進',
+                                           'qty': 1, 'price': 200.0}, 2.0)
+        self.assertAlmostEqual(rt['entry_price'], 150.0)
+        # 均價 150 的 5% 停損 = 142.5
+        self.assertIsNone(strategy_engine.check_bar_stop(s, rt, 143.0))
+        self.assertIsNotNone(strategy_engine.check_bar_stop(s, rt, 142.0))
+
+    # ---------- 回測 ----------
+
+    def _rise_then_drop(self, n=30, drop_at=12):
+        """先漲一段(進場+加碼),再一根大跌(觸發出場訊號)。"""
+        idx = pd.date_range('2026-01-01', periods=n, freq='D')
+        c = []
+        for i in range(n):
+            c.append(100.0 + i if i < drop_at else 60.0)
+        return pd.DataFrame({'Open': c, 'High': [x + 1 for x in c],
+                             'Low': [x - 1 for x in c], 'Close': c,
+                             'Volume': [1000] * n}, index=idx)
+
+    def test_backtest_produces_one_trade_row_per_lot_on_settlement(self):
+        """期末結算路徑:每一筆 lot 各一列。"""
+        s = self._strategy(max_entries=3,
+                           exit_signals=[{'type': 'pct_change_below',
+                                          'params': {'value': -99}}])
+        r = backtest.run_backtest(s, self._df(n=40, flat=False))
+        self.assertEqual(len(r['trades']), 3,
+                         "分 3 筆進場就該有 3 列交易明細 (使用者要看到買在哪幾個價位)")
+        self.assertEqual(len({t['entry_price'] for t in r['trades']}), 3,
+                         "三筆的進場價應各不相同")
+
+    def test_backtest_closes_every_lot_on_an_exit_signal(self):
+        """**出場訊號**路徑也要平掉每一筆 lot,不是只平第一筆。
+
+        這條與上面那條走的是完全不同的程式碼(CLOSE 分支 vs 期末結算)。
+        第一版只有期末結算那條,於是「平倉只結算第一筆」的突變照樣全綠 ——
+        因為那個測試的部位根本不是被出場訊號平掉的(P-124)。
+        """
+        s = self._strategy(max_entries=3,
+                           exit_signals=[{'type': 'pct_change_below',
+                                          'params': {'value': -20.0}}])
+        r = backtest.run_backtest(s, self._rise_then_drop())
+        closed = [t for t in r['trades'] if '出場訊號' in str(t.get('exit_reason', ''))]
+        self.assertEqual(len(closed), 3,
+                         f"3 筆 lot 都要被出場訊號平掉,實際 {len(closed)} 筆 "
+                         f"({[t.get('exit_reason') for t in r['trades']]})")
+        self.assertEqual(len({t['entry_price'] for t in closed}), 3,
+                         "三筆的進場價應各不相同 (證明不是同一筆被記三次)")
+        # 平倉後才可以再進場 —— 部位真的空了
+        self.assertTrue(any(x['kind'] == '出場' for x in r['log']))
+
+    def test_backtest_default_unchanged(self):
+        """反向對照:預設值下回測結果必須跟加這個功能之前一樣。"""
+        r = backtest.run_backtest(self._strategy(), self._df(n=40, flat=False))
+        self.assertEqual(len(r['trades']), 1)
+
+    def test_backtest_log_explains_why_nothing_happened(self):
+        """使用者要的「訊息 / 紀錄」分頁,核心價值就是這一條。"""
+        r = backtest.run_backtest(self._strategy(), self._df(n=40, flat=False))
+        kinds = [x['kind'] for x in r['log']]
+        self.assertIn('進場', kinds)
+        self.assertIn('未進場', kinds)
+        blocked = [x for x in r['log'] if x['kind'] == '未進場']
+        self.assertTrue(blocked)
+        self.assertIn('可分批進場次數', blocked[0]['text'])
+
+    def test_log_collapses_consecutive_identical_reasons(self):
+        """同一個原因連續幾百根,要合併成一列並標明次數 ——
+        逐根印出來會有幾萬列,使用者反而看不到重點。"""
+        r = backtest.run_backtest(self._strategy(), self._df(n=60, flat=False))
+        blocked = [x for x in r['log'] if x['kind'] == '未進場']
+        self.assertEqual(len(blocked), 1, "連續相同的原因要合併成一列")
+        self.assertGreater(blocked[0]['n'], 5)
+        self.assertIn('連續', blocked[0]['text'])
+
+    def test_log_is_bounded(self):
+        self.assertLessEqual(backtest.LOG_MAX_ROWS, 20000)
+        r = backtest.run_backtest(self._strategy(max_entries=0),
+                                  self._df(n=200, flat=False))
+        self.assertLessEqual(len(r['log']), backtest.LOG_MAX_ROWS + 1)
+
+    def test_empty_result_has_log_key(self):
+        """報告視窗會讀 result['log'],沒有這個 key 會 KeyError。"""
+        self.assertIn('log', backtest._empty_result())
+        r = backtest.run_backtest(self._strategy(), self._df(n=2))
+        self.assertIn('log', r)
+
+    def test_backtest_with_no_trades_says_why(self):
+        """一筆交易都沒有時,紀錄要回答「為什麼」,不是空白分頁。"""
+        s = self._strategy(entry=[{'type': 'pct_change_above',
+                                   'params': {'value': 9999}}])
+        r = backtest.run_backtest(s, self._df(n=40, flat=False))
+        self.assertEqual(len(r['trades']), 0)
+        self.assertTrue(r['log'], "沒有交易時更需要訊息紀錄")
+        self.assertTrue(any('沒有' in x['text'] for x in r['log']))
+
+
 class TestDayPctChangeConditions(unittest.TestCase):
     """【ADR-143】當日(盤中)漲跌幅條件:「A 跌超過 X% 就買 B、漲超過 Y% 就賣 B」。
 
@@ -3560,16 +3809,42 @@ class TestBuyAndHoldADR059(unittest.TestCase):
         self.assertEqual(rt['qty'], 4)
         self.assertAlmostEqual(rt['entry_price'], (100.0 * 1 + 200.0 * 3) / 4)
 
-    def test_normal_strategy_still_overwrites_not_accumulates(self):
-        """非買進持有的一般策略,行為完全不變 (仍是覆蓋,不累積)。"""
+    def test_same_direction_refill_accumulates_adr144(self):
+        """【ADR-144 行為變更】同方向再次成交 = **加碼**,不再覆蓋。
+
+        原本這條測試斷言「一般策略仍是覆蓋」(qty=3、成本=200)。那個行為是
+        **錯的**,只是被「持倉中不評估進場條件」的閘門遮住了 —— 一旦真的發生
+        第二筆成交,覆蓋會讓第一筆的成本基礎憑空消失,停損停利跟著算錯。
+        ADR-144 開放分批進場之後,這件事會真的發生,所以改成加權平均成本。
+
+        `apply_fill` 是「已經成交了,更新狀態」——「該不該買第二筆」是
+        `evaluate_strategy` / `can_scale_in()` 的職責,不是這裡的。
+        """
         s = self._bnh_strategy(); s['buy_and_hold'] = False
         rt = strategy_engine.new_runtime()
         strategy_engine.apply_fill(s, rt, {'kind': 'OPEN', 'action': '買進',
                                            'qty': 1, 'price': 100.0}, 1.0)
         strategy_engine.apply_fill(s, rt, {'kind': 'OPEN', 'action': '買進',
                                            'qty': 3, 'price': 200.0}, 2.0)
-        self.assertEqual(rt['qty'], 3)
-        self.assertAlmostEqual(rt['entry_price'], 200.0)
+        self.assertEqual(rt['qty'], 4, "同方向加碼要累加數量")
+        self.assertAlmostEqual(rt['entry_price'], (100.0 * 1 + 200.0 * 3) / 4,
+                               msg="成本要變成加權平均,不是被最後一筆蓋掉")
+        self.assertEqual(rt['entries'], 2)
+
+    def test_first_entry_after_flat_does_not_accumulate(self):
+        """反向對照:平倉之後的第一筆是全新部位,不可以跟上一段混在一起。"""
+        s = self._bnh_strategy(); s['buy_and_hold'] = False
+        rt = strategy_engine.new_runtime()
+        strategy_engine.apply_fill(s, rt, {'kind': 'OPEN', 'action': '買進',
+                                           'qty': 2, 'price': 100.0}, 1.0)
+        strategy_engine.apply_fill(s, rt, {'kind': 'CLOSE', 'action': '賣出',
+                                           'qty': 2, 'price': 110.0}, 2.0)
+        self.assertEqual(rt['entries'], 0, "平倉要把分批計數歸零")
+        strategy_engine.apply_fill(s, rt, {'kind': 'OPEN', 'action': '買進',
+                                           'qty': 1, 'price': 300.0}, 3.0)
+        self.assertEqual(rt['qty'], 1)
+        self.assertAlmostEqual(rt['entry_price'], 300.0)
+        self.assertEqual(rt['entries'], 1)
 
     def test_settle_can_be_disabled(self):
         r = backtest.run_backtest(self._bnh_strategy(), self._df(), settle_open_at_end=False)
