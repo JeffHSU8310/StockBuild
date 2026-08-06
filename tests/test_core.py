@@ -9175,5 +9175,313 @@ class TestTelegramBurstThrottle(unittest.TestCase):
         self.assertEqual(len(keys), 3)
 
 
+class TestEntryTimeGate(unittest.TestCase):
+    """【ADR-149】進場時間閘門 —— K棒路徑與即時路徑必須用同一份規則。
+
+    ADR-145 的即時進場通道原本**一行時間判斷都沒有**:使用者設「只在 12:01
+    進場」,只要同時勾了即時進場,任何時間都可能被開倉。那比「條件到了卻沒
+    動作」更嚴重 —— 是在他明確不想下單的時間下了真錢的單。
+    """
+
+    def _s(self, **kw):
+        s = strategy_engine.new_strategy()
+        s.update({'name': 'T', 'symbol': '2330'})
+        s.update(kw)
+        return s
+
+    def test_no_setting_means_no_gate(self):
+        ok, why = strategy_engine.entry_time_gate(self._s(), '12:01:00')
+        self.assertTrue(ok)
+        self.assertEqual(why, '')
+
+    def test_specific_entry_time_keeps_exact_match_semantics(self):
+        """刻意**不改** specific_entry_time 的語意(ADR-066 定的、ADR-147 決定
+        不動)。要在指定時刻進場,對的工具是 ADR-147 的「定時下單」。"""
+        s = self._s(specific_entry_time='12:01')
+        self.assertTrue(strategy_engine.entry_time_gate(s, '12:01:00')[0])
+        self.assertFalse(strategy_engine.entry_time_gate(s, '12:01:30')[0])
+        self.assertFalse(strategy_engine.entry_time_gate(s, '12:02:00')[0])
+
+    def test_entry_time_window_still_works(self):
+        s = self._s(entry_time_start='09:30', entry_time_end='11:00')
+        self.assertTrue(strategy_engine.entry_time_gate(s, '10:00:00')[0])
+        self.assertFalse(strategy_engine.entry_time_gate(s, '11:30:00')[0])
+
+    def test_blocked_reason_is_human_readable(self):
+        """被擋要講得出原因 —— 『條件到了卻沒動作,查無原因』是這專案的老問題。"""
+        s = self._s(specific_entry_time='12:01')
+        ok, why = strategy_engine.entry_time_gate(s, '13:00:00')
+        self.assertFalse(ok)
+        self.assertIn('12:01', why)
+        self.assertIn('13:00:00', why)
+
+    def test_realtime_entry_respects_the_gate(self):
+        s = self._s(trade_type='股票', realtime_entry=True,
+                    entry_time_start='09:00', entry_time_end='10:00',
+                    entry=[{'type': 'day_drop_over', 'params': {'value': 3.0}}])
+        rt = strategy_engine.new_runtime()
+        idx = pd.to_datetime(['2026-08-05 13:30', '2026-08-06 09:05'])
+        df = pd.DataFrame({'Open': [100.0, 100.0], 'High': [100.0, 100.0],
+                           'Low': [100.0, 100.0], 'Close': [100.0, 100.0]}, index=idx)
+        # 跌 5% > 3%,條件本身成立
+        self.assertIsNotNone(
+            strategy_engine.check_realtime_entry(s, rt, df, 95.0, now_hhmmss='09:30:00'))
+        # 同樣的條件,時間不對就不可以進場
+        self.assertIsNone(
+            strategy_engine.check_realtime_entry(s, rt, df, 95.0, now_hhmmss='13:20:00'))
+
+    def test_omitting_now_keeps_backward_compatible_behaviour(self):
+        """不帶 now_hhmmss 時維持舊行為(不擋) —— 其他呼叫端不受影響。"""
+        s = self._s(trade_type='股票', realtime_entry=True,
+                    entry_time_start='09:00', entry_time_end='10:00',
+                    entry=[{'type': 'day_drop_over', 'params': {'value': 3.0}}])
+        rt = strategy_engine.new_runtime()
+        idx = pd.to_datetime(['2026-08-05 13:30', '2026-08-06 09:05'])
+        df = pd.DataFrame({'Open': [100.0, 100.0], 'High': [100.0, 100.0],
+                           'Low': [100.0, 100.0], 'Close': [100.0, 100.0]}, index=idx)
+        self.assertIsNotNone(strategy_engine.check_realtime_entry(s, rt, df, 95.0))
+
+    def test_gate_is_shared_with_the_bar_path(self):
+        """兩條會下單的路徑對『使用者設的進場時間』不可以有兩種答案。"""
+        s = self._s(entry_time_start='09:30', entry_time_end='11:00')
+        intents = [{'kind': 'OPEN', 'action': '買進', 'qty': 1, 'price': 100.0, 'reason': 'x'}]
+        for t in ('09:29:59', '09:30:00', '11:00:00', '11:00:01'):
+            bar_ok = bool(strategy_engine.filter_intents_by_time(
+                intents, s, f'2026-08-06 {t}'))
+            gate_ok = strategy_engine.entry_time_gate(s, t)[0]
+            self.assertEqual(bar_ok, gate_ok, t)
+
+    def test_exit_intents_are_not_affected_by_entry_gate(self):
+        """反向對照:出場單不受**進場**時間窗限制,持倉一定要出得去。"""
+        s = self._s(specific_entry_time='12:01')
+        intents = [{'kind': 'CLOSE', 'action': '賣出', 'qty': 1, 'price': 100.0, 'reason': 'x'}]
+        self.assertEqual(len(strategy_engine.filter_intents_by_time(
+            intents, s, '2026-08-06 14:00:00')), 1)
+
+    def test_timed_entry_is_not_touched_by_this_gate(self):
+        """反向對照:ADR-147 的「定時下單」有自己的時刻邏輯,
+        不可以被這道閘門連坐擋掉(它用的是 timed_entry_time,不是 entry_* 欄位)。"""
+        s = self._s(timed_entry=True, timed_entry_time='12:01',
+                    timed_entry_window_min=5)
+        ok, _ = strategy_engine.entry_time_gate(s, '13:00:00')
+        self.assertTrue(ok, '只設定時下單時,進場時間閘門不該擋任何東西')
+
+
+class TestBacktestRiskGuards(unittest.TestCase):
+    """【ADR-150】回測要套用與實盤**同一份** risk_check。
+
+    使用者:「我預設每天只進場一次,但是適用1分K週期,變成每1分就重新計算,
+    導致一天只要達到條件,就一直重複買進,這不符合我的需求。不論是幾分K,
+    只要是在一天之中,有成交就算數,就不能再重複買進。」
+
+    根因:回測**從來沒有呼叫過 risk_check** —— 它直接
+    `evaluate_strategy` → `apply_fill`,而 `_relax_realtime_guards()` 還把
+    每日上限設成 10**9。所以回測數字與實盤行為對不上,而回測的用途正是預估實盤。
+    """
+
+    def _df(self, days=5, per_day=270, start_day=5):
+        idx = []
+        for d in range(days):
+            idx += list(pd.date_range(f"2026-01-{start_day + d} 09:00",
+                                      periods=per_day, freq="1min"))
+        idx = pd.DatetimeIndex(idx)
+        base = np.linspace(100, 140, len(idx))
+        return pd.DataFrame({'Open': base, 'High': base + 0.5, 'Low': base - 0.5,
+                             'Close': base + 0.2, 'Volume': [1000] * len(idx)}, index=idx)
+
+    def _s(self, **kw):
+        s = strategy_engine.new_strategy()
+        s.update({'name': 'T', 'symbol': '0050', 'trade_type': '零股', 'market': '台股',
+                  'qty': 999, 'timeframe': '1分K', 'direction': '做多',
+                  'max_trades_per_day': 1, 'cooldown_sec': 0,
+                  'stop_loss_pct': 0.0, 'take_profit_pct': 0.0,
+                  'buy_and_hold': True, 'bnh_mode': 'accumulate', 'max_entries': 2,
+                  'entry': [{'type': 'always_true', 'params': {}}], 'exit_signals': []})
+        s.update(kw)
+        return s
+
+    def _per_day(self, result):
+        from collections import Counter
+        return dict(Counter(str(t['entry_ts'])[:10] for t in result['trades']))
+
+    def test_daily_entry_cap_is_enforced_by_default(self):
+        """使用者的實際設定:1分K + 每日上限 1 → 一天就是一筆。"""
+        r = backtest.run_backtest(self._s(), self._df())
+        self.assertTrue(r['trades'], '應該要有交易')
+        for day, n in self._per_day(r).items():
+            self.assertEqual(n, 1, f"{day} 進場 {n} 次,每日上限是 1")
+
+    def test_cap_resets_across_days(self):
+        """每日上限是「每日」—— 跨日要重置,不是整段期間只准一次。"""
+        r = backtest.run_backtest(self._s(), self._df(days=5))
+        self.assertEqual(len(self._per_day(r)), 5, '5 個交易日都該有進場')
+
+    def test_cap_value_is_respected(self):
+        r = backtest.run_backtest(self._s(max_trades_per_day=2), self._df())
+        for day, n in self._per_day(r).items():
+            self.assertEqual(n, 2, f"{day} 進場 {n} 次,每日上限是 2")
+
+    def test_buy_and_hold_accumulate_does_not_bypass_the_cap(self):
+        """反向對照:Buy&Hold「累積加碼」是使用者截圖裡的設定 ——
+        「每次條件成立就再買固定數量」不可以繞過每日上限。"""
+        r = backtest.run_backtest(
+            self._s(buy_and_hold=True, bnh_mode='accumulate', max_entries=99),
+            self._df(days=2))
+        for day, n in self._per_day(r).items():
+            self.assertEqual(n, 1, f"{day} 進場 {n} 次 —— 累積加碼繞過了每日上限")
+
+    def test_timeframe_does_not_change_the_cap(self):
+        """使用者原話:「不論是幾分K」。週期只改變評估頻率,不該改變每日次數。"""
+        counts = []
+        for tf, freq in (('1分K', '1min'), ('5分K', '5min'), ('15分K', '15min')):
+            idx = pd.date_range("2026-01-05 09:00", periods=60, freq=freq)
+            base = np.linspace(100, 120, len(idx))
+            df = pd.DataFrame({'Open': base, 'High': base + 0.5, 'Low': base - 0.5,
+                               'Close': base + 0.2, 'Volume': [1000] * len(idx)}, index=idx)
+            r = backtest.run_backtest(self._s(timeframe=tf), df)
+            counts.append((tf, sum(self._per_day(r).values())))
+        for tf, n in counts:
+            self.assertLessEqual(n, 1, f"{tf} 在單一交易日進場 {n} 次,上限是 1")
+
+    def test_cooldown_uses_real_seconds_not_bar_index(self):
+        """回測的 now_ts 是**K 棒序號**,拿它比「冷卻 3600 秒」會把 3600 當成
+        3600 根 K 棒 —— 冷卻會變成永遠擋著。必須換成真實時間戳。"""
+        df = self._df(days=1, per_day=270)
+        r = backtest.run_backtest(
+            self._s(max_trades_per_day=99, cooldown_sec=3600), df)
+        n = sum(self._per_day(r).values())
+        # 270 分鐘的交易日、冷卻 1 小時 → 大約 5 筆;若冷卻被當成「3600 根K棒」
+        # 就會是 1 筆,若完全沒套用就會是好幾百筆。
+        self.assertGreater(n, 1, '冷卻被當成 K 棒數,整天只進場一次')
+        self.assertLess(n, 20, '冷卻完全沒有生效')
+
+    def test_blocked_entries_are_reported_not_silent(self):
+        """被擋下要看得見 —— 「條件到了卻沒動作,查無原因」是這專案的老問題。"""
+        r = backtest.run_backtest(self._s(), self._df(days=1))
+        blocked = [l for l in r['log'] if l.get('kind') == '風控擋單']
+        self.assertTrue(blocked, '風控擋單要記進回測的訊息紀錄')
+        self.assertIn('每日進場上限', blocked[0].get('_raw') or blocked[0].get('text', ''))
+
+    def test_opt_out_restores_pure_signal_view(self):
+        """反向對照:要看「純訊號績效」時,舊行為仍然拿得到。"""
+        r = backtest.run_backtest(self._s(), self._df(days=1), apply_risk_guards=False)
+        n = sum(self._per_day(r).values())
+        self.assertGreater(n, 50, '關掉風控時應該回到「每根K棒都能進場」的舊行為')
+
+    def test_exit_is_never_blocked_by_entry_guards(self):
+        """出場單不受每日次數/冷卻/熔斷限制 —— 持倉一定要出得去 (ADR-035 §7)。"""
+        rt = strategy_engine.new_runtime()
+        rt.update({'state': 'LONG', 'qty': 1, 'trades_today': 99, 'last_order_ts': 1e9})
+        s = self._s(max_trades_per_day=1, cooldown_sec=99999, daily_loss_limit=1)
+        rt['realized_pnl_today'] = -999999.0
+        ok, why = strategy_engine.risk_check(
+            s, rt, {'kind': 'CLOSE', 'action': '賣出', 'qty': 1, 'price': 100.0}, 1e9)
+        self.assertTrue(ok, f'出場不可以被進場風控擋下: {why}')
+
+
+class TestBacktestCustomStrategyGuards(unittest.TestCase):
+    """【ADR-150】**自訂策略**的回測路徑不經過 evaluate_strategy,
+    換日重置與每日上限都得靠 backtest 自己補上。
+
+    這一組是突變測試逼出來的:把 `reset_daily_counters()` 那一行拿掉,
+    原本的測試全部照過 —— 因為它們測的都是內建策略。少了這一份,
+    `trades_today` 會一路累加,跑幾天之後每一筆進場都被擋,
+    而且看起來像是策略不再有訊號。
+    """
+
+    # 有部位就平、沒部位就買 —— 一定要一買一賣輪流,才會每天重新進場;
+    # 一直回 'BUY' 的話持倉不動,根本驗不到「每日上限/換日重置」。
+    SRC = ("def on_bar(ctx):\n"
+           "    return 'CLOSE' if ctx.position != 'FLAT' else 'BUY'\n")
+
+    def _df(self, days=4, per_day=60):
+        idx = []
+        for d in range(days):
+            idx += list(pd.date_range(f"2026-01-{5 + d} 09:00",
+                                      periods=per_day, freq="1min"))
+        idx = pd.DatetimeIndex(idx)
+        base = np.linspace(100, 130, len(idx))
+        return pd.DataFrame({'Open': base, 'High': base + 0.5, 'Low': base - 0.5,
+                             'Close': base + 0.2, 'Volume': [1000] * len(idx)}, index=idx)
+
+    def _s(self, **kw):
+        s = strategy_engine.new_strategy()
+        s.update({'name': 'C', 'symbol': '0050', 'trade_type': '股票', 'market': '台股',
+                  'qty': 1, 'timeframe': '1分K', 'direction': '做多',
+                  'kind': 'custom', 'source_code': self.SRC,
+                  'max_trades_per_day': 1, 'cooldown_sec': 0,
+                  'stop_loss_pct': 0.0, 'take_profit_pct': 0.0,
+                  'max_entries': 99, 'entry': [], 'exit_signals': []})
+        s.update(kw)
+        return s
+
+    def _per_day(self, result):
+        from collections import Counter
+        return dict(Counter(str(t['entry_ts'])[:10] for t in result['trades']))
+
+    def test_custom_strategy_respects_daily_cap(self):
+        r = backtest.run_backtest(self._s(), self._df())
+        self.assertTrue(r['trades'], '自訂策略應該要有交易')
+        for day, n in self._per_day(r).items():
+            self.assertEqual(n, 1, f"{day} 進場 {n} 次,每日上限是 1")
+
+    def test_custom_strategy_counter_resets_each_day(self):
+        """少了換日重置的話,只有第一天進得去,後面幾天全被擋 —— 這正是
+        突變測試沒被抓到的那個缺口。"""
+        days = 4
+        r = backtest.run_backtest(self._s(), self._df(days=days))
+        self.assertEqual(len(self._per_day(r)), days,
+                         f"每一個交易日都該有機會進場,實際只有 {self._per_day(r)}")
+
+    def test_custom_strategy_opt_out_still_works(self):
+        """反向對照:關掉風控時回到「每根K棒都能進場」。"""
+        r = backtest.run_backtest(self._s(), self._df(days=1),
+                                  apply_risk_guards=False)
+        self.assertGreater(sum(self._per_day(r).values()), 10)
+
+
+class TestBacktestGuardsSetting(unittest.TestCase):
+    """【ADR-150】「回測套用風控」的勾選欄位。"""
+
+    def test_defaults_to_enabled_for_legacy_strategies(self):
+        """舊策略檔沒有這個欄位 → 套用。預設值刻意不是「相容舊行為」——
+        舊行為是回測忽略你的設定,那是 bug 不是相容性。"""
+        self.assertTrue(strategy_engine.backtest_guards_enabled({}))
+        self.assertTrue(strategy_engine.backtest_guards_enabled(
+            strategy_engine.new_strategy()))
+
+    def test_can_be_turned_off(self):
+        self.assertFalse(strategy_engine.backtest_guards_enabled(
+            {'backtest_risk_guards': False}))
+
+    def test_none_is_treated_as_enabled(self):
+        self.assertTrue(strategy_engine.backtest_guards_enabled(
+            {'backtest_risk_guards': None}))
+
+
+class TestResetDailyCounters(unittest.TestCase):
+    """【ADR-150】換日重置抽成共用函式 —— 回測的自訂策略路徑不經過
+    evaluate_strategy,少了這一份 trades_today 會一路累加。"""
+
+    def test_resets_on_day_change(self):
+        rt = strategy_engine.new_runtime()
+        rt.update({'day': '2026-01-05', 'trades_today': 3, 'realized_pnl_today': -50.0})
+        self.assertTrue(strategy_engine.reset_daily_counters(rt, '2026-01-06'))
+        self.assertEqual(rt['trades_today'], 0)
+        self.assertEqual(rt['realized_pnl_today'], 0.0)
+        self.assertEqual(rt['day'], '2026-01-06')
+
+    def test_same_day_is_a_noop(self):
+        """反向對照:同一天呼叫不可以把計數洗掉,否則每日上限完全失效。"""
+        rt = strategy_engine.new_runtime()
+        rt.update({'day': '2026-01-05', 'trades_today': 3, 'realized_pnl_today': -50.0})
+        self.assertFalse(strategy_engine.reset_daily_counters(rt, '2026-01-05'))
+        self.assertEqual(rt['trades_today'], 3)
+        self.assertEqual(rt['realized_pnl_today'], -50.0)
+
+    def test_none_runtime_is_safe(self):
+        self.assertFalse(strategy_engine.reset_daily_counters(None, '2026-01-05'))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
