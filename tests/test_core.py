@@ -2482,6 +2482,143 @@ class TestBollingerSigmaMigration(unittest.TestCase):
             self.assertEqual(d['bb_period'], 10)   # 其他欄位沒被弄壞
 
 
+class TestOddLotADR146(unittest.TestCase):
+    """【ADR-146】零股機制稽核:可下單時間 09:10 之後、只能限價、數量 1~999 股。
+
+    使用者要求檢查這個機制有沒有問題。查出來的**真 bug**:策略的數量上限
+    一律用 100,但零股的單位是「股」(1~999 是交易所規則)—— 零股策略最多
+    只能買 100 股,而 500 股完全合法。
+    """
+
+    def _s(self, tt='零股', qty=1, **over):
+        s = strategy_engine.new_strategy()
+        s.update({'name': '零股測試', 'symbol': '2330', 'trade_type': tt, 'qty': qty,
+                  'direction': '做多', 'stop_loss_pct': 2.0,
+                  'entry': [{'type': 'always_true', 'params': {}}]})
+        s.update(over)
+        return s
+
+    # ---------- 一、可下單時間:09:10 ~ 13:30 ----------
+
+    def test_odd_lot_opens_at_0910_not_0900(self):
+        """盤中零股 09:10 才開盤 —— 整股 09:00 就開了,兩者不同。"""
+        wed = lambda hh, mm: datetime.datetime(2026, 8, 5, hh, mm)
+        self.assertFalse(market_session.is_market_open('零股', dt=wed(9, 0)))
+        self.assertFalse(market_session.is_market_open('零股', dt=wed(9, 9)),
+                         "09:09 還沒開盤")
+        self.assertTrue(market_session.is_market_open('零股', dt=wed(9, 10)),
+                        "09:10 整要開盤 (邊界)")
+        # 反向對照:整股 09:00 就開了,不可以被零股的規則影響
+        self.assertTrue(market_session.is_market_open('股票', dt=wed(9, 0)))
+
+    def test_odd_lot_closes_at_1330(self):
+        wed = lambda hh, mm: datetime.datetime(2026, 8, 5, hh, mm)
+        self.assertTrue(market_session.is_market_open('零股', dt=wed(13, 30)))
+        self.assertFalse(market_session.is_market_open('零股', dt=wed(13, 31)))
+
+    def test_odd_lot_closed_at_weekend(self):
+        self.assertFalse(market_session.is_market_open(
+            '零股', dt=datetime.datetime(2026, 8, 8, 10, 0)))
+
+    def test_odd_lot_open_time_is_configurable(self):
+        """【ADR-072】未來交易所改成 09:00 時要能自己切,不必改程式。"""
+        old = market_session.ODD_LOT_OPEN_MIN
+        try:
+            market_session.set_odd_lot_open_hhmm('09:00')
+            self.assertTrue(market_session.is_market_open(
+                '零股', dt=datetime.datetime(2026, 8, 5, 9, 0)))
+        finally:
+            market_session.set_odd_lot_open_minute(old)
+        self.assertFalse(market_session.is_market_open(
+            '零股', dt=datetime.datetime(2026, 8, 5, 9, 0)), "還原後要回到 09:10")
+
+    # ---------- 二、只能限價(鐵則 6) ----------
+
+    def test_odd_lot_is_always_limit_even_if_the_strategy_says_market(self):
+        for pt in ('市價', '範圍市價', '限價', '亂寫'):
+            self.assertEqual(strategy_engine.price_type_of(self._s(price_type=pt)), '限價',
+                             f"零股存了「{pt}」也必須退回限價")
+
+    def test_saving_an_odd_lot_market_strategy_is_rejected(self):
+        ok, why = strategy_engine.validate_strategy(self._s(price_type='市價'))
+        self.assertFalse(ok)
+        self.assertIn('限價', why)
+
+    def test_built_order_is_limit_rod_odd(self):
+        oi = order_intent.build_live_order(
+            self._s(qty=500, slippage_ticks=0),
+            {'kind': 'OPEN', 'action': '買進', 'qty': 500, 'price': 600.0}, 'stock')
+        self.assertEqual(oi['price_type'], '限價')
+        self.assertEqual(oi['order_lot'], '零股')
+        self.assertEqual(oi['time_in_force'], order_intent.TIF_ROD)
+        self.assertGreater(oi['price'], 0, "限價單的價格不可以送 0")
+
+    # ---------- 三、數量 1~999 股(這次抓到的真 bug) ----------
+
+    def test_odd_lot_quantity_uses_the_exchange_rule_not_the_lot_cap(self):
+        """500 股是完全合法的零股委託,不可以被「100 張」那個防呆上限擋下。"""
+        for q in (1, 100, 101, 500, 999):
+            ok, why = strategy_engine.validate_strategy(self._s(qty=q))
+            self.assertTrue(ok, f"零股 {q} 股應該存得起來,卻被擋:{why}")
+
+    def test_odd_lot_over_999_is_rejected_with_the_right_reason(self):
+        ok, why = strategy_engine.validate_strategy(self._s(qty=1000))
+        self.assertFalse(ok)
+        self.assertIn('999', why)
+        self.assertIn('交易所', why, "這是交易所規則,訊息不可以說『請調整程式碼上限』")
+        self.assertNotIn('程式碼', why)
+
+    def test_lot_products_keep_the_conservative_cap(self):
+        """反向對照:整股/期貨的 100 張/口 防呆上限不可以被放寬成 999。"""
+        for tt in ('股票', '期貨'):
+            s = self._s(tt=tt, qty=101)
+            if tt == '期貨':
+                s['market'] = '台期貨'
+            ok, why = strategy_engine.validate_strategy(s)
+            self.assertFalse(ok, f"{tt} 101 應該被擋")
+            self.assertIn('100', why)
+            self.assertIn('防呆', why, "這是本系統的上限,要跟交易所規則講清楚差別")
+            self.assertTrue(strategy_engine.validate_strategy(self._s(tt=tt, qty=100))[0]
+                            if tt == '股票' else True)
+
+    def test_send_time_guard_blocks_illegal_quantity(self):
+        """【鐵則 9】送出前在本地擋掉,不依賴券商回退單。
+
+        存檔時已經驗過一次,這是第二道 —— 數量還可能經由舊策略檔的殘留值、
+        手動改 JSON 等途徑變動,而這裡是委託離開系統的最後一個關口。
+        """
+        s = self._s(qty=1, slippage_ticks=0)
+        for bad in (0, -1, 1000, 5000):
+            with self.assertRaises(ValueError, msg=f"零股 {bad} 股竟然送得出去"):
+                order_intent.build_live_order(
+                    s, {'kind': 'OPEN', 'action': '買進', 'qty': bad, 'price': 600.0},
+                    'stock')
+        # 反向對照:合法數量必須送得出去 (否則等於把功能鎖死)
+        for good in (1, 500, 999):
+            oi = order_intent.build_live_order(
+                s, {'kind': 'OPEN', 'action': '買進', 'qty': good, 'price': 600.0}, 'stock')
+            self.assertEqual(oi['qty'], good)
+
+    def test_quantity_limit_is_a_single_source(self):
+        """上限只有一份 —— 策略路徑與手動下單對零股用的是同一個 999
+        (原本就是因為兩份各自維護才出錯的,P-67)。"""
+        cap, unit, is_rule = order_rules.strategy_qty_limit('零股')
+        self.assertEqual(cap, order_rules.MAX_QTY_ODD)
+        self.assertEqual(unit, '股')
+        self.assertTrue(is_rule, "零股上限是交易所規則")
+        cap2, unit2, is_rule2 = order_rules.strategy_qty_limit('股票')
+        self.assertEqual(unit2, '張')
+        self.assertFalse(is_rule2, "整股上限是本系統防呆,不是交易所規則")
+        self.assertEqual(order_rules.strategy_qty_limit('期貨')[1], '口')
+
+    # ---------- 四、零股不可做空 ----------
+
+    def test_odd_lot_cannot_short(self):
+        ok, why = strategy_engine.validate_strategy(self._s(direction='做空'))
+        self.assertFalse(ok)
+        self.assertIn('期貨', why)
+
+
 class TestRealtimeEntryADR145(unittest.TestCase):
     """【ADR-145】即時進場:用即時報價判斷「當日漲跌幅」類進場條件,不等 K 棒收盤。
 

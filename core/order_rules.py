@@ -15,6 +15,25 @@ MODE_LABELS = {"Common": "整股", "IntradayOdd": "盤中零股", "Fixing": "盤
 MAX_QTY_LOT = 499     # 整股/盤後定價,單位:張
 MAX_QTY_ODD = 999     # 盤中零股/盤後零股,單位:股
 
+# 【ADR-146】自動交易策略的單筆數量上限。手動下單與策略下單的上限**刻意不同**:
+# 手動是人盯著按的,策略是無人看管、可能一天觸發好幾次,所以整股/期貨壓得更保守。
+# 零股那條是**交易所規則**(超過 999 股就該用整股下單),兩邊必須一致 ——
+# 這正是原本出錯的地方:策略路徑拿「張/口」的防呆上限 100 去卡「股」,
+# 於是零股策略最多只能買 100 股,而 500 股是完全合法的。
+MAX_STRATEGY_QTY_LOT = 100    # 策略的整股/期貨,單位:張/口 (本系統防呆)
+MAX_STRATEGY_QTY_ODD = MAX_QTY_ODD   # 策略的零股,單位:股 (交易所規則,與手動同一份)
+
+
+def strategy_qty_limit(trade_type):
+    """【ADR-146】策略單筆數量上限 → (上限, 單位, 是不是交易所規則)。
+
+    回傳第三個值是要讓錯誤訊息能講對話:交易所規則不可以叫使用者「去改程式碼
+    上限」(原本的訊息就是這樣寫的,會把人引導去改一個不該改的常數)。
+    """
+    if str(trade_type) == '零股':
+        return MAX_STRATEGY_QTY_ODD, '股', True
+    return MAX_STRATEGY_QTY_LOT, ('口' if str(trade_type) == '期貨' else '張'), False
+
 
 def validate_stock_order(mode: str, order_type_str: str, order_cond: str, order_type_tif: str, qty_str: str):
     """
