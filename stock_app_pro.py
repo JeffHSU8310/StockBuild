@@ -9276,9 +9276,29 @@ class StockTradingAppPro(tk.Tk):
                     # intent['price'] (A 的價) 仍保留給 strategy_engine.apply_fill 當
                     # entry_price → 停損停利以 A 判定;下單/記帳一律用 exec_px (B)。
                     exec_px = b_exec_price if b_exec_price is not None else float(intent['price'])
+                    _odd_tag = ''
+                    # 【ADR-149】零股改用零股五檔當掛價基準。上面那個 exec_px 一定
+                    # 來自整股 K 線 (零股沒有 K 線),對零股而言是**別的市場的價**。
+                    if strategy_engine.trade_type_of(s) == '零股':
+                        if intent.get('kind') == 'OPEN':
+                            _px, _odd_tag = self._qt_odd_entry_price(s, intent['action'])
+                            if _px is None:
+                                self._qt_odd_log_once(
+                                    s, 'entry_nobook',
+                                    f"【自動交易-零股】策略「{s.get('name')}」進場訊號成立,"
+                                    f"但取不到零股五檔,這一輪不送單:{_odd_tag}"
+                                    f" —— 拿整股價去掛零股單會掛不到,而系統會以為已成交"
+                                    f"(今日這檔不再重複提醒)。")
+                                continue
+                            exec_px = float(_px)
+                        else:
+                            # 出場一定要走得掉:取不到五檔就退回整股價,不擋單
+                            _px, _odd_tag = self._qt_odd_exit_price(s, intent['action'], exec_px)
+                            exec_px = float(_px)
                     _watch_tag = (f" [看{strategy_engine.watch_symbol_of(s)}訊號→做{s.get('symbol')}@{exec_px:g}]"
                                   if strategy_engine.watch_enabled(s) else "")
-                    label = f"策略「{s.get('name')}」{intent['action']} {intent['qty']} {s.get('symbol')} @ {exec_px:g}{_watch_tag}"
+                    label = (f"策略「{s.get('name')}」{intent['action']} {intent['qty']} "
+                             f"{s.get('symbol')} @ {exec_px:g}{_odd_tag}{_watch_tag}")
                     ok, reason = strategy_engine.risk_check(s, rt, intent, now_ts)
                     if not ok:
                         self.safe_after(0, self.log_message, f"【自動交易-風控擋單】{label} — {reason}")
@@ -9450,7 +9470,27 @@ class StockTradingAppPro(tk.Tk):
             a_df = rt.get('_live_a_df')
             if a_df is None or len(a_df) < 2:
                 continue
-            intent = strategy_engine.check_realtime_entry(s, rt, a_df, live_price)
+            # 【ADR-149】使用者設的「進場時間窗 / 特定進場時間」在這條路上原本
+            # 完全沒有生效 —— K 棒路徑早就在擋,即時路徑不擋,同一份設定兩種
+            # 答案,而且是**在使用者明確不想下單的時間下了單**。這裡先問一次是
+            # 為了寫日誌(每檔每天一次),check_realtime_entry 內部還會再擋一次。
+            _now_hms = datetime.now().strftime('%H:%M:%S')
+            ok_time, why_time = strategy_engine.entry_time_gate(s, _now_hms)
+            if not ok_time:
+                _hint = ""
+                if str(s.get('specific_entry_time', '') or '').strip():
+                    # 「就在那一刻」這條路給不了保證(節拍是秒級),要在指定時刻
+                    # 進場,ADR-147 的「定時下單」才是對的工具 —— 直接指路,
+                    # 不要讓使用者以為是 bug。
+                    _hint = (" —— 即時進場的節拍是秒級,無法保證命中某一秒;"
+                             "要在指定時刻進場請改用「定時下單」(有明確的窗口設定)。")
+                self._qt_odd_log_once(
+                    s, 'live_time_gate',
+                    f"【即時進場-時間窗】策略「{s.get('name')}」{why_time}{_hint}"
+                    f"(今日這檔不再重複提醒)")
+                continue
+            intent = strategy_engine.check_realtime_entry(s, rt, a_df, live_price,
+                                                          now_hhmmss=_now_hms)
             if intent is None:
                 continue
             # 風控與 K 棒路徑同一份 (每日進場上限/冷卻/熔斷)
@@ -9482,8 +9522,20 @@ class StockTradingAppPro(tk.Tk):
                                         f"但取不到 {sym_b} 的價格,這一輪先不送單 (下一輪再試)。")
                         continue
                     exec_px = float(b_live)
+                # 【ADR-149】零股改用零股五檔 —— 上面的 exec_px 來自 snapshots(),
+                # 而 shioaji 的 snapshot 只有整股欄位 (P-06)。
+                _odd_tag = ''
+                if strategy_engine.trade_type_of(s) == '零股':
+                    _px, _odd_tag = self._qt_odd_entry_price(s, intent['action'])
+                    if _px is None:
+                        self._qt_odd_log_once(
+                            s, 'live_entry_nobook',
+                            f"【即時進場-零股】策略「{s.get('name')}」訊號成立,但取不到"
+                            f"零股五檔,這一輪不送單:{_odd_tag}(今日這檔不再重複提醒)")
+                        continue
+                    exec_px = float(_px)
                 label = (f"策略「{s.get('name')}」{intent['action']} {intent['qty']} {sym_b} "
-                         f"@ {exec_px:g} [即時進場,A={sym_a} {live_price:g}]")
+                         f"@ {exec_px:g}{_odd_tag} [即時進場,A={sym_a} {live_price:g}]")
                 if s.get('mode') == '實單' and self._qt_running:
                     sent, msg = self._place_strategy_order(s, intent, contract, asset_type,
                                                           exec_price=exec_px)
@@ -9523,18 +9575,29 @@ class StockTradingAppPro(tk.Tk):
     # —— 下面這幾個方法補的就是這一段:為策略標的常駐訂閱、把推送存進策略
     # 專用的快取、時間到了用它取價下單。
 
-    def _qt_timed_targets(self):
+    def _qt_book_targets(self):
         """→ {symbol: (contract, 是不是零股)};哪些標的需要常駐五檔訂閱。
 
-        只收「已啟用 + 有開定時下單」的策略。停用的策略不該佔訂閱配額。
+        【ADR-147】原本只收「已啟用 + 有開定時下單」的策略。
+        【ADR-149 擴充】再加上「**已啟用的零股策略**」—— 不論它有沒有開定時
+        下單。理由:零股是獨立市場,`snapshots()` 只有整股欄位 (P-06)、零股又
+        沒有 K 線,所以零股策略走**任何**路徑下單時,唯一的真實價格來源都是
+        這份五檔串流。只替定時下單訂閱的話,一般 K 棒進場/即時進場/即時停損
+        仍然拿整股價去掛零股單。
+
+        停用的策略不該佔訂閱配額,這一點沒有變。
+        (原名 `_qt_timed_targets`;涵蓋範圍變大之後那個名字會誤導,故改名。)
         """
         out = {}
         for s in list(getattr(self, 'strategies', []) or []):
-            if not s.get('enabled') or not strategy_engine.timed_entry_enabled(s):
+            if not s.get('enabled'):
                 continue
             tt = strategy_engine.trade_type_of(s)
+            # 【ADR-149】定時下單的標的 ∪ 零股策略的標的
+            if not (strategy_engine.timed_entry_enabled(s) or tt == '零股'):
+                continue
             if tt == '期貨':
-                continue        # 期貨不在這一筆的範圍 (見 ADR-147「刻意不做」)
+                continue        # 期貨不在範圍 (見 ADR-147「刻意不做」)
             sym = str(s.get('symbol', '')).upper()
             if not sym or sym in out:
                 continue
@@ -9547,8 +9610,11 @@ class StockTradingAppPro(tk.Tk):
             out[sym] = (contract, tt == '零股')
         return out
 
-    def _qt_sync_timed_subs(self):
+    def _qt_sync_book_subs(self):
         """讓常駐五檔訂閱與目前的策略設定一致 (訂新的、退掉不要的)。
+
+        (原名 `_qt_sync_timed_subs`;ADR-149 把涵蓋範圍從「定時下單」擴大到
+         「定時下單 ∪ 零股策略」之後,原名字會誤導。)
 
         跟 `_resubscribe_quotes_worker` 共用 `self.subscribe_lock`:那邊會把
         「上一檔」的四路全部退訂,如果兩邊同時動,一檔標的可能被那邊退掉之後
@@ -9560,7 +9626,7 @@ class StockTradingAppPro(tk.Tk):
         """
         if not (self.api_logged_in and HAS_SJ and getattr(self, 'sj_api', None)):
             return
-        want = self._qt_timed_targets()
+        want = self._qt_book_targets()
         have = dict(getattr(self, '_qt_book_subs', {}) or {})
         if set(want) == set(have):
             return
@@ -9579,10 +9645,10 @@ class StockTradingAppPro(tk.Tk):
                             intraday_odd=odd)
                     have[sym] = odd
                     self.safe_after(0, self.log_message,
-                                    f"【定時下單】已訂閱 {sym} 的{'零股' if odd else '整股'}五檔 (常駐)")
+                                    f"【策略報價】已訂閱 {sym} 的{'零股' if odd else '整股'}五檔 (常駐)")
                 except Exception as e:
                     self.safe_after(0, self.log_message,
-                                    f"【定時下單】訂閱 {sym} 五檔失敗: {e} —— "
+                                    f"【策略報價】訂閱 {sym} 五檔失敗: {e} —— "
                                     "沒有五檔就不會送單,請確認是否在交易時段且已登入")
             for sym in [k for k in have if k not in want]:
                 odd = have.pop(sym)
@@ -9591,7 +9657,7 @@ class StockTradingAppPro(tk.Tk):
                     if c is not None:
                         self.sj_api.quote.unsubscribe(
                             c, quote_type=sj.constant.QuoteType.BidAsk, intraday_odd=odd)
-                    self.safe_after(0, self.log_message, f"【定時下單】已退訂 {sym} 的五檔")
+                    self.safe_after(0, self.log_message, f"【策略報價】已退訂 {sym} 的五檔")
                 except Exception:
                     pass
             self._qt_book_subs = have
@@ -9628,6 +9694,88 @@ class StockTradingAppPro(tk.Tk):
         """讀策略用的五檔快取 (鐵則 3:讀寫一律經 quote_lock)。"""
         with self.quote_lock:
             return (getattr(self, '_qt_books', {}) or {}).get((str(symbol).upper(), bool(odd)))
+
+    # ------------------------------------------------------------------
+    # 【ADR-149】零股在**既有下單路徑**上的取價
+    #
+    # ADR-147 把五檔取價接上了「定時下單」那一條新路,但零股策略走一般 K 棒
+    # 進場、即時進場、即時停損時,價格來源仍然是整股:
+    #   · K 棒路徑     `b_df['Close']`  ← 零股沒有 K 線,拿得到的只有整股 K 棒
+    #   · 即時路徑     `snapshots()`    ← shioaji 的 snapshot 只有整股欄位 (P-06)
+    #
+    # 零股只能限價 (鐵則 6),所以掛什麼價就等於會不會成交。基準價取自另一個
+    # 市場,買單可能掛在零股賣方報價之下,整天掛著不成交 —— 而系統採樂觀成交
+    # 模型 (ADR-035),送出即視為成交:**策略以為買到了,實際上一股都沒買到**。
+    #
+    # 取價規則一律沿用 `core/quote_book.py`(ADR-147 已經寫好、已經測過)。
+    # **刻意不新增第二個取價模組** —— 兩個模組同時決定真錢的掛價,遲早分歧
+    # (P-67),而分歧的後果是委託價格。
+    # ------------------------------------------------------------------
+
+    # 既有路徑一律用最佳一檔,不另外開旋鈕:
+    # 「要多積極」已經由既有的 `slippage_ticks`(讓價檔數)表達,而定時下單的
+    # `timed_book_level` 是為「我指定時刻、也指定積極度」那個場景設計的。
+    # 多一個旋鈕就是多一個會設錯的地方,而第 1 檔正是最不容易掛著不成交的。
+    QT_ODD_BOOK_LEVEL = 1
+
+    def _qt_odd_entry_price(self, strategy, action):
+        """【ADR-149】零股**進場**的掛價基準。→ (價格 or None, 說明)。
+
+        取不到五檔就回 None,呼叫端**不可以下單** —— 與 ADR-147 的定時下單
+        同一個選擇。理由:退回整股價會掛出一張錯價單,而樂觀成交模型會讓
+        策略以為它成交了,部位認知從此對不上;沒送出去只是這一輪沒進場,
+        下一根 K 棒/下一個 tick 還會再評估。
+
+        (這與我先前在工作分支上寫、後來作廢的那版 ADR-147 相反 —— 那版選擇
+         退回整股價。改成對齊 ADR-147 的理由有兩個:錯價單的傷害大於延後進場;
+         而且同一個系統對「取不到五檔怎麼辦」不可以有兩種答案。)
+        """
+        sym = str(strategy.get('symbol', '') or '').upper()
+        book = self._qt_get_book(sym, True)
+        fresh, why = quote_book.is_fresh(book, time.time())
+        if not fresh:
+            return None, f"{why};{quote_book.describe(book)}"
+        px, why = quote_book.pick_price(book, action, self.QT_ODD_BOOK_LEVEL)
+        if px is None:
+            return None, f"{why};{quote_book.describe(book)}"
+        return px, f"[零股五檔 {action}第{self.QT_ODD_BOOK_LEVEL}檔 {px:g}]"
+
+    def _qt_odd_exit_price(self, strategy, action, fallback_price):
+        """【ADR-149】零股**出場**的價(停損停利的觸發價與掛單價共用)。
+        → (價格, 說明)。
+
+        **與進場刻意不同:取不到五檔時退回整股價,不會不下單。**
+        進場沒送出去只是沒進場;出場沒送出去是**部位裸奔** —— 停損走不掉是
+        這個系統裡最糟的一種失敗。所以這條路寧可用一個偏掉的價,也要走得掉。
+        退回時一定記日誌,不安靜退化。
+
+        觸發價與掛單價都用**對手價**(賣出看買方、買進看賣方),因為停損問的
+        正是「如果我現在出場,拿得到什麼價」—— 對手價就是那個答案。用中價或
+        成交價會高估你出得掉的價,停損就會晚跳。
+        """
+        sym = str(strategy.get('symbol', '') or '').upper()
+        book = self._qt_get_book(sym, True)
+        fresh, why = quote_book.is_fresh(book, time.time())
+        if fresh:
+            px, why2 = quote_book.pick_price(book, action, self.QT_ODD_BOOK_LEVEL)
+            if px is not None:
+                return px, f"[零股五檔 {action}第{self.QT_ODD_BOOK_LEVEL}檔 {px:g}]"
+            why = why2
+        return fallback_price, f"[整股價 ({why})]"
+
+    def _qt_odd_log_once(self, strategy, key, msg):
+        """同一檔策略、同一個原因,每天只講一次。
+
+        即時路徑每 2~3 秒跑一次,每次都講會把系統日誌洗掉,使用者反而看不到
+        真正重要的訊息(P-05 的目標是「失敗要看得見」,做法上不能有反效果)。
+        """
+        rt = self._qt_runtime(strategy['id'])
+        day = datetime.now().strftime('%Y-%m-%d')
+        k = f"_odd_log_{key}"
+        if rt.get(k) == day:
+            return
+        rt[k] = day
+        self.safe_after(0, self.log_message, msg)
 
     def _qt_check_timed_entries(self, now_dt=None):
         """時間到了就用當時的五檔進場。掛在 runner 的 2 秒節拍上。
@@ -9790,6 +9938,19 @@ class StockTradingAppPro(tk.Tk):
             rt = self._qt_runtime(s['id'])
             if rt.get('state') not in ('LONG', 'SHORT'):
                 continue
+            # 【ADR-149】零股的停損停利要用**零股的價**來量。live_price 來自
+            # snapshots(),那是整股價 (P-06);而進場價自 ADR-149 起記的是零股價。
+            # 兩者混用等於「用 A 市場的現價減 B 市場的成本」—— 損益從一開始就錯,
+            # 停損自然早跳或晚跳。
+            #
+            # 觸發價用**出場方向的對手價**:停損問的正是「如果我現在出場,拿得到
+            # 什麼價」,對手價就是那個答案;用成交價或中價會高估,停損會晚跳。
+            _odd_tag = ''
+            if strategy_engine.trade_type_of(s) == '零股':
+                _exit_action = '賣出' if rt.get('state') == 'LONG' else '買進'
+                _px, _odd_tag = self._qt_odd_exit_price(s, _exit_action, live_price)
+                if _px is not None:
+                    live_price = float(_px)
             intent = strategy_engine.check_intrabar_futures_stop(s, rt, live_price)
             if intent is None:
                 continue
@@ -9797,7 +9958,8 @@ class StockTradingAppPro(tk.Tk):
                 contract, asset_type = self._qt_resolve(s)
                 if contract is None:
                     continue
-                label = f"策略「{s.get('name')}」{intent['action']} {intent['qty']} {sym} @ {live_price:g} [即時]"
+                label = (f"策略「{s.get('name')}」{intent['action']} {intent['qty']} {sym} "
+                         f"@ {live_price:g}{_odd_tag} [即時]")
                 if s.get('mode') == '實單' and self._qt_running:
                     sent, msg = self._place_strategy_order(s, intent, contract, asset_type, exec_price=live_price)
                     if not sent:
@@ -10097,7 +10259,7 @@ class StockTradingAppPro(tk.Tk):
                 # 3 秒的 snapshots 節流裡:這條路一個 API 都不打 (五檔來自串流
                 # 快取、進場條件用已經快取好的 K 棒),不受鐵則 5 的節流管轄,
                 # 而「指定時刻」本來就該用最密的節拍去逼近。
-                self._qt_sync_timed_subs()
+                self._qt_sync_book_subs()
                 self._qt_check_timed_entries()
 
                 now_ts = _time.time()
@@ -10267,6 +10429,13 @@ class StockTradingAppPro(tk.Tk):
         tk.Label(_risk2, text="可分批進場次數", bg="#1A2026", fg="#FFCA28",
                  font=('微軟正黑體', 9, 'bold')).pack(side=tk.LEFT)
         e_maxent2 = _ent(_risk2, s.get('max_entries', 1), 4); e_maxent2.pack(side=tk.LEFT, padx=(2, 8))
+        # 【ADR-150】回測要不要照上面這幾項風控跑。自訂策略同樣適用 ——
+        # 它的回測路徑不經過 evaluate_strategy,換日重置與每日上限都要靠這條。
+        var_bt_guards2 = tk.BooleanVar(value=strategy_engine.backtest_guards_enabled(s))
+        tk.Checkbutton(_risk2, text="回測套用風控 (每日上限/冷卻/熔斷;取消=純訊號績效,會比實盤樂觀)",
+                       variable=var_bt_guards2, bg="#1A2026", fg="#FFCA28",
+                       selectcolor="#2A323D", activebackground="#1A2026",
+                       font=('微軟正黑體', 8)).pack(side=tk.LEFT, padx=(8, 0))
         # 【ADR-145】自訂策略**刻意不提供**「即時進場」:它的進場邏輯寫在
         # on_bar() 裡,而 on_bar 天生就是「一根 K 棒呼叫一次」的模型,
         # 沒有「用即時價重算一次」的語意。硬加會變成一個勾了卻不會動的框。
@@ -10439,6 +10608,7 @@ class StockTradingAppPro(tk.Tk):
             s['exit_time_start'] = e_ex_st.get().strip()
             s['exit_time_end'] = e_ex_ed.get().strip()
             s['specific_entry_time'] = e_sp_en.get().strip()
+            s['backtest_risk_guards'] = bool(var_bt_guards2.get())
             s['mode'] = cb_mode.get()
             s['account_id'] = _ids2[cb_acct2.current()] if cb_acct2.current() >= 0 else 'default'
             # 【ADR-110階段2】實單要下到哪一家券商的哪一個帳號
@@ -11363,6 +11533,14 @@ class StockTradingAppPro(tk.Tk):
                            "數字越大越積極;再往上疊「讓價檔數」。窗口內取不到五檔就不送單(絕不用整股價頂替)。",
                  bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8), justify='left',
                  wraplength=680).grid(row=19, column=0, columnspan=6, sticky='w', pady=(0, 2))
+        # 【ADR-150】回測要不要照風控跑。放 row 20:row 0~19 都已經有人用了,
+        # tkinter 的 grid 撞格不報錯,只是後放的蓋掉前放的 (P-104)。
+        var_bt_guards = tk.BooleanVar(value=strategy_engine.backtest_guards_enabled(s))
+        tk.Checkbutton(top, text="回測套用風控 (每日進場上限/冷卻/熔斷;取消勾選=純訊號績效,數字會比實盤樂觀)",
+                       variable=var_bt_guards, bg="#1A2026", fg="#FFCA28",
+                       selectcolor="#2A323D", activebackground="#1A2026",
+                       font=('微軟正黑體', 8)).grid(row=20, column=0, columnspan=7,
+                                                    sticky='w', pady=(2, 0))
         _lbl(top, "每日進場上限").grid(row=3, column=0, sticky='w', pady=(6, 0))
         e_maxd = _ent(top, s.get('max_trades_per_day', 3), 6); e_maxd.grid(row=3, column=1, padx=4, pady=(6, 0))
         _lbl(top, "冷卻秒數").grid(row=3, column=2, sticky='w', padx=(10, 0), pady=(6, 0))
@@ -11645,6 +11823,7 @@ class StockTradingAppPro(tk.Tk):
             s['exit_time_start'] = e_ex_st.get().strip()
             s['exit_time_end'] = e_ex_ed.get().strip()
             s['specific_entry_time'] = e_sp_en.get().strip()
+            s['backtest_risk_guards'] = bool(var_bt_guards.get())
             # 【ADR-070】交易時段閘門設定
             s['futures_session'] = 'day' if cb_fut_sess.get() == '只做日盤' else 'day_night'
             s['session_gate'] = bool(var_sess_gate.get())
@@ -12458,7 +12637,9 @@ class StockTradingAppPro(tk.Tk):
                     r = backtest.run_backtest(
                         st, df, slippage_ticks=int(st.get('slippage_ticks', 2) or 0),
                         tick_size=tick, cost_params=self._cost_params(), apply_cost_model=True,
-                        should_stop=lambda: getattr(self, '_backtest_cancel', False) or self._closing)
+                        should_stop=lambda: getattr(self, '_backtest_cancel', False) or self._closing,
+                        # 【ADR-150】照策略勾選的設定跑 (預設套用)
+                        apply_risk_guards=strategy_engine.backtest_guards_enabled(st))
                     rows.append({'name': st.get('name'), 'mode': mode, 'ok': True, 'm': r['metrics']})
                 except Exception as e:
                     rows.append({'name': st.get('name'), 'mode': mode, 'ok': False,
@@ -12918,7 +13099,9 @@ class StockTradingAppPro(tk.Tk):
             result = backtest.run_backtest(s, signal_df, slippage_ticks=slip, tick_size=tick,
                                            cost_params=self._cost_params(), apply_cost_model=True,
                                            should_stop=lambda: getattr(self, '_backtest_cancel', False) or self._closing,
-                                           exec_df=exec_df)
+                                           exec_df=exec_df,
+                                           # 【ADR-150】照策略勾選的設定跑 (預設套用)
+                                           apply_risk_guards=strategy_engine.backtest_guards_enabled(s))
             if getattr(self, '_backtest_cancel', False):
                 self.safe_after(0, self.log_message, "【回測】已依使用者要求中止,不產生報告。")
                 return

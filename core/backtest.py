@@ -24,7 +24,7 @@ from . import strategy_engine
 
 def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
                  cost_params=None, apply_cost_model=True, should_stop=None,
-                 settle_open_at_end=True, exec_df=None):
+                 settle_open_at_end=True, exec_df=None, apply_risk_guards=True):
     """
     對單一策略在歷史 df 上回測。
 
@@ -85,10 +85,17 @@ def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
     # 也需要同一個數字。兩處各寫一份遲早分歧 (P-67),統一到共用函式。
     contract_size = _se.unit_size(s)
     rt = strategy_engine.new_runtime()
-    # 回測不套用「每日次數/冷卻/熔斷」等即時風控 (那是防人為狂點與當日風險控制,
-    # 回測要看的是策略訊號本身的績效);但每日計數換日重置仍由引擎內部處理。
-    # 若要看含風控的結果,未來可加參數;此處預設純訊號績效。
-    s = _relax_realtime_guards(s)
+    # 【ADR-150】回測是否套用「每日進場上限 / 冷卻 / 熔斷」。
+    #
+    # 舊版一律**不套用**,理由寫的是「回測要看策略訊號本身的績效」,並註明
+    # 「若要看含風控的結果,未來可加參數」。實際後果是:使用者把「每日進場
+    # 上限」設成 1,回測卻一天買很多次 —— **回測數字與實盤行為對不上**,
+    # 而回測的用途正是預估實盤。使用者原話:「這不符合我的需求。不論是幾分K,
+    # 只要是在一天之中,有成交就算數,就不能再重複買進。」
+    #
+    # 所以預設改成**照策略設定跑**;要看純訊號績效才傳 apply_risk_guards=False。
+    if not apply_risk_guards:
+        s = _relax_realtime_guards(s)
 
     # 【ADR-040】自訂 Python 策略:逐根呼叫 on_bar,決策轉 intent 後與內建同路。
     is_custom = s.get('kind') == 'custom' and s.get('source_code')
@@ -176,6 +183,21 @@ def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
         ts = df.index[i]
         today = str(getattr(ts, 'date', lambda: ts)())
         now_ts = float(i)
+        # 【ADR-150】風控用的時鐘要是**真實秒數**,不能用 K 棒序號。
+        # `now_ts` 是序號 (float(i)),拿它去比「冷卻秒數 10800」等於把 10800
+        # 當成 10800 根 K 棒 —— 冷卻會變成永遠擋著。每日上限與熔斷不看時鐘,
+        # 但冷卻看,所以這裡另外算一個真實時間戳給 risk_check / apply_fill 用
+        # (兩者必須用**同一個時鐘**,否則 last_order_ts 與 now 對不起來)。
+        try:
+            now_clock = float(ts.timestamp())
+            _clock_ok = True
+        except Exception:
+            now_clock = now_ts
+            _clock_ok = False
+        # 【ADR-150】自訂策略那條路不經過 evaluate_strategy,每日計數不會換日
+        # 重置 —— 沒有這一段,trades_today 會一路累加,跑幾天之後全部被擋。
+        if is_custom:
+            strategy_engine.reset_daily_counters(rt, today_eval)
         
         if is_custom:
             try:
@@ -242,7 +264,15 @@ def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
                 _px_src = float(intent['_touch_price'])
             fill = _fill_price(_px_src, action)
             if intent['kind'] == 'OPEN':
-                strategy_engine.apply_fill(s, rt, intent, now_ts)
+                # 【ADR-150】與實盤**同一份** risk_check:每日進場上限、冷卻、
+                # 熔斷。被擋下要記進訊息紀錄 —— 否則又是「條件到了卻沒動作,
+                # 查無原因」(ADR-144 加訊息紀錄就是為了這個)。
+                if apply_risk_guards:
+                    _ok_rk, _why_rk = strategy_engine.risk_check(s, rt, intent, now_clock)
+                    if not _ok_rk:
+                        _log(ts, '風控擋單', f"{action} 被擋 — {_why_rk}", collapse=True)
+                        continue
+                strategy_engine.apply_fill(s, rt, intent, now_clock)
                 # 【ADR-053 重大修正】方向必須取自「實際開倉動作」,不能讀
                 # s['direction'] 這個靜態欄位:
                 #   (1) 自訂 Python 策略的 direction 只是佔位值 (ADR-045),
@@ -308,7 +338,7 @@ def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
                         'bars_held': i - _lot['entry_i'],
                         'exit_reason': intent.get('reason', ''),
                     })
-                strategy_engine.apply_fill(s, rt, intent, now_ts)
+                strategy_engine.apply_fill(s, rt, intent, now_clock)
                 if _closed_n:
                     _log(ts, '出場',
                          f"{action} @ {fill:g} 平掉 {_closed_n} 筆,合計損益 {_sum_pnl:,.0f}"
@@ -467,6 +497,16 @@ def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
         else:
             _log(df.index[-1] if len(df) else None, '總結',
                  '整段回測沒有完成任何一筆交易 (有進場但沒平倉,或全被擋下)。')
+    # 【ADR-150】把「這次回測有沒有照策略的風控設定跑」寫進訊息紀錄。
+    # 沒有這一行,使用者無法分辨「策略本來就只買一次」與「回測忽略了我的設定」——
+    # 而那正是這一筆 ADR 要修的那種看不見的落差。
+    _log(df.index[-1] if len(df) else None, '總結',
+         ('本次回測**已套用**策略的風控設定:每日進場上限 '
+          f"{s.get('max_trades_per_day')} 次、冷卻 {s.get('cooldown_sec')} 秒、"
+          f"每日虧損熔斷 {s.get('daily_loss_limit')}(與實盤同一份 risk_check)。"
+          if apply_risk_guards else
+          '本次回測**未套用**每日進場上限/冷卻/熔斷 (純訊號績效模式),'
+          '結果會比實盤樂觀。'))
     return {'trades': trades, 'equity': equity, 'metrics': metrics, 'markers': markers,
             # 【ADR-144】回測訊息紀錄:每一列 {ts, kind, text}
             'log': log_rows,

@@ -836,6 +836,10 @@ def new_strategy():
         'timed_entry_window_min': TIMED_ENTRY_DEFAULT_WINDOW_MIN,
         'timed_book_level': 1,        # 用五檔的第幾檔當基準價 (1=最佳檔)
         'max_trades_per_day': 3,      # 每日最多進場次數
+        # 【ADR-150】回測要不要照上面這幾項風控跑 (每日進場上限/冷卻/熔斷)。
+        # 預設 True = 回測模擬實盤。取消勾選才回到舊的「純訊號績效」模式,
+        # 那個模式的數字會比實盤樂觀 (交易次數多很多),報告會標明。
+        'backtest_risk_guards': True,
         'cooldown_sec': 300,          # 兩次下單間最短間隔 (秒)
         'daily_loss_limit': 0.0,      # 每日虧損熔斷 (價差×數量, 0=停用)
         'mode': '模擬',               # 模擬 / 實單
@@ -1362,11 +1366,18 @@ def live_entry_supported(strategy):
     return True, ''
 
 
-def check_realtime_entry(strategy, runtime, df_closed, live_price):
+def check_realtime_entry(strategy, runtime, df_closed, live_price, now_hhmmss=None):
     """即時進場判斷。回傳 OPEN intent 或 None。
 
     df_closed 是 A 的已收盤 K 棒(拿來算「昨收」與「當日已收盤的極值」),
     live_price 是 A 的即時價。兩者合起來才算得出「當日到**此刻**為止的跌幅」。
+
+    【ADR-149】`now_hhmmss`(牆上時鐘):有帶就套用 `entry_time_gate()` ——
+    使用者設的「進場時間窗 / 特定進場時間」在這條路上原本**完全沒有生效**。
+    K 棒路徑早就在擋,即時路徑不擋,同一份設定兩種答案,而這條路會下真錢的單。
+    這裡是第二道(呼叫端為了寫日誌會先問一次),不是唯一防線:把不變量寫在
+    「產生 intent」的邊界上,日後有人改動呼叫端也不會直接變成「在使用者明確
+    不想下單的時間下單」。
 
     這裡**不**負責:
       - 有沒有開即時進場(呼叫端先問 realtime_entry_enabled)
@@ -1378,6 +1389,10 @@ def check_realtime_entry(strategy, runtime, df_closed, live_price):
     ok, _why = live_entry_supported(strategy)
     if not ok:
         return None
+    if now_hhmmss is not None:
+        ok_t, _why_t = entry_time_gate(strategy, now_hhmmss)
+        if not ok_t:
+            return None
     can, _ = can_scale_in(strategy, runtime)
     if not can:
         return None
@@ -1581,11 +1596,9 @@ def evaluate_strategy(strategy, runtime, df_closed, now_ts, today_str):
     """
     if df_closed is None or len(df_closed) < 3:
         return []
-    # 換日重置每日計數
-    if runtime.get('day') != today_str:
-        runtime['day'] = today_str
-        runtime['trades_today'] = 0
-        runtime['realized_pnl_today'] = 0.0
+    # 換日重置每日計數 (【ADR-150】抽成共用函式:回測的自訂策略路徑不經過
+    # 這個函式,得自己呼叫同一份,否則 trades_today 永遠不歸零)
+    reset_daily_counters(runtime, today_str)
     # 同一根K棒只評估一次 (杜絕重複訊號/重複下單的第一道閘門)。用 A 的 K 棒時間,
     # 一根 A 訊號 K 棒只評估一次。
     bar_ts = str(df_closed.index[-1])
@@ -1752,6 +1765,45 @@ def _is_time_in_window(bar_t, t_start, t_end):
     else:
         return bar_t >= t_start or bar_t <= t_end
 
+def entry_time_gate(strategy, t_now):
+    """【ADR-149】**進場**的時間閘門。回傳 (ok, 擋下的原因)。
+
+    抽成共用函式的理由:這道閘門原本只長在 K 棒路徑 (`filter_intents_by_time`)
+    上,ADR-145 新增的即時進場通道 (`check_realtime_entry`) **一行時間判斷都
+    沒有**。也就是說,使用者設了「只在 12:01 進場」,只要那檔策略同時勾了
+    即時進場,這個限制就等於不存在,任何時間都可能被開倉 —— 而且畫面上完全
+    看不出來。
+
+    使用者親手設定的時間限制被靜默忽略,比「條件到了卻沒動作」更糟:
+    前者只是沒賺到,後者是**在他明確不想下單的時間下了單**,而且是真錢。
+
+    `t_now` 是 'HH:MM:SS'(K 棒路徑傳 K 棒時間,即時路徑傳牆上時鐘)。
+
+    【刻意不改 `specific_entry_time` 的語意】它比對的是「時刻完全相等」,
+    這是 ADR-066 定下、ADR-147 明確決定不動的既有行為。即時通道的節拍是
+    秒級,實務上不可能命中某一秒 —— 所以設了 `specific_entry_time` 的策略
+    在即時路徑上會一直被這道閘門擋下,那是**正確**的:使用者要的是「就在
+    那一刻」,而這條路給不了保證。要在指定時刻進場,ADR-147 的「定時下單」
+    (`timed_entry`,有明確的窗口語意)才是對的工具,呼叫端應該這樣提示。
+    """
+    sp_entry = _normalize_time((strategy or {}).get('specific_entry_time', ''))
+    en_start = _normalize_time((strategy or {}).get('entry_time_start', ''))
+    en_end = _normalize_time((strategy or {}).get('entry_time_end', ''))
+    if not (sp_entry or en_start or en_end):
+        return True, ''
+    t = _normalize_time(t_now)
+    if not t:
+        return True, ''   # 讀不到時間就不擋,維持既有行為 (不憑空製造拒絕)
+    if sp_entry:
+        if t != sp_entry:
+            return False, f"設定只在 {sp_entry} 這一刻進場 (目前 {t})"
+        return True, ''
+    if not _is_time_in_window(t, en_start, en_end):
+        return False, (f"不在進場時間窗 {en_start[:5] or '--'}~{en_end[:5] or '--'} 內 "
+                       f"(目前 {t})")
+    return True, ''
+
+
 def filter_intents_by_time(intents, strategy, bar_ts_str, runtime=None):
     """依 entry_time_start/end、exit_time_start/end、specific_entry_time 排除
     落在時間窗外的 intent。
@@ -1784,17 +1836,20 @@ def filter_intents_by_time(intents, strategy, bar_ts_str, runtime=None):
     skips = []
     for intent in intents:
         blocked = False
+        why = ''
         if intent.get('kind') == 'OPEN':
-            if sp_entry and bar_time_str != sp_entry:
-                blocked = True
-            elif not _is_time_in_window(bar_time_str, en_start, en_end):
-                blocked = True
+            # 【ADR-149】改走 entry_time_gate() —— 與即時進場通道**同一份規則**。
+            # 原本這裡自己判一次、即時那條路根本不判,同一份使用者設定兩種答案。
+            ok_t, why = entry_time_gate(strategy, bar_time_str)
+            blocked = not ok_t
         elif intent.get('kind') == 'CLOSE':
             if not _is_time_in_window(bar_time_str, ex_start, ex_end):
                 blocked = True
+                why = (f"不在出場時間窗 {ex_start[:5] or '--'}~{ex_end[:5] or '--'} 內 "
+                       f"(K棒時間 {bar_time_str})")
         if blocked:
             skips.append(f"{intent.get('kind')} {intent.get('action')} 因設定的進/出場時間窗被跳過 "
-                          f"(K棒時間 {bar_time_str})")
+                          f"(K棒時間 {bar_time_str}) — {why}")
             continue
         filtered.append(intent)
     if runtime is not None:
@@ -1804,6 +1859,38 @@ def filter_intents_by_time(intents, strategy, bar_ts_str, runtime=None):
 def _close_intent(runtime, price, reason):
     action = '賣出' if runtime.get('state') == 'LONG' else '買進'
     return {'kind': 'CLOSE', 'action': action, 'qty': int(runtime.get('qty', 0)), 'price': price, 'reason': reason}
+
+
+def backtest_guards_enabled(strategy):
+    """【ADR-150】回測要不要套用每日上限/冷卻/熔斷。
+
+    舊策略檔沒有這個欄位 → 回 True(照策略設定跑)。預設值刻意選「套用」而不是
+    「相容舊行為」:舊行為是**回測忽略你的設定**,那是這一筆要修的 bug,
+    不是需要保留的相容性。
+    """
+    v = (strategy or {}).get('backtest_risk_guards', True)
+    return True if v is None else bool(v)
+
+
+def reset_daily_counters(runtime, today_str):
+    """【ADR-150】換日就把「每日」計數歸零。回傳有沒有真的換日。
+
+    抽成共用函式的理由:`evaluate_strategy()` 一直有做這件事,但**回測跑自訂
+    策略時根本不經過它**(那條路直接呼叫 `custom_strategy.run_on_bar`)。
+    於是 `trades_today` 一路累加,跑個幾天之後每一筆進場都被「已達每日進場
+    上限」擋掉 —— 而且看起來像是策略不再有訊號。
+
+    這正是「同一份規則不可以有兩份實作」(P-67) 的典型:少寫一份的後果不是
+    程式壞掉,是**行為悄悄不一樣**。
+    """
+    if runtime is None:
+        return False
+    if runtime.get('day') == today_str:
+        return False
+    runtime['day'] = today_str
+    runtime['trades_today'] = 0
+    runtime['realized_pnl_today'] = 0.0
+    return True
 
 
 def risk_check(strategy, runtime, intent, now_ts):

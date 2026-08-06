@@ -6323,6 +6323,8 @@ def _day_pct_watch_ab_140():
     """
     import pandas as _pd
     from core import strategy_engine as _se14
+    from core import quote_book as _qb143   # 【ADR-149】零股掛價基準改用五檔
+    _orig_books143 = dict(getattr(app, '_qt_books', {}) or {})
 
     class FakeContract:
         code = '2330'
@@ -6446,11 +6448,29 @@ def _day_pct_watch_ab_140():
         stock_app_pro.market_session.is_market_open = lambda *a, **k: True
         stock_app_pro.market_session.just_opened = lambda *a, **k: False
 
+        # 【ADR-149】零股的掛價基準改成零股五檔(零股沒有 K 線,K 棒路徑拿到的
+        # 一定是**整股** K 棒)。所以零股子案例得先餵一份五檔進策略快取,
+        # 否則會走進「取不到五檔就不送單」而整檔不進場 —— 那不是這個案例要測的。
+        # 買一與賣一**都**刻意設成 600.0 = B 的價。這樣進場(吃賣一)與出場
+        # (吃買一)取到的都是 600,**ADR-143 原本的斷言一字都不用改** ——
+        # 它要守的是「下單價要用 B 的價,不是 A 的 97」,那個意圖與 ADR-149
+        # 無關,不該因為取價來源換了就跟著改寫。
+        # (真實市場的買一不會等於賣一;這裡是診斷,要的是可分辨,不是像真的。)
+        with app.quote_lock:
+            if not hasattr(app, '_qt_books'):
+                app._qt_books = {}
+            app._qt_books[('2330', True)] = _qb143.make(
+                [600.0, 599.5], [1, 1], [600.0, 600.5], [1, 1],
+                ts=time.time(), symbol='2330', odd=True)
+
         # ---- 1. 三種商品別都要能「A 跌 4% → 買進 B」----
         for _tt, _qty in (('股票', 1), ('零股', 100), ('期貨', 2)):
             mode['v'] = 'drop'
             s = _mk(_tt, _qty); rt = _mount(s)
             orders.clear()
+            # 五檔會過期 (quote_book 預設 10 秒),每一輪重新打時間戳
+            with app.quote_lock:
+                app._qt_books[('2330', True)]['ts'] = time.time()
             _pass()
             assert rt['state'] == 'LONG', \
                 f"{_tt}:A 當日跌 4% > X=3% 應該進場買進 B (實際 state={rt['state']})"
@@ -6522,6 +6542,9 @@ def _day_pct_watch_ab_140():
         app.strategies, app.strategy_runtimes = orig_strats, orig_rts
         app._qt_last_boundary = {}
         app._qt_session_state = {}
+        # 【ADR-149】五檔快取是全域的,不還原會把狀態留給後面的案例
+        with app.quote_lock:
+            app._qt_books = _orig_books143
 
     # ---- 6. 回測也要吃得下這兩個條件 (使用者很在意回測,ADR-136) ----
     from core import backtest as _bt14
@@ -7136,7 +7159,7 @@ def _timed_entry_odd_lot_147():
         # ---- 1. 要為策略標的常駐訂閱「零股」五檔 ----
         st = _mk(); rt = _mount(st)
         subs.clear()
-        app._qt_sync_timed_subs(); app.flush_after()
+        app._qt_sync_book_subs(); app.flush_after()
         assert ('2330', 'BidAsk', True) in subs, \
             f"要為策略標的訂閱零股五檔,實際訂了 {subs}"
 
@@ -7229,15 +7252,37 @@ def _timed_entry_odd_lot_147():
         assert not orders and rt6['state'] == 'FLAT', \
             f"沒開定時下單的策略不可以被這條路動到,實際 {orders}"
         # 也不該為它佔訂閱配額
+        #
+        # 【ADR-149 更新了這條斷言的規則,意圖不變】原本是「沒開定時下單就不該
+        # 訂閱」,而 ADR-149 把常駐訂閱的範圍從「定時下單」擴大到
+        # 「定時下單 ∪ **零股策略**」—— 因為零股策略走任何路徑下單時,唯一的
+        # 真實價格來源都是這份五檔串流(零股沒有 K 線、snapshot 只有整股欄位)。
+        # 這個案例的 _mk() 預設就是零股,所以舊斷言在 ADR-149 之後必然紅。
+        #
+        # 要守的意圖沒有變:**不該為用不到的策略佔配額**。所以反向對照換成
+        # 「既沒開定時下單、也不是零股」的股票策略。
         subs.clear()
         app._qt_book_subs = {}
-        app._qt_sync_timed_subs(); app.flush_after()
-        assert not subs, f"沒開定時下單就不該訂閱五檔 (別浪費配額),實際 {subs}"
+        st6b = _mk(timed_entry=False, trade_type='股票', qty=1,
+                   entry=[{'type': 'ma_cross_up', 'params': {}}])
+        _mount(st6b)
+        app._qt_sync_book_subs(); app.flush_after()
+        assert not subs, \
+            f"既沒開定時下單、又不是零股的策略不該訂閱五檔 (別浪費配額),實際 {subs}"
+        # 正向對照 (ADR-149 的新行為):零股策略就算沒開定時下單也要訂閱,
+        # 否則它的 K 棒進場/即時進場/即時停損又會退回整股價。
+        subs.clear()
+        app._qt_book_subs = {}
+        _mount(_mk(timed_entry=False, entry=[{'type': 'ma_cross_up', 'params': {}}]))
+        app._qt_sync_book_subs(); app.flush_after()
+        assert any(c == '2330' and o for c, _q, o in subs), \
+            f"零股策略即使沒開定時下單也要訂閱零股五檔 (ADR-149),實際 {subs}"
+        _mount(st6)
 
         # ---- 12. 換股時不可以把策略的常駐五檔訂閱一起退掉 ----
         st7 = _mk(); _mount(st7)
         app._qt_book_subs = {}
-        app._qt_sync_timed_subs(); app.flush_after()
+        app._qt_sync_book_subs(); app.flush_after()
         unsubs.clear()
         app._resubscribe_quotes_worker(FakeContract('2330'), FakeContract('2454'), 'stock')
         app.flush_after()
@@ -7269,7 +7314,7 @@ def _timed_entry_odd_lot_147():
         _i = _src47.index('    def quant_runner_worker(')
         _m = _re47.search(r'\n    def (?!quant_runner_worker\b)\w+', _src47[_i:])
         _seg = _src47[_i:_i + _m.start()]
-        for _need in ('_qt_check_timed_entries', '_qt_sync_timed_subs'):
+        for _need in ('_qt_check_timed_entries', '_qt_sync_book_subs'):
             assert _need in _seg, f"runner 沒有呼叫 {_need},功能永遠不會跑"
         # 而且 on_bidask_stk_v1 要在「只收主畫面那一檔」的 if 之外收策略的五檔
         _j = _src47.index('    def on_bidask_stk_v1(')
@@ -7471,6 +7516,344 @@ def _session_drop_not_strategy_fault_148():
 
 run_case("ADR-148: 連線中斷不可以關掉策略 (合約解析失敗歸類為外部問題 + 訊息不誤導 + 通知合併)",
          _session_drop_not_strategy_fault_148)
+
+
+def _odd_lot_existing_paths_149():
+    """【ADR-149】零股在**既有下單路徑**上也要用零股五檔,不是整股價。
+
+    ADR-147 把五檔取價接上了「定時下單」那一條新路,但零股策略走一般 K 棒
+    進場、即時進場、即時停損時,價格來源仍然是整股(K 棒是整股的、
+    `snapshots()` 只有整股欄位 P-06)。零股只能限價(鐵則 6),掛價取自另一個
+    市場就可能整天掛不到,而樂觀成交模型(ADR-035)會讓策略以為它成交了。
+
+    純規則(`quote_book`)ADR-147 已經測過,`entry_time_gate` 在
+    tests/test_core.py 釘死。這個案例守**接線**:
+      A. K 棒進場的掛價 = 零股賣一,不是整股 K 線收盤價。
+      B. 取不到五檔時**不送單**(與 ADR-147 的定時下單同一個選擇),而且要出聲。
+      C. 即時進場同樣走零股五檔。
+      D. **出場相反**:取不到五檔要退回整股價**照樣出場** —— 進場沒送只是沒
+         進場,出場沒送是部位裸奔。這是整筆最重要的一條。
+      E. 即時進場通道要套用使用者設的進場時間窗(ADR-145 原本完全沒有)。
+      F. 反向對照:股票策略完全不受影響。
+    """
+    import re as _re49
+    import pandas as _pd49
+    from core import strategy_engine as _se49
+    from core import quote_book as _qb49
+
+    class FakeContract:
+        def __init__(self, code='2330'):
+            self.code = code
+            self.symbol = code
+
+    class FakeSnap:
+        def __init__(self, code, close):
+            self.code = code
+            self.close = close
+
+    class FakeApi:
+        def snapshots(self, contracts):
+            # snapshot 一律回**整股**價 (P-06 的先天限制),案例要證明系統
+            # 不會拿這個價去掛零股單。
+            return [FakeSnap(getattr(c, 'code', ''), 500.0) for c in contracts]
+
+    _now = stock_app_pro.datetime.now()
+    _base = _now.replace(hour=0, minute=0, second=0, microsecond=0)
+    # B 的已收盤 K 棒:收盤 500 = 整股的價
+    _b_df = _pd49.DataFrame({'Open': [500.0] * 3, 'High': [500.0] * 3,
+                             'Low': [500.0] * 3, 'Close': [500.0] * 3,
+                             'Volume': [1] * 3},
+                            index=[_now - stock_app_pro.timedelta(minutes=15),
+                                   _now - stock_app_pro.timedelta(minutes=10),
+                                   _now - stock_app_pro.timedelta(minutes=5)])
+    # A 的已收盤 K 棒:昨收 520,今日已收盤只跌到 515 (0.96%);
+    # 即時價 500 = 跌 3.8% > X=3%,所以是「即時」那條路救的。
+    _a_df = _pd49.DataFrame(
+        {'Open': [520.0, 518.0], 'High': [520.0, 519.0],
+         'Low': [520.0, 515.0], 'Close': [520.0, 515.0], 'Volume': [1, 1]},
+        index=_pd49.to_datetime([(_base - stock_app_pro.timedelta(days=1)).replace(hour=13, minute=30),
+                                 _base.replace(hour=9, minute=5)]))
+
+    orders, logs = [], []
+    orig_log = app.log_message
+    orig_resolve, orig_resolve_watch = app._qt_resolve, app._qt_resolve_watch
+    orig_fetch = app._qt_fetch_closed_bars
+    orig_place = app._place_strategy_order
+    orig_api, orig_login, orig_running = app.sj_api, app.api_logged_in, app._qt_running
+    orig_strats, orig_rts = app.strategies, app.strategy_runtimes
+    orig_books = dict(getattr(app, '_qt_books', {}) or {})
+
+    def _mk(**over):
+        st = _se49.new_strategy()
+        st.update({'name': '診斷ADR149', 'symbol': '2330', 'trade_type': '零股',
+                   'market': '台股', 'qty': 500, 'direction': '做多', 'mode': '實單',
+                   'enabled': True, 'timeframe': '1分K', 'session_gate': False,
+                   'stop_loss_pct': 2.0, 'take_profit_pct': 0.0,
+                   'cooldown_sec': 0, 'max_trades_per_day': 99, 'slippage_ticks': 0,
+                   'entry': [{'type': 'always_true', 'params': {}}], 'exit_signals': []})
+        st.update(over)
+        return st
+
+    def _mount(st):
+        rt = _se49.new_runtime()
+        rt['_live_a_df'] = _a_df
+        rt['_live_b_df'] = _b_df
+        app.strategies = [st]
+        app.strategy_runtimes = {st['id']: rt}
+        app._qt_last_boundary = {}
+        app._qt_session_state = {}
+        return rt
+
+    def _bar_pass():
+        # 【P-127】一定要走 eval_pass(),不可直接呼叫 _quant_eval_pass()
+        app._qt_last_boundary = {}
+        eval_pass()
+        app.flush_after()
+
+    def _put_book(bid=None, ask=None, fresh=True):
+        """把一份零股五檔放進策略快取。fresh=False 用來模擬串流斷掉。"""
+        b = _qb49.make([p for p, _ in (bid or [(497.0, 1), (496.5, 1)])],
+                       [v for _, v in (bid or [(497.0, 1), (496.5, 1)])],
+                       [p for p, _ in (ask or [(498.5, 1), (499.0, 1)])],
+                       [v for _, v in (ask or [(498.5, 1), (499.0, 1)])],
+                       ts=time.time() if fresh else time.time() - 3600,
+                       symbol='2330', odd=True)
+        with app.quote_lock:
+            if not hasattr(app, '_qt_books'):
+                app._qt_books = {}
+            app._qt_books[('2330', True)] = b
+
+    def _clear_book():
+        with app.quote_lock:
+            (getattr(app, '_qt_books', {}) or {}).pop(('2330', True), None)
+
+    try:
+        app.log_message = lambda m: (logs.append(str(m)), orig_log(m))[0]
+        app._qt_resolve = lambda _s: (FakeContract(_s.get('symbol', '2330')), 'stock')
+        app._qt_resolve_watch = lambda _s: (FakeContract(_s.get('symbol', '2330')), 'stock',
+                                            _s.get('symbol', '2330'), '台股')
+        app._qt_fetch_closed_bars = lambda *a, **k: _b_df
+        app._place_strategy_order = lambda st, it, c, k, exec_price=None, **kw: (
+            orders.append((it['kind'], it['action'], it['qty'], exec_price)), (True, 'OK'))[1]
+        app.sj_api = FakeApi(); app.api_logged_in = True; app._qt_running = True
+
+        # ---- A. K 棒進場的掛價要用零股賣一 498.5,不是整股 K 線的 500 ----
+        st = _mk(); rt = _mount(st)
+        _put_book(); orders.clear()
+        _bar_pass()
+        assert orders, f"零股策略應該進場 (才驗得到掛價),state={rt['state']}"
+        assert orders[-1][3] == 498.5, \
+            (f"K棒路徑的零股掛價要用零股賣一 498.5,實際 {orders[-1][3]} —— "
+             f"500.0 代表還在用整股 K 線收盤價")
+
+        # ---- B. 取不到五檔 → **不送單**,而且要出聲 ----
+        st_b = _mk(); rt_b = _mount(st_b)
+        _clear_book(); orders.clear(); logs.clear()
+        _bar_pass()
+        assert not orders and rt_b['state'] == 'FLAT', \
+            (f"取不到零股五檔就不可以送單 —— 拿整股價掛零股單會掛不到,"
+             f"而樂觀成交模型會讓策略以為成交了。實際 {orders}")
+        assert any('取不到零股五檔' in m for m in logs), \
+            f"不送單要講出原因,不可以靜默:{logs[:4]}"
+        # 每檔每天只講一次,不可以每輪洗版
+        _n = sum(1 for m in logs if '取不到零股五檔' in m)
+        _bar_pass()
+        assert sum(1 for m in logs if '取不到零股五檔' in m) == _n, \
+            "同一個原因每檔每天只該講一次,否則會把日誌洗掉"
+
+        # ---- B2. 五檔**過期**也一樣不送單(不是只有「沒有五檔」才擋) ----
+        #
+        # 這一段是突變測試逼出來的:第一版只測了「沒有五檔」,所以把
+        # `is_fresh()` 檢查整個拿掉的突變**沒有被抓到** —— 一份三小時前的
+        # 五檔會被當成有效報價拿去掛真錢的限價單,而且看起來完全正常。
+        st_b2 = _mk(); rt_b2 = _mount(st_b2)
+        _put_book(fresh=False)          # 時間戳往前撥一小時
+        orders.clear(); logs.clear()
+        _bar_pass()
+        assert not orders and rt_b2['state'] == 'FLAT', \
+            (f"五檔過期就不可以拿來掛單 —— 一份一小時前的報價看起來跟剛更新的"
+             f"一模一樣,但價格前提早就不存在了。實際 {orders}")
+        assert any('取不到零股五檔' in m for m in logs), \
+            f"過期而不送單一樣要講出原因:{logs[:4]}"
+
+        # ---- C. 即時進場同樣走零股五檔 ----
+        st_c = _mk(realtime_entry=True, watch_enabled=False,
+                   entry=[{'type': 'day_drop_over', 'params': {'value': 3.0}}])
+        rt_c = _mount(st_c)
+        _put_book(); orders.clear()
+        app._qt_update_realtime_pnl(); app.flush_after()
+        assert rt_c['state'] == 'LONG', f"即時進場條件成立時應進場 (state={rt_c['state']})"
+        assert orders and orders[-1][3] == 498.5, \
+            (f"即時路徑的零股掛價要用零股賣一 498.5,實際 {orders[-1][3]} —— "
+             f"500.0 代表還在用 snapshots 的整股價 (P-06)")
+
+        # ---- C2. 即時進場取不到五檔也不送單 ----
+        st_c2 = _mk(realtime_entry=True, watch_enabled=False,
+                    entry=[{'type': 'day_drop_over', 'params': {'value': 3.0}}])
+        rt_c2 = _mount(st_c2)
+        _clear_book(); orders.clear()
+        app._qt_update_realtime_pnl(); app.flush_after()
+        assert rt_c2['state'] == 'FLAT' and not orders, \
+            f"即時進場取不到零股五檔也不可以送單,實際 {orders}"
+
+        # ---- D. 出場:取不到五檔要**退回整股價照樣出場** (與進場相反) ----
+        #
+        # 這是整筆最重要的一條。進場沒送只是沒進場;出場沒送是部位裸奔。
+        st_d = _mk(stop_loss_pct=1.0)
+        rt_d = _mount(st_d)
+        rt_d['state'] = 'LONG'; rt_d['qty'] = 500
+        rt_d['exec_entry_price'] = 520.0; rt_d['entry_price'] = 520.0
+        _clear_book(); orders.clear()
+        app._qt_update_realtime_pnl(); app.flush_after()
+        assert orders, \
+            ("取不到零股五檔時,停損**仍然要走** —— 退回整股價 500 相對成本 520 "
+             "已經跌 3.8% > 停損 1%。出場被擋下來會讓部位裸奔,這比用一個偏掉的價更糟")
+        assert orders[-1][:2] == ('CLOSE', '賣出'), f"應是平倉賣出,實際 {orders[-1]}"
+        assert orders[-1][3] == 500.0, \
+            f"退回整股價時掛價就是 500.0,實際 {orders[-1][3]}"
+
+        # ---- D2. 有五檔時,出場的觸發價與掛單價都用**買一**(出場方向的對手價) ----
+        st_d2 = _mk(stop_loss_pct=1.0)
+        rt_d2 = _mount(st_d2)
+        rt_d2['state'] = 'LONG'; rt_d2['qty'] = 500
+        rt_d2['exec_entry_price'] = 502.5; rt_d2['entry_price'] = 502.5
+        # 三個候選價刻意落在停損線的兩側,才分辨得出用了哪一個:
+        #   買一   497.0 → 跌 1.09% ≥ 停損 1%  → 該出場   ← 正解 (出場的對手價)
+        #   賣一   498.5 → 跌 0.80%            → 不出場   ← 誤用進場那一側
+        #   整股快照 500.0 → 跌 0.50%            → 不出場   ← 整條路沒換成零股價
+        _put_book(); orders.clear()
+        app._qt_update_realtime_pnl(); app.flush_after()
+        assert orders, \
+            ("出場的觸發價要用**買一** 497 (賣出的對手價,也就是真的出得掉的價);"
+             "用賣一 498.5 或整股 500 都不會觸發,停損就會晚跳")
+        assert orders[-1][3] == 497.0, \
+            f"出場掛價要用買一 497.0,實際 {orders[-1][3]}"
+
+        # ---- E. 即時進場要套用使用者設的進場時間窗 (ADR-145 原本完全沒有) ----
+        _future = (_now + stock_app_pro.timedelta(hours=3)).strftime('%H:%M')
+        _future2 = (_now + stock_app_pro.timedelta(hours=4)).strftime('%H:%M')
+        st_e = _mk(realtime_entry=True, watch_enabled=False,
+                   entry_time_start=_future, entry_time_end=_future2,
+                   entry=[{'type': 'day_drop_over', 'params': {'value': 3.0}}])
+        rt_e = _mount(st_e)
+        _put_book(); orders.clear(); logs.clear()
+        app._qt_update_realtime_pnl(); app.flush_after()
+        assert rt_e['state'] == 'FLAT' and not orders, \
+            (f"進場時間窗是 {_future}~{_future2},現在不在窗內就不可以進場 "
+             f"(state={rt_e['state']}, orders={orders})")
+        assert any('時間窗' in m for m in logs), \
+            f"被時間窗擋下要講一次原因,不可靜默:{logs[:4]}"
+
+        # ---- E2. 設了 specific_entry_time 要指路到「定時下單」,不要讓人以為是 bug ----
+        st_e2 = _mk(realtime_entry=True, watch_enabled=False,
+                    specific_entry_time='12:01',
+                    entry=[{'type': 'day_drop_over', 'params': {'value': 3.0}}])
+        rt_e2 = _mount(st_e2)
+        _put_book(); orders.clear(); logs.clear()
+        app._qt_update_realtime_pnl(); app.flush_after()
+        assert any('定時下單' in m for m in logs), \
+            (f"即時通道無法保證命中某一秒,要主動指路到 ADR-147 的「定時下單」,"
+             f"不可以只是安靜不動作:{logs[:4]}")
+
+        # ---- F. 反向對照:股票策略完全不受影響 ----
+        st_f = _mk(trade_type='股票', qty=1)
+        _mount(st_f)
+        _clear_book(); orders.clear()
+        _bar_pass()
+        assert orders and orders[-1][3] == 500.0, \
+            (f"股票策略不可以被零股取價動到 (也不可以因為沒有零股五檔就被擋),"
+             f"應為 500.0,實際 {orders}")
+    finally:
+        app.log_message = orig_log
+        app._qt_resolve, app._qt_resolve_watch = orig_resolve, orig_resolve_watch
+        app._qt_fetch_closed_bars = orig_fetch
+        app._place_strategy_order = orig_place
+        app.sj_api, app.api_logged_in, app._qt_running = orig_api, orig_login, orig_running
+        app.strategies, app.strategy_runtimes = orig_strats, orig_rts
+        with app.quote_lock:
+            app._qt_books = orig_books
+
+    _src49 = open('stock_app_pro.py', encoding='utf-8').read()
+
+    # ---- G. 接線:三條會下單的路徑都要走零股取價 ----
+    for _fn, _need in (('_quant_eval_pass', '_qt_odd_entry_price'),
+                       ('_qt_check_realtime_entries', '_qt_odd_entry_price'),
+                       ('_qt_check_realtime_futures_stops', '_qt_odd_exit_price')):
+        _i = _src49.index(f'    def {_fn}(')
+        _m = _re49.search(r'\n    def (?!' + _fn + r'\b)\w+', _src49[_i:])
+        _seg = _src49[_i:_i + _m.start()]
+        assert _need in _seg, \
+            (f"{_fn} 沒有走 {_need} —— 零股單會掛在整股價上,而系統採樂觀成交 "
+             f"(ADR-035):掛不到卻以為成交,部位認知就此對不上")
+
+    # ---- H. 即時進場要真的呼叫時間閘門 ----
+    _i = _src49.index('    def _qt_check_realtime_entries(')
+    _m = _re49.search(r'\n    def (?!_qt_check_realtime_entries\b)\w+', _src49[_i:])
+    _seg = _src49[_i:_i + _m.start()]
+    assert 'entry_time_gate' in _seg, \
+        "即時進場沒有套用進場時間閘門 —— 使用者設的時間限制會被靜默忽略"
+
+    # ---- I. 反向對照:不可以出現第二個零股取價模組 (P-67) ----
+    import os as _os49
+    assert not _os49.path.exists('core/odd_lot_price.py'), \
+        ("零股取價規則只能有一份 (core/quote_book.py) —— 兩個模組同時決定真錢的"
+         "掛價,遲早分歧,而分歧的後果是委託價格")
+    assert 'quote_book.pick_price' in _src49, "取價要走 quote_book,不可以自己再寫一份"
+
+
+run_case("ADR-149: 零股既有下單路徑也用零股五檔 (進場取不到就不送/出場一定走得掉/即時進場補時間閘門)",
+         _odd_lot_existing_paths_149)
+
+
+def _backtest_risk_guards_150():
+    """【ADR-150】回測要照策略的風控設定跑,不可以偷偷放寬。
+
+    使用者:「我預設每天只進場一次,但是適用1分K週期,變成每1分就重新計算,
+    導致一天只要達到條件,就一直重複買進。」
+
+    根因:回測**從來沒有呼叫過 risk_check**,而且 `_relax_realtime_guards()`
+    還把每日上限設成 10**9。純規則已在 tests/test_core.py 釘死(12 案),
+    這裡守的是**接線** —— GUI 的回測入口不可以把這個保護關掉 (P-64)。
+    """
+    import re as _re50
+    _src50 = open('stock_app_pro.py', encoding='utf-8').read()
+
+    # GUI 的每一個 run_backtest 呼叫都不可以傳 apply_risk_guards=False
+    assert 'apply_risk_guards=False' not in _src50,         ("GUI 不可以關掉回測風控 —— 關掉的話回測數字又會與實盤對不上,"
+         "而那正是 ADR-150 修的東西")
+    _n_calls = _src50.count('backtest.run_backtest(')
+    assert _n_calls >= 2, f"預期至少兩個回測入口 (單一策略 + 策略比較),實際 {_n_calls}"
+
+    # 預設值必須是「套用」——這是整筆的核心,預設值錯了就等於沒修
+    import inspect as _insp50
+    from core import backtest as _bt50
+    _sig = _insp50.signature(_bt50.run_backtest)
+    assert _sig.parameters['apply_risk_guards'].default is True,         "apply_risk_guards 的預設值必須是 True (回測 = 實盤會怎麼跑)"
+
+    # 回測真的有呼叫 risk_check (改回不呼叫的話這條會紅)
+    _src_bt = open('core/backtest.py', encoding='utf-8').read()
+    assert 'strategy_engine.risk_check(' in _src_bt,         "回測必須走與實盤同一份 risk_check,否則每日上限/冷卻/熔斷全部是裝飾"
+
+    # 換日重置只能有一份實作 (P-67):兩處都要呼叫共用函式
+    _src_se = open('core/strategy_engine.py', encoding='utf-8').read()
+    assert _src_se.count('def reset_daily_counters(') == 1, "換日重置只能有一份實作"
+    assert 'reset_daily_counters(' in _src_bt,         ("回測的自訂策略路徑不經過 evaluate_strategy,必須自己呼叫換日重置,"
+         "否則 trades_today 一路累加,跑幾天之後每一筆進場都會被擋")
+
+    # 反向對照:出場永遠不受進場風控限制 (持倉一定要出得去)
+    from core import strategy_engine as _se50
+    _rt = _se50.new_runtime()
+    _rt.update({'state': 'LONG', 'qty': 1, 'trades_today': 999,
+                'last_order_ts': 1e9, 'realized_pnl_today': -1e9})
+    _st = _se50.new_strategy()
+    _st.update({'max_trades_per_day': 1, 'cooldown_sec': 99999, 'daily_loss_limit': 1})
+    _ok, _why = _se50.risk_check(
+        _st, _rt, {'kind': 'CLOSE', 'action': '賣出', 'qty': 1, 'price': 100.0}, 1e9)
+    assert _ok, f"出場不可以被進場風控擋下 (持倉會出不去): {_why}"
+
+
+run_case("ADR-150: 回測照策略的風控設定跑 (每日進場上限真的生效,不論幾分K)",
+         _backtest_risk_guards_150)
 
 
 def _diag_self_check_no_raw_eval_pass():
