@@ -213,11 +213,199 @@ def default_strategy():
     # 【新ADR 盤勢型態提醒】預設關閉 (不要沒問過使用者就多送通知);
     # 使用者在編輯器打開後,才會依 pattern_lookback/pattern_near_pct/
     # pattern_list 跑 core/market_pattern.py 的判斷並用 Telegram/日誌提醒。
+    # 【ADR-152】每日晨間狀態報告:交易日早上把「這檔策略現在是什麼狀況」
+    # 推到手機 —— 目前部位/損益、移動停利線在哪、離停損還有幾點、月線(SMA20)
+    # 條件、有沒有待確認的進出場。預設**開啟**:這是唯讀的狀態報告,不會下單,
+    # 而終極波段是「每天只看一次收盤、隔天中午才確認」的慢節奏策略,使用者
+    # 沒有別的管道知道它今天打算做什麼。
+    s['status_notify'] = True
+    s['status_notify_time'] = STATUS_NOTIFY_DEFAULT_TIME
     s['pattern_enabled'] = False
     s['pattern_lookback'] = market_pattern.DEFAULT_PARAMS['lookback']
     s['pattern_near_pct'] = market_pattern.DEFAULT_PARAMS['near_pct']
     s['pattern_list'] = list(market_pattern.DEFAULT_PARAMS['enabled_patterns'])
     return s
+
+
+# 【ADR-152】每日狀態報告的預設時刻。09:10 是使用者指定的:台股 09:00 開盤、
+# 盤中零股 09:10 開盤,那時昨天的日K 已經定案、今天的盤也剛開,是「看一眼今天
+# 這檔策略打算做什麼」最合適的時點。
+STATUS_NOTIFY_DEFAULT_TIME = '09:10'
+
+
+def status_notify_enabled(strategy):
+    """有沒有開每日狀態報告。舊策略檔沒有這個欄位 → 開啟。
+
+    預設開啟與 `pattern_enabled` 預設關閉的差別在於:型態提醒是**判斷**
+    (會多送很多則、而且是主觀的),狀態報告是**唯讀的事實陳述**,一天一則,
+    而且終極波段的節奏慢到使用者沒有別的管道知道它今天打算做什麼。
+    """
+    v = (strategy or {}).get('status_notify', True)
+    return True if v is None else bool(v)
+
+
+def status_notify_time_of(strategy):
+    """狀態報告的時刻 'HH:MM';格式壞掉退回預設。"""
+    raw = str((strategy or {}).get('status_notify_time', '') or '').strip()
+    try:
+        hh, mm = raw.split(':')[:2]
+        hh, mm = int(hh), int(mm)
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return f"{hh:02d}:{mm:02d}"
+    except (ValueError, AttributeError):
+        pass
+    return STATUS_NOTIFY_DEFAULT_TIME
+
+
+def should_send_daily_status(strategy, dt, last_notify_date):
+    """現在該不該送這檔策略的每日狀態報告。→ bool。
+
+    三個條件:功能開著、**是交易日**、已經過了設定的時刻、今天還沒送過。
+
+    **刻意用「過了時刻就送」而不是「剛好等於那一分鐘」**(沿用 ADR-132 的做法):
+    程式可能在 09:10 當下沒開、或正忙著別的事而錯過那一分鐘。錯過就整天不發,
+    對一天只發一次的通知來說是最糟的失敗模式 —— 使用者不會知道自己漏掉了。
+    配合 last_notify_date 的每日去重,「過了就送」不會變成重複轟炸。
+
+    交易日只判斷**週一~週五**:這個專案沒有國定假日行事曆(`market_session`
+    也只做到星期幾)。假日誤送一則的代價,遠小於為了它去維護一份會過期的
+    假日表;而且假日沒有新的日K,報告會直接說「日K 尚未更新」。
+
+    dt 由呼叫端傳入(不在這裡讀時鐘),測試才驗得到邊界(P-94)。
+    """
+    if not status_notify_enabled(strategy):
+        return False
+    if not strategy or not strategy.get('enabled'):
+        return False            # 沒在跑的策略不必報告
+    if dt is None:
+        return False
+    try:
+        if dt.weekday() >= 5:
+            return False
+        today = dt.strftime('%Y-%m-%d')
+        cur_min = dt.hour * 60 + dt.minute
+    except AttributeError:
+        return False
+    if str(last_notify_date or '') == today:
+        return False
+    hh, mm = (int(x) for x in status_notify_time_of(strategy).split(':'))
+    return cur_min >= hh * 60 + mm
+
+
+def _fmt_pt(v):
+    """點位/點數一律一位小數,並帶正負號的地方自己加。"""
+    try:
+        return f"{float(v):,.1f}"
+    except (TypeError, ValueError):
+        return "--"
+
+
+def daily_status_report(strategy, rt, daily_df, dt=None):
+    """組出這檔策略的每日狀態報告文字。資料不足時回 None(呼叫端不要送)。
+
+    【為什麼用「最近一根已收盤日K」而不是盤中即時價】這檔策略的**每一個**判斷
+    (進場、停損、點數移動停利、SMA20 切換)都以日收盤為準;拿 09:10 剛開盤的
+    即時價去講「符合什麼條件」會與策略實際的判斷不一致,而那正是最會誤導人的
+    一種報告。報告開頭會標明基準日與基準價,使用者一眼看得出來這是「截至昨收」。
+
+    算式一律沿用 `on_daily_close()` 裡的同一份(獲利、停利線、SMA20)——
+    報告與引擎各算一份遲早分歧(P-67),而分歧的後果是使用者照著一份錯的
+    報告做決定。
+    """
+    if daily_df is None or len(daily_df) < 20:
+        return None
+    ensure_runtime(rt)
+    params = params_of(strategy)
+    direction = direction_of(strategy)
+    X, Y, _Z, S1, _S2, C, F = (params[k] for k in ('x', 'y', 'z', 's1', 's2', 'c', 'f'))
+
+    bar_date = str(daily_df.index[-1]).split(' ')[0]
+    close = float(daily_df['Close'].iloc[-1])
+    sma20 = float(daily_df['Close'].rolling(20).mean().iloc[-1])
+    position = _position_of(rt)
+    entry_px = float(rt.get('entry_index_price', 0) or 0)
+
+    name = strategy.get('name') or STRATEGY_NAME
+    today = (dt.strftime('%Y-%m-%d') if dt is not None else bar_date)
+    L = [f"【自動交易-終極波段】{name} {today} 晨間狀態",
+         f"基準:{bar_date} 加權指數收盤 {_fmt_pt(close)} 點 "
+         f"(本策略一切判斷都以日收盤為準,不看盤中跳動)"]
+
+    # ---- 月線 (SMA20) ----
+    if sma20 == sma20:      # 非 NaN
+        rel = "站上" if close > sma20 else ("跌破" if close < sma20 else "剛好等於")
+        L.append(f"月線(SMA20):{_fmt_pt(sma20)} 點,收盤{rel}月線 "
+                 f"({_fmt_pt(close - sma20)} 點)")
+
+    # ---- 部位 ----
+    if position == 'FLAT':
+        L.append(f"部位:空手 ({direction})")
+        if direction == '做多':
+            gap = close - X
+            L.append(f"進場條件:收盤突破 X={_fmt_pt(X)} → 目前{'已突破' if gap > 0 else '尚差'} "
+                     f"{_fmt_pt(abs(gap))} 點")
+        else:
+            gap = X - close
+            L.append(f"進場條件:收盤跌破 X={_fmt_pt(X)} → 目前{'已跌破' if gap > 0 else '尚差'} "
+                     f"{_fmt_pt(abs(gap))} 點")
+    else:
+        qty = int(rt.get('qty', 0) or 0)
+        L.append(f"部位:{'多單' if position == 'LONG' else '空單'} {qty} 口,"
+                 f"進場點位 {_fmt_pt(entry_px)} 點")
+        if entry_px > 0:
+            profit = (close - entry_px) if position == 'LONG' else (entry_px - close)
+            L.append(f"目前損益:{profit:+,.1f} 點 (以 {bar_date} 收盤計)")
+        else:
+            profit = 0.0
+            L.append("目前損益:-- (沒有記錄到進場點位)")
+
+        # ---- 停損 ----
+        if position == 'LONG':
+            L.append(f"停損條件:收盤跌破 Y={_fmt_pt(Y)} → 目前高於停損線 "
+                     f"{_fmt_pt(close - Y)} 點")
+        else:
+            L.append(f"停損條件:收盤突破 S1={_fmt_pt(S1)} → 目前低於停損線 "
+                     f"{_fmt_pt(S1 - close)} 點")
+
+        # ---- 停利 ----
+        if rt.get('sma20_mode'):
+            L.append("停利模式:**已切換 SMA20 移動停利** —— "
+                     f"{'收盤跌破' if position == 'LONG' else '收盤突破'}月線就列入待確認出場"
+                     " (不會再切回點數模式)")
+        elif rt.get('trail_armed'):
+            tb = float(rt.get('trail_base', entry_px) or entry_px)
+            if position == 'LONG':
+                L.append(f"停利模式:點數移動停利**已啟動**,停利線 {_fmt_pt(tb)} 點,"
+                         f"目前高於停利線 {_fmt_pt(close - tb)} 點 (步幅 F={_fmt_pt(F)})")
+            else:
+                L.append(f"停利模式:點數移動停利**已啟動**,停利線 {_fmt_pt(tb)} 點,"
+                         f"目前低於停利線 {_fmt_pt(tb - close)} 點 (步幅 F={_fmt_pt(F)})")
+            L.append(f"　　切換 SMA20 的條件:獲利已過 C,只要收盤"
+                     f"{'站上' if position == 'LONG' else '跌破'}月線就切換")
+        else:
+            need = C - profit
+            L.append(f"停利模式:尚未啟動 (啟動門檻 C={_fmt_pt(C)} 點,"
+                     f"目前獲利 {profit:+,.1f} 點,還差 {_fmt_pt(max(0.0, need))} 點)")
+
+    # ---- 待確認 (這檔策略的核心節奏:今天列待確認,隔天 12:00 才真的動作) ----
+    pe = rt.get('pending_entry')
+    px_ = rt.get('pending_exit')
+    if pe:
+        L.append(f"⚠ 待確認進場:{pe.get('date')} 收盤已符合,"
+                 f"**今天 12:00** 加權指數若仍在 X={_fmt_pt(X)} 的"
+                 f"{'上方' if pe.get('dir') == 'LONG' else '下方'},12:01 就會進場")
+    if px_:
+        why = _REASON_LABEL.get(px_.get('reason'), px_.get('reason'))
+        L.append(f"⚠ 待確認出場({why}):{px_.get('date')} 收盤已觸發,"
+                 f"**今天 12:00** 若條件仍成立,12:01 就會平倉")
+    if not pe and not px_:
+        L.append("待確認事項:無 (今天 12:00 沒有預定要執行的動作)")
+
+    L.append(f"模式:{strategy.get('mode', '模擬')}｜"
+             f"參數 X={_fmt_pt(X)} "
+             + (f"Y={_fmt_pt(Y)} " if direction == '做多' else f"S1={_fmt_pt(S1)} ")
+             + f"C={_fmt_pt(C)} F={_fmt_pt(F)}")
+    return "\n".join(L)
 
 
 def validate(strategy):

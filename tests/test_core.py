@@ -9584,6 +9584,176 @@ class TestBacktestTimedEntryAndSession(unittest.TestCase):
         self.assertNotIn('零股**沒有 K 線**', txt)
 
 
+class TestChukuangrenDailyStatus(unittest.TestCase):
+    """【ADR-152】終極波段的每日晨間狀態報告。
+
+    使用者:「終極波段策略,有在啟動中,有辦法每天判斷報告目前策略的狀況…
+    然後在市場交易日,每天 09:10 用訊息通知我。」
+    """
+
+    def _df(self, n=40, start=41000.0, end=42500.0):
+        idx = pd.date_range("2026-06-01", periods=n, freq="D")
+        c = np.linspace(start, end, n)
+        return pd.DataFrame({'Open': c, 'High': c + 50, 'Low': c - 50,
+                             'Close': c, 'Volume': [1] * n}, index=idx)
+
+    def _s(self, **kw):
+        s = chukuangren_band.default_strategy()
+        s.update({'name': '終極波段', 'enabled': True, 'mode': '實單',
+                  'direction': '做多', 'ck_x': 41500.0, 'ck_y': 41200.0,
+                  'ck_c': 300.0, 'ck_f': 100.0})
+        s.update(kw)
+        return s
+
+    # ---------- 時刻判斷 ----------
+
+    def test_sends_after_the_configured_time_on_a_weekday(self):
+        s = self._s()
+        wed = datetime.datetime(2026, 8, 5, 9, 10)     # 週三 09:10
+        self.assertTrue(chukuangren_band.should_send_daily_status(s, wed, None))
+
+    def test_not_before_the_configured_time(self):
+        s = self._s()
+        self.assertFalse(chukuangren_band.should_send_daily_status(
+            s, datetime.datetime(2026, 8, 5, 9, 9), None))
+
+    def test_late_start_still_gets_todays_report(self):
+        """「過了時刻就送」—— 程式 11:00 才開,今天那一則仍要補送。
+        錯過就整天不發,是一天一則的通知最糟的失敗模式。"""
+        s = self._s()
+        self.assertTrue(chukuangren_band.should_send_daily_status(
+            s, datetime.datetime(2026, 8, 5, 11, 0), None))
+
+    def test_only_once_per_day(self):
+        s = self._s()
+        self.assertFalse(chukuangren_band.should_send_daily_status(
+            s, datetime.datetime(2026, 8, 5, 11, 0), '2026-08-05'))
+        # 隔天要再送
+        self.assertTrue(chukuangren_band.should_send_daily_status(
+            s, datetime.datetime(2026, 8, 6, 9, 10), '2026-08-05'))
+
+    def test_not_on_weekends(self):
+        """使用者原話:「在市場交易日」。"""
+        for d in (8, 9):        # 2026-08-08 週六 / 08-09 週日
+            self.assertFalse(chukuangren_band.should_send_daily_status(
+                self._s(), datetime.datetime(2026, 8, d, 9, 10), None),
+                f"2026-08-{d} 是週末,不該發")
+
+    def test_disabled_strategy_gets_no_report(self):
+        """反向對照:沒在跑的策略不必報告。"""
+        self.assertFalse(chukuangren_band.should_send_daily_status(
+            self._s(enabled=False), datetime.datetime(2026, 8, 5, 9, 10), None))
+
+    def test_can_be_turned_off(self):
+        self.assertFalse(chukuangren_band.should_send_daily_status(
+            self._s(status_notify=False), datetime.datetime(2026, 8, 5, 9, 10), None))
+
+    def test_custom_time(self):
+        s = self._s(status_notify_time='13:45')
+        self.assertFalse(chukuangren_band.should_send_daily_status(
+            s, datetime.datetime(2026, 8, 5, 13, 44), None))
+        self.assertTrue(chukuangren_band.should_send_daily_status(
+            s, datetime.datetime(2026, 8, 5, 13, 45), None))
+
+    def test_defaults_and_bad_time_fall_back(self):
+        self.assertEqual(chukuangren_band.status_notify_time_of({}),
+                         chukuangren_band.STATUS_NOTIFY_DEFAULT_TIME)
+        self.assertEqual(chukuangren_band.status_notify_time_of(
+            {'status_notify_time': '亂填'}), chukuangren_band.STATUS_NOTIFY_DEFAULT_TIME)
+        self.assertEqual(chukuangren_band.status_notify_time_of(
+            {'status_notify_time': '9:5'}), '09:05')
+        self.assertTrue(chukuangren_band.status_notify_enabled({}))
+
+    # ---------- 報告內容 ----------
+
+    def _report(self, rt, **kw):
+        return chukuangren_band.daily_status_report(
+            self._s(**kw), rt, self._df(), datetime.datetime(2026, 8, 5, 9, 10))
+
+    def test_long_position_report_covers_what_user_asked(self):
+        """使用者列的項目:移動停利點數、月線條件、其他條件、虧損多少、停損條件。"""
+        rt = chukuangren_band.ensure_runtime(
+            {'state': 'LONG', 'qty': 2, 'entry_index_price': 41600.0})
+        rt['trail_armed'] = True
+        rt['trail_base'] = 42100.0
+        txt = self._report(rt)
+        for need in ('多單', '進場點位', '目前損益', '停損條件',
+                     '移動停利', '42,100', '月線(SMA20)', '待確認'):
+            self.assertIn(need, txt, f"報告缺少「{need}」")
+
+    def test_profit_matches_the_engine_formula(self):
+        """損益必須與引擎同一份算式 (收盤 − 進場點位),不可以另算一份。"""
+        rt = chukuangren_band.ensure_runtime(
+            {'state': 'LONG', 'qty': 1, 'entry_index_price': 41600.0})
+        txt = self._report(rt)
+        self.assertIn('+900.0 點', txt)     # 42500 − 41600
+
+    def test_short_position_uses_s1_not_y(self):
+        rt = chukuangren_band.ensure_runtime(
+            {'state': 'SHORT', 'qty': 1, 'entry_index_price': 42800.0})
+        txt = chukuangren_band.daily_status_report(
+            self._s(direction='做空', ck_s1=43000.0), rt, self._df(),
+            datetime.datetime(2026, 8, 5, 9, 10))
+        self.assertIn('空單', txt)
+        self.assertIn('S1', txt)
+        self.assertNotIn('跌破 Y=', txt)
+
+    def test_flat_report_shows_distance_to_x(self):
+        rt = chukuangren_band.ensure_runtime({'state': 'FLAT'})
+        txt = self._report(rt)
+        self.assertIn('空手', txt)
+        self.assertIn('X=41,500.0', txt)
+
+    def test_pending_entry_is_announced(self):
+        """這檔策略的核心節奏:今天列待確認,隔天 12:00 才真的動作 ——
+        那正是使用者最需要提前知道的一件事。"""
+        rt = chukuangren_band.ensure_runtime({'state': 'FLAT'})
+        rt['pending_entry'] = {'dir': 'LONG', 'date': '2026-08-04'}
+        txt = self._report(rt)
+        self.assertIn('待確認進場', txt)
+        self.assertIn('12:00', txt)
+
+    def test_pending_exit_is_announced_with_reason(self):
+        rt = chukuangren_band.ensure_runtime(
+            {'state': 'LONG', 'qty': 1, 'entry_index_price': 41600.0})
+        rt['pending_exit'] = {'reason': 'SL', 'date': '2026-08-04'}
+        txt = self._report(rt)
+        self.assertIn('待確認出場', txt)
+        self.assertIn('固定停損', txt)
+
+    def test_sma20_mode_is_stated(self):
+        rt = chukuangren_band.ensure_runtime(
+            {'state': 'LONG', 'qty': 1, 'entry_index_price': 41600.0})
+        rt['sma20_mode'] = True
+        self.assertIn('SMA20 移動停利', self._report(rt))
+
+    def test_report_states_the_basis_is_daily_close(self):
+        """報告用的是**日收盤**不是盤中即時價 —— 不標明就會誤導。"""
+        rt = chukuangren_band.ensure_runtime({'state': 'FLAT'})
+        txt = self._report(rt)
+        self.assertIn('收盤', txt)
+        self.assertIn('日收盤為準', txt)
+
+    def test_insufficient_data_returns_none(self):
+        """反向對照:資料不足就不要發一則半殘的報告。"""
+        rt = chukuangren_band.ensure_runtime({'state': 'FLAT'})
+        self.assertIsNone(chukuangren_band.daily_status_report(
+            self._s(), rt, self._df(n=10), datetime.datetime(2026, 8, 5, 9, 10)))
+        self.assertIsNone(chukuangren_band.daily_status_report(
+            self._s(), rt, None, datetime.datetime(2026, 8, 5, 9, 10)))
+
+    def test_report_is_pushed_to_phone(self):
+        """接線:報告的前綴要被 telegram_notify 認得,而且**不可以被合併掉**
+        (一天一則,被 ADR-148 的 burst 節流吃掉就是整天沒看到)。"""
+        rt = chukuangren_band.ensure_runtime({'state': 'FLAT'})
+        txt = self._report(rt)
+        self.assertTrue(telegram_notify.is_quant_message(txt))
+        self.assertTrue(telegram_notify.always_send(txt))
+        st = {}
+        for _ in range(3):
+            self.assertTrue(telegram_notify.should_send(txt, 1000.0, st)[0])
+
+
 class TestResetDailyCounters(unittest.TestCase):
     """【ADR-150】換日重置抽成共用函式 —— 回測的自訂策略路徑不經過
     evaluate_strategy,少了這一份 trades_today 會一路累加。"""
