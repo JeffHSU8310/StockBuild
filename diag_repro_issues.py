@@ -6390,7 +6390,14 @@ def _day_pct_watch_ab_140():
 
     def _pass():
         app._qt_last_boundary = {}          # 每次都讓 K 棒邊界閘門放行
-        app._quant_eval_pass()
+        # 【ADR-123 的教訓,這裡漏掉了一次】一定要走 eval_pass(),不可以直接
+        # 呼叫 app._quant_eval_pass()。後者對分K策略有一道「給資料源 2 秒緩衝」
+        # 的閘門 (`if (now_dt - boundary).total_seconds() < 2: continue`),
+        # 剛好落在那 2 秒內的話整檔策略**完全不會被評估**,斷言就莫名其妙紅一次。
+        # 這個案例第一版寫成直接呼叫,於是在 main 上重跑時紅了一次
+        # (「股票:A 當日跌 4% > X=3% 應該進場買進 B (實際 state=FLAT)」),
+        # 而程式其實完全沒問題 —— 純粹是時鐘。見 P-127。
+        eval_pass()
         app.flush_after()
 
     try:
@@ -6986,6 +6993,65 @@ def _odd_lot_audit_146():
 
 run_case("ADR-146: 零股機制稽核 (09:10開盤/只能限價/數量1~999股)",
          _odd_lot_audit_146)
+
+
+def _diag_self_check_no_raw_eval_pass():
+    """【P-127】診斷檔自己的自我檢查:不可以有人再直接呼叫 `_quant_eval_pass()`。
+
+    ADR-123 已經為了「K棒邊界後 2 秒緩衝」的窗口做了 `eval_pass()` 包裝,
+    但那只是一個「請大家記得用」的慣例 —— 慣例擋不住第四次。ADR-143 的案例
+    就又寫成直接呼叫,結果在 main 上重跑時紅了一次,而程式碼完全沒問題。
+
+    偶發紅比一直紅更貴:它會讓人去懷疑剛改的東西,而真正的原因是時鐘。
+    所以把慣例變成斷言。
+
+    只擋**不帶參數**的呼叫:帶 now_ts/today_str 的是 ADR-041 的 _forced,
+    本來就跳過邊界閘門,不受這個窗口影響。
+
+    ※ 用 AST 而不是字串比對:第一版用 `re` 掃行,結果**掃到自己的錯誤訊息
+      字串**,變成一個永遠紅的檢查。AST 只看真正的呼叫節點,字串與註解裡的
+      同名文字一律不算 —— 這跟 P-104 的 grid 檢查是同一個教訓。
+    """
+    import ast as _ast47
+    _tree47 = _ast47.parse(open('diag_repro_issues.py', encoding='utf-8').read())
+
+    def _is_raw_call(node):
+        """`app._quant_eval_pass()` 且**沒有帶任何參數**。"""
+        f = node.func
+        return (isinstance(f, _ast47.Attribute) and f.attr == '_quant_eval_pass'
+                and isinstance(f.value, _ast47.Name) and f.value.id == 'app'
+                and not node.args and not node.keywords)
+
+    _bad = []
+    for _fn in _ast47.walk(_tree47):
+        if not isinstance(_fn, (_ast47.FunctionDef, _ast47.AsyncFunctionDef)):
+            continue
+        if _fn.name == 'eval_pass':
+            continue                        # 包裝自己的那一個呼叫是正當的
+        for _n in _ast47.walk(_fn):
+            if isinstance(_n, _ast47.Call) and _is_raw_call(_n):
+                _bad.append(f"{_fn.name}():{_n.lineno}")
+    assert not _bad, (
+        "診斷案例不可以直接跑那個未包裝的評估函式,請改用 eval_pass() "
+        f"(它會避開 K棒邊界後 2 秒的窗口,見 P-127):{_bad}")
+
+    # 反向對照一:包裝本身要還在,而且真的有那道等待 (否則檢查變成空殼)
+    _ep = next((n for n in _ast47.walk(_tree47)
+                if isinstance(n, _ast47.FunctionDef) and n.name == 'eval_pass'), None)
+    assert _ep is not None, "eval_pass() 不見了"
+    _ep_src = _ast47.unparse(_ep)
+    assert 'now.second' in _ep_src and 'sleep' in _ep_src, \
+        "eval_pass() 少了避開 2 秒窗口的等待 —— 包裝變成空殼,偶發紅會回來"
+
+    # 反向對照二:被守的那道閘門要真的還在 production 裡。
+    # 閘門若哪天被拿掉,這個檢查就只是在防一個不存在的東西。
+    _src47b = open('stock_app_pro.py', encoding='utf-8').read()
+    assert 'total_seconds() < 2' in _src47b, \
+        "_quant_eval_pass 的 2 秒緩衝閘門不見了 —— 請重新確認 eval_pass() 還需不需要"
+
+
+run_case("診斷自我檢查:不可以繞過 eval_pass() 直接跑評估 (P-127)",
+         _diag_self_check_no_raw_eval_pass)
 
 
 print(f"{'案例':60s} 結果")
