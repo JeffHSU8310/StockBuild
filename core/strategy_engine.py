@@ -25,6 +25,8 @@ from core import sj_compat as _sjc
 # 【ADR-101】籌碼條件:籌碼在資料準備階段被併成 df 的 Chip* 欄位,
 # 條件函式簽名維持 func(df, params) 不變,實盤與回測因此自動共用同一條路。
 from core import chips_features as _cf
+# 【ADR-146】委託數量上限的單一出處 (與手動下單共用同一份)。
+from core import order_rules as _order_rules
 # 【ADR-143】當日漲跌幅要照「交易日」分組 (期貨夜盤歸下一個交易日, ADR-007)。
 from core import futures_session as _fs
 
@@ -1057,8 +1059,17 @@ def validate_strategy(s):
         q = int(s.get('qty', 0))
         if q <= 0:
             return False, "數量必須為正整數"
-        if q > 100:
-            return False, "單筆數量超過 100 (防呆上限),請確認後調整程式碼上限"
+        # 【ADR-146】上限要看**單位**。原本一律用 100,但零股的單位是「股」
+        # (1~999 是交易所規則),於是零股策略最多只能買 100 股 —— 500 股是完全
+        # 合法的卻被擋,而且訊息還叫使用者「去調整程式碼上限」,把人引導去改
+        # 一個不該改的常數。上限的單一出處在 core/order_rules (與手動下單同一份)。
+        cap, unit, is_exchange_rule = _order_rules.strategy_qty_limit(tt)
+        if q > cap:
+            if is_exchange_rule:
+                return False, (f"{tt}單筆數量須為 1~{cap} {unit} (交易所規則;"
+                               f"超過請改用整股下單)")
+            return False, (f"{tt}單筆數量超過 {cap} {unit} (本系統的防呆上限,"
+                           f"不是交易所規則)")
     except (TypeError, ValueError):
         return False, "數量必須為正整數"
     if not s.get('entry'):

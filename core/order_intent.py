@@ -21,6 +21,7 @@ core/order_intent.py — 券商中立的「委託意圖」(ADR-110 階段 1)
 `core/order_rules.py` 的職責 (鐵則 9),兩者分開是因為驗證規則要能單獨
 套用在手動下單路徑上,而那條路徑不經過這裡。
 """
+from core import order_rules
 from core import strategy_engine
 from core import tick_rules
 
@@ -119,6 +120,19 @@ def build_live_order(strategy, intent, asset_type, exec_price=None):
     if tt == '零股':
         ptype = '限價'
     is_lmt = (ptype == '限價')
+
+    # 【ADR-146 / 鐵則 9】送出前在本地擋掉不合法的數量,不依賴券商回退單。
+    #
+    # 這是**第二道**(第一道是存檔時的 validate_strategy)。兩道都要有的理由很
+    # 具體:策略存檔之後,數量還可能經由「舊策略檔的殘留值」「手動改 JSON」
+    # 「日後新增的批次調整」變動,而這裡是所有委託離開系統的最後一個關口。
+    # 零股的 1~999 股是**交易所規則**,超過一定被退 —— 被退的當下策略已經
+    # 以為自己成交了(ADR-035 的樂觀模型),部位認知就此對不上。
+    _cap, _unit, _is_rule = order_rules.strategy_qty_limit(tt)
+    if qty < 1 or qty > _cap:
+        raise ValueError(
+            f"{tt}委託數量 {qty} {_unit} 不合法,須為 1~{_cap} {_unit}"
+            + ("(交易所規則)" if _is_rule else "(本系統防呆上限)"))
 
     return {
         'symbol': sym,

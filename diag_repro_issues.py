@@ -118,6 +118,12 @@ def place_and_settle(ctx, timeout=5.0):
 
 
 results = []
+#: 【ADR-146】run_case 會把 market_session.is_market_open 凍結成永遠 True
+# (ADR-126 的時鐘防護)。要驗「交易時段規則本身」的案例必須用這一份未被凍結的
+# 原始函式 —— 用被凍結的那份,任何時間都會回 True,斷言就是空殼。
+_REAL_IS_MARKET_OPEN = stock_app_pro.market_session.is_market_open
+
+
 def run_case(name, fn):
     """【ADR-126】跑一個案例,並且**把時鐘相依的表面凍結住**。
 
@@ -6837,6 +6843,149 @@ def _realtime_entry_145():
 
 run_case("ADR-145: 即時進場 (A 即時跌破X%就買B,不等K棒收盤;看A做B/風控/時段閘門不變)",
          _realtime_entry_145)
+
+
+def _odd_lot_audit_146():
+    """【ADR-146】零股機制稽核:09:10 才開盤、只能限價、數量 1~999 股。
+
+    使用者:「我用零股下單,可下單時間是09:10之後,零股只能用限價單。
+             檢查這個機制是否有問題。」
+
+    查出來的**真 bug**:策略的數量上限一律用 100,但零股的單位是「股」——
+    零股策略最多只能買 100 股,而 500 股是完全合法的委託;而且錯誤訊息還叫
+    使用者「請確認後調整程式碼上限」,把人引導去改一個不該改的常數。
+
+    純規則已在 tests/test_core.py 釘死。這個案例走**完整下單路徑**,
+    確認三件事在實際送出去的那一刻都成立。
+    """
+    import pandas as _pd
+    from core import strategy_engine as _se46
+    from core import order_rules as _or46
+
+    class FakeContract:
+        code = '2330'
+        symbol = '2330'
+
+    sent = []
+    logs = []
+    orig_log = app.log_message
+    orig_resolve = app._qt_resolve
+    orig_running, orig_login, orig_api = app._qt_running, app.api_logged_in, app.sj_api
+    orig_strats, orig_rts = app.strategies, app.strategy_runtimes
+    orig_broker_for = app._broker_for
+
+    class FakeBroker:
+        def place_order(self, contract, oi):
+            sent.append(dict(oi))
+            class T:
+                status = type('S', (), {'status': 'Submitted'})()
+            return T()
+        def order_status_text(self, trade):
+            return 'Submitted'
+
+    def _mk(qty=500, **over):
+        st = _se46.new_strategy()
+        st.update({'name': '診斷ADR146零股', 'symbol': '2330', 'trade_type': '零股',
+                   'market': '台股', 'qty': qty, 'direction': '做多', 'mode': '實單',
+                   'enabled': True, 'timeframe': '5分K', 'slippage_ticks': 0,
+                   'entry': [{'type': 'always_true', 'params': {}}]})
+        st.update(over)
+        return st
+
+    try:
+        app.log_message = lambda m: (logs.append(str(m)), orig_log(m))[0]
+        app._qt_resolve = lambda _s: (FakeContract(), 'stock')
+        app._broker_for = lambda _s: FakeBroker()
+        app.sj_api = object(); app.api_logged_in = True; app._qt_running = True
+
+        # ---- 1. 零股 500 股:存得起來,而且真的送得出去 ----
+        st = _mk(500)
+        ok, why = _se46.validate_strategy(st)
+        assert ok, f"零股 500 股是合法委託,不該被擋:{why}"
+        sent.clear()
+        okk, msg = app._place_strategy_order(
+            st, {'kind': 'OPEN', 'action': '買進', 'qty': 500, 'price': 600.0},
+            FakeContract(), 'stock')
+        assert okk, f"零股 500 股應該送得出去:{msg}"
+        assert sent and sent[-1]['qty'] == 500, f"數量不對:{sent}"
+
+        # ---- 2. 送出去的一定是「限價 + 零股 + ROD」(鐵則6) ----
+        oi = sent[-1]
+        assert oi['price_type'] == '限價', f"零股必須限價,實際 {oi['price_type']}"
+        assert oi['order_lot'] == '零股', f"order_lot 必須是零股,實際 {oi['order_lot']}"
+        assert oi['time_in_force'] == 'ROD', f"零股只能 ROD,實際 {oi['time_in_force']}"
+        assert oi['price'] > 0, "限價單的價格不可以送 0 (那是市價的送法)"
+
+        # ---- 3. 策略被改成市價也一樣 (兩層防線任一層失效都要被抓到) ----
+        sent.clear()
+        app._place_strategy_order(
+            _mk(500, price_type='市價'),
+            {'kind': 'OPEN', 'action': '買進', 'qty': 500, 'price': 600.0},
+            FakeContract(), 'stock')
+        assert sent[-1]['price_type'] == '限價' and sent[-1]['price'] > 0, \
+            f"零股存了市價也必須退回限價,實際 {sent[-1]}"
+
+        # ---- 4. 超過 999 股:存不進去,而且送出前也擋得住 (鐵則9,兩道) ----
+        ok2, why2 = _se46.validate_strategy(_mk(1000))
+        assert not ok2, "零股 1000 股超過交易所規則,不該存得起來"
+        assert '999' in why2 and '交易所' in why2, f"訊息要講對規則來源:{why2}"
+        assert '程式碼' not in why2, \
+            "交易所規則不可以叫使用者去改程式碼上限 (原本的訊息就是這樣寫的)"
+        sent.clear()
+        okk3, msg3 = app._place_strategy_order(
+            _mk(1), {'kind': 'OPEN', 'action': '買進', 'qty': 5000, 'price': 600.0},
+            FakeContract(), 'stock')
+        assert not okk3 and not sent, \
+            f"送出前就要擋掉 5000 股 (不依賴券商退單),實際 sent={sent}"
+        assert '999' in str(msg3), f"擋下的訊息要講出上限:{msg3}"
+
+        # ---- 5. 反向對照:整股/期貨的 100 張防呆上限沒有被放寬成 999 ----
+        okl, whyl = _se46.validate_strategy(_mk(101, trade_type='股票'))
+        assert not okl and '100' in whyl and '防呆' in whyl, \
+            f"整股 101 張要被防呆上限擋下,而且要講明不是交易所規則:{whyl}"
+        assert _se46.validate_strategy(_mk(100, trade_type='股票'))[0], \
+            "整股 100 張要放行 (邊界)"
+
+        # ---- 6. 零股不可做空 ----
+        oks, whys = _se46.validate_strategy(_mk(500, direction='做空'))
+        assert not oks and '期貨' in whys, f"零股不該能做空:{whys}"
+    finally:
+        app.log_message = orig_log
+        app._qt_resolve = orig_resolve
+        app._broker_for = orig_broker_for
+        app._qt_running, app.api_logged_in, app.sj_api = orig_running, orig_login, orig_api
+        app.strategies, app.strategy_runtimes = orig_strats, orig_rts
+
+    # ---- 7. 交易時段閘門:零股 09:10 才開,而且三條會下單的路徑都吃這一道 ----
+    _wed = lambda hh, mm: stock_app_pro.datetime(2026, 8, 5, hh, mm)
+    # 用未被凍結的那一份 —— run_case 把 is_market_open 換成永遠 True 了,
+    # 拿它來驗時段規則會是空殼 (見 _REAL_IS_MARKET_OPEN 的說明)。
+    _open = _REAL_IS_MARKET_OPEN
+    assert not _open('零股', dt=_wed(9, 9)), "09:09 零股不該開盤"
+    assert _open('零股', dt=_wed(9, 10)), "09:10 零股要開盤 (邊界)"
+    assert _open('零股', dt=_wed(13, 30)), "13:30 還在盤中 (邊界)"
+    assert not _open('零股', dt=_wed(13, 31)), "13:31 已收盤"
+    assert not _open('零股', dt=stock_app_pro.datetime(2026, 8, 8, 10, 0)), "週末不該開盤"
+    # 反向對照:整股 09:00 就開了,不可以被零股的規則帶歪
+    assert _open('股票', dt=_wed(9, 0)), "整股 09:00 就開盤"
+
+    _src46 = open('stock_app_pro.py', encoding='utf-8').read()
+    for _fn in ('_quant_eval_pass', '_qt_check_realtime_futures_stops',
+                '_qt_check_realtime_entries'):
+        import re as _re46
+        _i = _src46.index(f'    def {_fn}(')
+        _m = _re46.search(r'\n    def (?!' + _fn + r'\b)\w+', _src46[_i:])
+        _seg = _src46[_i:_i + _m.start()]
+        assert 'market_session.is_market_open' in _seg, \
+            f"{_fn} 少了交易時段閘門 —— 零股在 09:10 之前送單一定被退 (ADR-124)"
+
+    # ---- 8. 上限只有一份 (原本就是兩份各自維護才出錯的,P-67) ----
+    assert _or46.strategy_qty_limit('零股')[0] == _or46.MAX_QTY_ODD, \
+        "策略與手動下單的零股上限必須是同一個常數"
+
+
+run_case("ADR-146: 零股機制稽核 (09:10開盤/只能限價/數量1~999股)",
+         _odd_lot_audit_146)
 
 
 print(f"{'案例':60s} 結果")
