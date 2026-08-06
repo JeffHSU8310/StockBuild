@@ -9161,6 +9161,13 @@ class StockTradingAppPro(tk.Tk):
                         if b_df is None or b_df.empty:
                             continue  # B 沒有可用價格,先不動作 (可能 B 剛好無資料)
                         b_exec_price = float(b_df['Close'].iloc[-1])
+                    # 【ADR-145】把 A 的已收盤 K 棒快取起來給「即時進場」用。
+                    # 即時那條路**絕不可以自己抓 K 線** —— 它跟即時停損共用同一個
+                    # tick,阻塞會拖住停損 (P-90)。這裡順手存下來,即時路徑只做
+                    # 「快取的 df + 現在的價」的純計算。
+                    if strategy_engine.realtime_entry_enabled(s):
+                        rt['_live_a_df'] = df
+                        rt['_live_b_df'] = b_df if strategy_engine.watch_enabled(s) else df
                     if s.get('kind') == 'custom':
                         # 【ADR-040】自訂策略:在子行程執行 on_bar (逾時保護),
                         # 取決策後轉成與內建同格式的 intent → 下游 risk_check/下單完全同路。
@@ -9255,6 +9262,10 @@ class StockTradingAppPro(tk.Tk):
     def _qt_update_realtime_pnl(self):
         try:
             needed = {}
+            # 【ADR-145】即時進場要監看的是 **A(訊號來源)**,而且是在「還沒進場」
+            # 的時候 —— 原本這份名單只收「已經有部位」的 B,所以即時通道天生
+            # 只能做出場。這裡把 A 補進來。
+            live_entry_syms = {}
             for s in self.strategies:
                 if not s.get('enabled'):
                     continue
@@ -9263,6 +9274,14 @@ class StockTradingAppPro(tk.Tk):
                     c, _ = self._qt_resolve(s)
                     if c:
                         needed[s.get('symbol')] = c
+                if strategy_engine.realtime_entry_enabled(s):
+                    try:
+                        w_c, _w_a, w_sym, _w_m = self._qt_resolve_watch(s)
+                        if w_c is not None and w_sym:
+                            needed[w_sym] = w_c
+                            live_entry_syms[s['id']] = w_sym
+                    except Exception:
+                        pass
             
             # 【新ADR 多帳戶】所有帳戶的持倉都要納入標記價更新範圍,不是只看
             # 單一帳戶——不同策略可能把部位分散記在不同帳戶裡。
@@ -9299,10 +9318,122 @@ class StockTradingAppPro(tk.Tk):
                 # 不額外呼叫 API (鐵則5:snapshots() 節流)——期貨標的一旦價格觸及
                 # 使用者設定的停損%/停利%/停損點數/停利點數,不等K棒收盤立刻出場。
                 self._qt_check_realtime_futures_stops(live_price_by_symbol)
+                # 【ADR-145】同一份 snapshots 結果再跑一次「即時進場」——
+                # 不額外呼叫 API (鐵則5)。順序刻意在停損之後:要走的先走完,
+                # 再看要不要進場,同一個 tick 不會又出又進。
+                self._qt_check_realtime_entries(live_price_by_symbol, live_entry_syms)
                 return True
         except Exception:
             pass
         return False
+
+    def _qt_check_realtime_entries(self, live_price_by_symbol, live_entry_syms):
+        """【ADR-145】用即時報價判斷「當日漲跌幅」類的**進場**條件,不等 K 棒收盤。
+
+        使用者要的是「當 A 盤中**即時**跌幅超過 X% 就買進 B」。ADR-143 的條件
+        本身沒問題,但引擎的進場只在 K 棒收盤時評估;即時通道原本又只做出場。
+        這裡補上進場那一半。
+
+        設計上刻意與 `_qt_check_realtime_futures_stops` **同一套骨架**:
+        同一份 snapshots 結果、同樣的交易時段閘門、同樣的風控、同樣的下單/記帳
+        路徑。差別只有「判斷的是進場而不是出場」。
+
+        三件刻意不做的事:
+          1. **不自己抓 K 線**。A 的已收盤 K 棒是 `_quant_eval_pass` 順手快取進
+             runtime 的;這條路跟即時停損共用同一個 tick,阻塞會拖住停損 (P-90)。
+          2. **不繞過風控**。`risk_check` 照跑 —— 每日進場上限、冷卻秒數、
+             熔斷全部有效,而且與 K 棒路徑用的是同一份規則。
+          3. **不放寬「哪些條件算得出來」**。進場條件只要有一條需要 K 棒序列,
+             這條路直接不做並記日誌,退回 K 棒模式 (見 live_entry_supported)。
+        """
+        for s in list(self.strategies):
+            if not s.get('enabled'):
+                continue
+            if not strategy_engine.realtime_entry_enabled(s):
+                continue
+            sym_a = (live_entry_syms or {}).get(s['id'])
+            live_price = live_price_by_symbol.get(sym_a) if sym_a else None
+            if live_price is None:
+                continue
+            # 【ADR-124 的閘門】市場關閉時不可以下單 —— 與即時停損同一道。
+            if s.get('session_gate', True) and not market_session.is_market_open(
+                    strategy_engine.trade_type_of(s),
+                    include_night=strategy_engine.include_night_of(s)):
+                continue
+            rt = self._qt_runtime(s['id'])
+            # 條件不支援即時就講一次話再放棄 —— 靜默失效會讓使用者以為在跑
+            ok_live, why_live = strategy_engine.live_entry_supported(s)
+            if not ok_live:
+                if not rt.get('_live_warned'):
+                    rt['_live_warned'] = True
+                    self.safe_after(0, self.log_message,
+                                    f"【即時進場】策略「{s.get('name')}」沒有啟用:{why_live}")
+                continue
+            a_df = rt.get('_live_a_df')
+            if a_df is None or len(a_df) < 2:
+                continue
+            intent = strategy_engine.check_realtime_entry(s, rt, a_df, live_price)
+            if intent is None:
+                continue
+            # 風控與 K 棒路徑同一份 (每日進場上限/冷卻/熔斷)
+            ok_risk, why_risk = strategy_engine.risk_check(s, rt, intent, time.time())
+            if not ok_risk:
+                self.safe_after(0, self.log_message,
+                                f"【自動交易-風控擋單】策略「{s.get('name')}」[即時進場] — {why_risk}")
+                continue
+            try:
+                contract, asset_type = self._qt_resolve(s)
+                if contract is None:
+                    continue
+                # 【看A做B】訊號在 A、下單在 B。成交價一定要用 B 的價 ——
+                # A 是加權指數的話,拿指數點數去下股票單是完全錯的。
+                exec_px = live_price
+                sym_b = s.get('symbol', '')
+                if strategy_engine.watch_enabled(s):
+                    b_live = live_price_by_symbol.get(sym_b)
+                    if b_live is None:
+                        b_df = rt.get('_live_b_df')
+                        try:
+                            b_live = float(b_df['Close'].iloc[-1]) if b_df is not None else None
+                        except Exception:
+                            b_live = None
+                    if b_live is None:
+                        # 拿不到 B 的價就不送 —— 絕不拿 A 的價當 B 的成交價
+                        self.safe_after(0, self.log_message,
+                                        f"【即時進場】策略「{s.get('name')}」訊號成立,"
+                                        f"但取不到 {sym_b} 的價格,這一輪先不送單 (下一輪再試)。")
+                        continue
+                    exec_px = float(b_live)
+                label = (f"策略「{s.get('name')}」{intent['action']} {intent['qty']} {sym_b} "
+                         f"@ {exec_px:g} [即時進場,A={sym_a} {live_price:g}]")
+                if s.get('mode') == '實單' and self._qt_running:
+                    sent, msg = self._place_strategy_order(s, intent, contract, asset_type,
+                                                          exec_price=exec_px)
+                    if not sent:
+                        self.safe_after(0, self.log_message,
+                                        f"【自動交易-實單失敗】{label} — {msg} (狀態未變更,下次再試)")
+                        continue
+                    strategy_engine.apply_fill(s, rt, intent, time.time(), exec_price=exec_px)
+                    self.safe_after(0, self.log_message,
+                                    f"【自動交易-實單】🔥 {label} | {intent['reason']} | {msg}")
+                else:
+                    strategy_engine.apply_fill(s, rt, intent, time.time(), exec_price=exec_px)
+                    acct = self._qt_paper_acct_for(s)
+                    paper_account.apply_fill(
+                        acct, datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        s.get('market', '台股'), sym_b, intent['action'], intent['kind'],
+                        intent['qty'], exec_px, trade_type=strategy_engine.trade_type_of(s))
+                    paper_account.mark_price(acct, sym_b, exec_px)
+                    self._qt_save_paper()
+                    self.safe_after(0, self.log_message,
+                                    f"【自動交易-模擬】🧪 {label} | {intent['reason']} → 已記入模擬帳戶")
+                self._qt_save_state()
+                self.safe_after(0, self._qt_refresh_tree)
+                if getattr(self, '_paper_win', None) and self._paper_win.winfo_exists():
+                    self.safe_after(0, self._qt_refresh_paper_account)
+            except Exception as e:
+                self.safe_after(0, self.log_message,
+                                f"【自動交易-即時進場異常】策略「{s.get('name')}」: {type(e).__name__}: {e}")
 
     def _qt_check_realtime_futures_stops(self, live_price_by_symbol):
         """【新ADR】期貨標的用內建停損%/停利%/停損點數(元)/停利點數(元) 時,
@@ -9819,6 +9950,9 @@ class StockTradingAppPro(tk.Tk):
         tk.Label(_risk2, text="可分批進場次數", bg="#1A2026", fg="#FFCA28",
                  font=('微軟正黑體', 9, 'bold')).pack(side=tk.LEFT)
         e_maxent2 = _ent(_risk2, s.get('max_entries', 1), 4); e_maxent2.pack(side=tk.LEFT, padx=(2, 8))
+        # 【ADR-145】自訂策略**刻意不提供**「即時進場」:它的進場邏輯寫在
+        # on_bar() 裡,而 on_bar 天生就是「一根 K 棒呼叫一次」的模型,
+        # 沒有「用即時價重算一次」的語意。硬加會變成一個勾了卻不會動的框。
         tk.Label(_risk2, text="每日進場上限", bg="#1A2026", fg="white",
                  font=('微軟正黑體', 9)).pack(side=tk.LEFT)
         e_maxd = _ent(_risk2, s.get('max_trades_per_day', 3), 5); e_maxd.pack(side=tk.LEFT, padx=(2, 8))
@@ -10882,6 +11016,13 @@ class StockTradingAppPro(tk.Tk):
         tk.Label(top, text="1=買了就不准再買(要先平倉);填 2 以上可分批建倉/加碼;0=不限",
                  bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8)).grid(
                  row=15, column=2, columnspan=4, sticky='w', pady=(6, 0))
+        # 【ADR-145】即時進場:只對「當日漲跌幅」類的進場條件有效,其他條件
+        # 需要完整 K 棒序列,勾了也會退回 K 棒模式並在日誌說明原因。
+        var_rt_entry = tk.BooleanVar(value=strategy_engine.realtime_entry_enabled(s))
+        tk.Checkbutton(top, text="⚡ 即時進場 (用即時報價判斷,不等K棒收盤;僅「當日漲跌幅」類條件)",
+                       variable=var_rt_entry, bg="#1A2026", fg="#29B6F6", selectcolor="#2A323D",
+                       font=('微軟正黑體', 9)).grid(row=16, column=0, columnspan=6,
+                                                    sticky='w', pady=(2, 0))
         _lbl(top, "每日進場上限").grid(row=3, column=0, sticky='w', pady=(6, 0))
         e_maxd = _ent(top, s.get('max_trades_per_day', 3), 6); e_maxd.grid(row=3, column=1, padx=4, pady=(6, 0))
         _lbl(top, "冷卻秒數").grid(row=3, column=2, sticky='w', padx=(10, 0), pady=(6, 0))
@@ -11145,6 +11286,7 @@ class StockTradingAppPro(tk.Tk):
             s['broker'], s['broker_account'] = _live_get()
             try: s['max_entries'] = int(e_maxent.get().strip())
             except (TypeError, ValueError): s['max_entries'] = 1
+            s['realtime_entry'] = bool(var_rt_entry.get())
             try: s['max_trades_per_day'] = int(e_maxd.get().strip())
             except (TypeError, ValueError): s['max_trades_per_day'] = 3
             s['entry_time_start'] = e_en_st.get().strip()

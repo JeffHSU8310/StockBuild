@@ -2482,6 +2482,183 @@ class TestBollingerSigmaMigration(unittest.TestCase):
             self.assertEqual(d['bb_period'], 10)   # 其他欄位沒被弄壞
 
 
+class TestRealtimeEntryADR145(unittest.TestCase):
+    """【ADR-145】即時進場:用即時報價判斷「當日漲跌幅」類進場條件,不等 K 棒收盤。
+
+    使用者:「當A(比如:加權指數)盤中**即時**跌幅超過X%,就買進B。」
+    """
+
+    def _df(self):
+        """昨收 100;今天已收盤的 K 棒最低 98.0(只跌 2%)。"""
+        idx = pd.to_datetime(['2026-08-04 13:00', '2026-08-04 13:30',
+                              '2026-08-05 09:00', '2026-08-05 09:05'])
+        return pd.DataFrame({'Open': [100, 100, 99, 98.5],
+                             'High': [100, 100, 99.5, 99.0],
+                             'Low': [100, 100, 98.5, 98.0],
+                             'Close': [100.0, 100.0, 98.5, 98.2],
+                             'Volume': [1] * 4}, index=idx)
+
+    def _s(self, **over):
+        s = strategy_engine.new_strategy()
+        s.update({'symbol': '2330', 'trade_type': '股票', 'qty': 1, 'direction': '做多',
+                  'realtime_entry': True,
+                  'entry': [{'type': 'day_drop_over', 'params': {'value': 3.0}}],
+                  'exit_signals': []})
+        s.update(over)
+        return s
+
+    # ---------- 開關 ----------
+
+    def test_off_by_default(self):
+        """會下單的功能不可以預設打開。"""
+        self.assertFalse(strategy_engine.realtime_entry_enabled(
+            strategy_engine.new_strategy()))
+        self.assertFalse(strategy_engine.realtime_entry_enabled({}))
+        self.assertFalse(strategy_engine.realtime_entry_enabled(None))
+        self.assertTrue(strategy_engine.realtime_entry_enabled({'realtime_entry': True}))
+
+    # ---------- 哪些條件算得出來 ----------
+
+    def test_only_day_pct_conditions_are_live_evaluable(self):
+        ok, _ = strategy_engine.live_entry_supported(self._s())
+        self.assertTrue(ok)
+        ok2, why2 = strategy_engine.live_entry_supported(
+            self._s(entry=[{'type': 'day_drop_over', 'params': {'value': 3.0}},
+                           {'type': 'ma_cross_up', 'params': {}}]))
+        self.assertFalse(ok2, "只要有一條需要 K 棒序列就不能只憑即時價判斷")
+        self.assertIn('均線', why2, "原因要點名是哪一條擋的")
+
+    def test_no_entry_conditions_is_not_supported(self):
+        ok, why = strategy_engine.live_entry_supported(self._s(entry=[]))
+        self.assertFalse(ok)
+        self.assertTrue(why)
+
+    def test_unsupported_conditions_never_fire(self):
+        """反向對照:條件不支援時,即時路徑必須什麼都不做 ——
+        不可以「忽略那條算不出來的條件」就進場。
+
+        測試資料刻意讓**可即時的那一條成立**(即時價 96.5 → 跌 3.5% > 3%),
+        所以只要不認得的條件被跳過,就會真的下單。第一版用的是 90.0,
+        那個價位下另一條剛好也算不成立,於是拿掉守門照樣綠 —— 那是巧合,
+        不是保護(突變測試抓到的)。
+        """
+        rt = strategy_engine.new_runtime()
+        self.assertIsNotNone(strategy_engine.check_realtime_entry(
+            self._s(), rt, self._df(), 96.5), "前提:單獨那一條在 96.5 是會成立的")
+        for bad in ('ma_cross_up', 'kd_cross_up', 'always_true', '不存在的條件'):
+            s = self._s(entry=[{'type': 'day_drop_over', 'params': {'value': 3.0}},
+                               {'type': bad, 'params': {}}])
+            self.assertIsNone(
+                strategy_engine.check_realtime_entry(s, rt, self._df(), 96.5),
+                f"混進 {bad} 之後就不可以即時進場")
+
+        # 上面那組其實**證明力不夠**:不認得的條件被當成「漲幅條件」硬算時,
+        # 在跌的那一天剛好也算出 False,所以拿掉守門照樣是 None(突變測試抓到)。
+        # 這裡改用**漲的一天**:不認得的條件被硬算成漲幅時會算出 True,
+        # 少了守門就會真的進場。
+        up_df = self._df().copy()
+        for col, vals in (('Open', [100, 101, 103]), ('High', [100, 102, 104.5]),
+                          ('Low', [100, 100.5, 102.5]), ('Close', [100.0, 101.5, 104.0])):
+            up_df.iloc[1:, up_df.columns.get_loc(col)] = vals
+        s_up = self._s(entry=[{'type': 'day_rise_over', 'params': {'value': 3.0}}])
+        self.assertIsNotNone(strategy_engine.check_realtime_entry(s_up, rt, up_df, 104.0),
+                             "前提:漲幅條件單獨在這天是會成立的")
+        for bad in ('ma_cross_up', 'always_true', '不存在的條件'):
+            s_bad = self._s(entry=[{'type': 'day_rise_over', 'params': {'value': 3.0}},
+                                   {'type': bad, 'params': {}}])
+            self.assertIsNone(
+                strategy_engine.check_realtime_entry(s_bad, rt, up_df, 104.0),
+                f"混進 {bad} 之後就不可以即時進場(它需要 K 棒序列,即時價算不出來)")
+
+    # ---------- 即時價的語意:K 棒模式的超集 ----------
+
+    def test_live_price_fires_earlier_than_the_bar_would(self):
+        """核心行為:已收盤 K 棒只跌 2%(不成立),但即時價已經跌 3.5% → 成立。"""
+        df = self._df()
+        self.assertFalse(strategy_engine._c_day_drop_over(df, {'value': 3.0}),
+                         "前提:純 K 棒模式此刻不該成立")
+        intent = strategy_engine.check_realtime_entry(
+            self._s(), strategy_engine.new_runtime(), df, 96.5)
+        self.assertIsNotNone(intent)
+        self.assertEqual(intent['kind'], 'OPEN')
+        self.assertEqual(intent['action'], '買進')
+        self.assertEqual(intent['price'], 96.5)
+        self.assertIn('即時', intent['reason'])
+
+    def test_live_price_not_low_enough_does_not_fire(self):
+        """反向對照:即時價沒跌夠就不可以進場。"""
+        self.assertIsNone(strategy_engine.check_realtime_entry(
+            self._s(), strategy_engine.new_runtime(), self._df(), 99.0))
+
+    def test_live_is_a_superset_of_the_bar_model(self):
+        """即時判斷必須是 K 棒判斷的**超集**:K 棒成立的,即時一定也成立。
+        少了這個性質,回測與實盤就會出現互相矛盾的訊號。"""
+        df = self._df()
+        # 讓 K 棒本身就成立 (最低 96 → -4%)
+        df2 = df.copy()
+        df2.iloc[-1, df2.columns.get_loc('Low')] = 96.0
+        self.assertTrue(strategy_engine._c_day_drop_over(df2, {'value': 3.0}))
+        # 即時價比較高(還沒跌那麼多)也照樣成立 —— 因為當日極值已經跌破了
+        self.assertIsNotNone(strategy_engine.check_realtime_entry(
+            self._s(), strategy_engine.new_runtime(), df2, 99.0))
+
+    def test_day_pct_change_folds_live_price_into_the_extreme(self):
+        df = self._df()
+        self.assertAlmostEqual(
+            strategy_engine.day_pct_change(df, '昨收', '盤中觸價', 'down'), -2.0)
+        self.assertAlmostEqual(
+            strategy_engine.day_pct_change(df, '昨收', '盤中觸價', 'down',
+                                           live_price=96.5), -3.5)
+        # 即時價比當日最低高 → 極值不變 (只會更早,不會更寬鬆)
+        self.assertAlmostEqual(
+            strategy_engine.day_pct_change(df, '昨收', '盤中觸價', 'down',
+                                           live_price=99.9), -2.0)
+
+    # ---------- 方向與加碼 ----------
+
+    def test_short_direction_enters_with_sell(self):
+        intent = strategy_engine.check_realtime_entry(
+            self._s(direction='做空'), strategy_engine.new_runtime(), self._df(), 96.5)
+        self.assertEqual(intent['action'], '賣出')
+
+    def test_respects_max_entries(self):
+        """已持倉且分批上限是 1 → 即時路徑也不可以再進場 (與 K 棒路徑同一份規則)。"""
+        rt = strategy_engine.new_runtime()
+        rt.update({'state': 'LONG', 'qty': 1, 'entries': 1})
+        self.assertIsNone(strategy_engine.check_realtime_entry(
+            self._s(), rt, self._df(), 96.5))
+        # 調大就可以加碼,而且方向跟現有部位一致
+        intent = strategy_engine.check_realtime_entry(
+            self._s(max_entries=3), rt, self._df(), 96.5)
+        self.assertIsNotNone(intent)
+        self.assertEqual(intent['action'], '買進')
+        self.assertIn('加碼', intent['reason'])
+
+    def test_short_position_scale_in_is_still_a_sell(self):
+        rt = strategy_engine.new_runtime()
+        rt.update({'state': 'SHORT', 'qty': 1, 'entries': 1})
+        intent = strategy_engine.check_realtime_entry(
+            self._s(max_entries=3, direction='做空'), rt, self._df(), 96.5)
+        self.assertEqual(intent['action'], '賣出', "加碼不可以變成反手")
+
+    # ---------- 壞輸入 ----------
+
+    def test_bad_inputs_return_none_not_raise(self):
+        s, rt = self._s(), strategy_engine.new_runtime()
+        self.assertIsNone(strategy_engine.check_realtime_entry(s, rt, self._df(), None))
+        self.assertIsNone(strategy_engine.check_realtime_entry(s, rt, None, 96.5))
+        self.assertIsNone(strategy_engine.check_realtime_entry(
+            s, rt, self._df().iloc[:1], 96.5))
+        # 只有當天的資料 → 算不出昨收 → 不進場 (不可以亂猜一個基準)
+        only_today = self._df().iloc[2:]
+        self.assertIsNone(strategy_engine.check_realtime_entry(s, rt, only_today, 50.0))
+
+    def test_bad_threshold_does_not_fire(self):
+        s = self._s(entry=[{'type': 'day_drop_over', 'params': {'value': 'abc'}}])
+        self.assertIsNone(strategy_engine.check_realtime_entry(
+            s, strategy_engine.new_runtime(), self._df(), 50.0))
+
+
 class TestScaleInADR144(unittest.TestCase):
     """【ADR-144】分批進場 / 加碼 —— 拆掉「買了就不准再買」的限制。
 

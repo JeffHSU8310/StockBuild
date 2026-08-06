@@ -6635,6 +6635,210 @@ run_case("ADR-144: 分批進場/加碼 (拆掉『買了就不准再買』) + 回
          _scale_in_and_backtest_log_144)
 
 
+def _realtime_entry_145():
+    """【ADR-145】即時進場:A 的即時價一跌破 X% 就買 B,不等 K 棒收盤。
+
+    使用者:「當A(比如:加權指數)盤中**即時**跌幅超過X%,就買進B。」
+
+    純判斷已經在 tests/test_core.py 釘死。這個案例守的是**接線**:
+      A. A(還沒進場的策略)有沒有被放進即時報價的監看名單 —— 原本那份名單
+         只收「已經有部位」的 B,所以即時通道天生只能做出場。
+      B. 走完整的 `_qt_update_realtime_pnl()` 之後,B 那邊真的收到買進。
+      C. 下單價用的是 **B 的價**,不是 A 的指數點數。
+      D. 沒開這個功能的策略完全不受影響(反向對照)。
+      E. 風控與交易時段閘門照樣有效。
+    """
+    import re as _re
+    import pandas as _pd
+    from core import strategy_engine as _se45
+
+    class FakeContract:
+        def __init__(self, code):
+            self.code = code
+            self.symbol = code
+
+    _base = stock_app_pro.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    _y = (_base - stock_app_pro.timedelta(days=1)).replace(hour=13, minute=30)
+    _t0 = _base.replace(hour=9, minute=0)
+    _t1 = _base.replace(hour=9, minute=5)
+    # A(加權指數)的已收盤 K 棒:昨收 100,今天最低只到 98 (跌 2%,還不到 3%)
+    _a_df = _pd.DataFrame(
+        {'Open': [100.0, 99.0, 98.5], 'High': [100.0, 99.5, 99.0],
+         'Low': [100.0, 98.5, 98.0], 'Close': [100.0, 98.5, 98.2],
+         'Volume': [1] * 3},
+        index=_pd.to_datetime([_y, _t0, _t1]))
+    _b_df = _pd.DataFrame({'Open': [600.0], 'High': [600.0], 'Low': [600.0],
+                           'Close': [600.0], 'Volume': [1]},
+                          index=[stock_app_pro.datetime.now()])
+
+    orders = []
+    logs = []
+    snaps_asked = {'codes': []}
+    live = {'A': 96.5, 'B': 600.0}      # A 即時已經跌 3.5%
+    orig_log = app.log_message
+    orig_resolve, orig_resolve_watch = app._qt_resolve, app._qt_resolve_watch
+    orig_place = app._place_strategy_order
+    orig_api, orig_login, orig_running = app.sj_api, app.api_logged_in, app._qt_running
+    orig_strats, orig_rts = app.strategies, app.strategy_runtimes
+    orig_open = stock_app_pro.market_session.is_market_open
+
+    class FakeSnap:
+        def __init__(self, code, close):
+            self.code = code
+            self.close = close
+
+    class FakeApi:
+        def snapshots(self, contracts):
+            codes = [getattr(c, 'code', '') for c in contracts]
+            snaps_asked['codes'] = list(codes)
+            out = []
+            for c in codes:
+                if c == '^TWII':
+                    out.append(FakeSnap('^TWII', live['A']))
+                else:
+                    out.append(FakeSnap(c, live['B']))
+            return out
+
+    def _mk(**over):
+        st = _se45.new_strategy()
+        st.update({'name': '診斷ADR145', 'symbol': '2330', 'trade_type': '股票',
+                   'market': '台股', 'qty': 1, 'direction': '做多', 'mode': '實單',
+                   'enabled': True, 'timeframe': '1分K', 'session_gate': False,
+                   'stop_loss_pct': 0.0, 'take_profit_pct': 0.0,
+                   'cooldown_sec': 0, 'max_trades_per_day': 99,
+                   'realtime_entry': True,
+                   'watch_enabled': True, 'watch_symbol': '^TWII',
+                   'watch_trade_type': '指數', 'watch_timeframe': '1分K',
+                   'entry': [{'type': 'day_drop_over', 'params': {'value': 3.0}}],
+                   'exit_signals': []})
+        st.update(over)
+        return st
+
+    def _mount(st):
+        rt = _se45.new_runtime()
+        rt['_live_a_df'] = _a_df      # 平常由 _quant_eval_pass 順手快取
+        rt['_live_b_df'] = _b_df
+        app.strategies = [st]
+        app.strategy_runtimes = {st['id']: rt}
+        return rt
+
+    try:
+        app.log_message = lambda m: (logs.append(str(m)), orig_log(m))[0]
+        app._qt_resolve = lambda _s: (FakeContract(_s.get('symbol', '2330')), 'stock')
+        app._qt_resolve_watch = lambda _s: (FakeContract('^TWII'), 'index_tw', '^TWII', '台股')
+        app._place_strategy_order = lambda st, it, c, k, exec_price=None, **kw: (
+            orders.append((it['kind'], it['action'], it['qty'], exec_price)), (True, 'OK'))[1]
+        app.sj_api = FakeApi(); app.api_logged_in = True; app._qt_running = True
+        stock_app_pro.market_session.is_market_open = lambda *a, **k: True
+
+        # ---- A. A 要被放進監看名單 (原本只收「有部位」的 B) ----
+        st = _mk(); rt = _mount(st)
+        orders.clear(); snaps_asked['codes'] = []
+        app._qt_update_realtime_pnl(); app.flush_after()
+        assert '^TWII' in snaps_asked['codes'], \
+            f"還沒進場時也要監看 A 的即時價,實際問了 {snaps_asked['codes']}"
+
+        # ---- B. 即時價跌破 X% → 真的送出買進 ----
+        assert rt['state'] == 'LONG', \
+            f"A 即時跌 3.5% > X=3% 應該即時進場 (實際 state={rt['state']})"
+        assert orders and orders[-1][:2] == ('OPEN', '買進'), f"應送出買進,實際 {orders}"
+
+        # ---- C. 下單價要用 B 的價,不是 A 的指數點數 ----
+        assert orders[-1][3] == 600.0, \
+            f"下單價要用 B 的 600,實際 {orders[-1][3]} —— 拿到 A 的指數點數就是接錯線"
+
+        # ---- D. 前提確認:純 K 棒模式此刻**不**成立 (證明是即時價救的) ----
+        assert not _se45._c_day_drop_over(_a_df, {'value': 3.0}), \
+            "前提:已收盤 K 棒只跌 2%,K 棒模式不該成立 —— 否則這個案例證明不了『即時』"
+
+        # ---- E. 反向對照:沒開即時進場就完全不該動 ----
+        st2 = _mk(realtime_entry=False); rt2 = _mount(st2)
+        orders.clear(); snaps_asked['codes'] = []
+        app._qt_update_realtime_pnl(); app.flush_after()
+        assert rt2['state'] == 'FLAT', "沒開即時進場的策略不可以被即時路徑動到"
+        assert not orders, f"沒開即時進場不該送單,實際 {orders}"
+        assert '^TWII' not in snaps_asked['codes'], \
+            "沒開即時進場就不必為它多打一次 A 的報價 (鐵則5:別浪費流量)"
+
+        # ---- F. 反向對照:即時價沒跌夠就不該進場 ----
+        live['A'] = 99.0
+        st3 = _mk(); rt3 = _mount(st3)
+        orders.clear()
+        app._qt_update_realtime_pnl(); app.flush_after()
+        assert rt3['state'] == 'FLAT' and not orders, \
+            f"A 只跌 1% 不該進場 (實際 state={rt3['state']}, orders={orders})"
+        live['A'] = 96.5
+
+        # ---- G. 條件不支援即時 → 不動作,而且要講一次話 (不可靜默失效) ----
+        st4 = _mk(entry=[{'type': 'day_drop_over', 'params': {'value': 3.0}},
+                         {'type': 'ma_cross_up', 'params': {}}])
+        rt4 = _mount(st4)
+        orders.clear(); logs.clear()
+        app._qt_update_realtime_pnl(); app.flush_after()
+        assert rt4['state'] == 'FLAT' and not orders, "條件算不出來時不可以進場"
+        assert any('即時進場' in m and '沒有啟用' in m for m in logs), \
+            f"條件不支援時要講一次原因,不可以靜默失效: {logs[:4]}"
+
+        # ---- H. 交易時段閘門照樣有效 (與即時停損同一道) ----
+        stock_app_pro.market_session.is_market_open = lambda *a, **k: False
+        st5 = _mk(session_gate=True); rt5 = _mount(st5)
+        orders.clear()
+        app._qt_update_realtime_pnl(); app.flush_after()
+        assert rt5['state'] == 'FLAT' and not orders, "市場關閉時即時進場也不該下單"
+        stock_app_pro.market_session.is_market_open = lambda *a, **k: True
+
+        # ---- I. 風控(每日進場上限)照樣有效 ----
+        st6 = _mk(max_trades_per_day=0); rt6 = _mount(st6)
+        orders.clear(); logs.clear()
+        app._qt_update_realtime_pnl(); app.flush_after()
+        assert rt6['state'] == 'FLAT' and not orders, "即時進場不可以繞過風控"
+        assert any('風控擋單' in m for m in logs), f"被風控擋下要有日誌: {logs[:4]}"
+
+        # ---- J. 取不到 B 的價時,絕不拿 A 的價當成交價 ----
+        st7 = _mk(); rt7 = _mount(st7)
+        rt7['_live_b_df'] = None
+        _old_b = live['B']
+        class NoBApi(FakeApi):
+            def snapshots(self, contracts):
+                snaps_asked['codes'] = [getattr(c, 'code', '') for c in contracts]
+                return [FakeSnap('^TWII', live['A'])]     # 只回 A,沒有 B
+        app.sj_api = NoBApi()
+        orders.clear(); logs.clear()
+        app._qt_update_realtime_pnl(); app.flush_after()
+        assert not orders, f"取不到 B 的價時不可以送單 (更不可以拿 A 的價),實際 {orders}"
+        assert any('取不到' in m for m in logs), f"要說明為什麼沒送: {logs[:4]}"
+        app.sj_api = FakeApi(); live['B'] = _old_b
+    finally:
+        app.log_message = orig_log
+        app._qt_resolve, app._qt_resolve_watch = orig_resolve, orig_resolve_watch
+        app._place_strategy_order = orig_place
+        app.sj_api, app.api_logged_in, app._qt_running = orig_api, orig_login, orig_running
+        app.strategies, app.strategy_runtimes = orig_strats, orig_rts
+        stock_app_pro.market_session.is_market_open = orig_open
+
+    # ---- K. 接線:即時通道真的有呼叫進場檢查,而且排在停損之後 ----
+    _src45 = open('stock_app_pro.py', encoding='utf-8').read()
+    _i = _src45.index('    def _qt_update_realtime_pnl(')
+    _m = _re.search(r'\n    def (?!_qt_update_realtime_pnl\b)\w+', _src45[_i:])
+    _seg = _src45[_i:_i + _m.start()]
+    assert '_qt_check_realtime_entries' in _seg, \
+        "即時通道必須呼叫 _qt_check_realtime_entries,否則這條路一輩子不會跑 (P-64)"
+    assert _seg.index('_qt_check_realtime_futures_stops') < _seg.index('_qt_check_realtime_entries'), \
+        "要走的先走完再看要不要進場 —— 同一個 tick 不可以又出又進"
+
+    # ---- L. 編輯器要有這個勾選框,而且存檔要寫進去 ----
+    _i = _src45.index('    def _qt_open_editor(')
+    _m = _re.search(r'\n    def (?!_qt_open_editor\b)\w+', _src45[_i:])
+    _eseg = _src45[_i:_i + _m.start()]
+    assert '即時進場' in _eseg, "內建策略編輯器要有「即時進場」勾選框"
+    assert "s['realtime_entry']" in _eseg, "存檔時要把 realtime_entry 寫進策略"
+    assert not _grid_overlaps('_qt_open_editor'), "新勾選框不可以撞格 (P-104)"
+
+
+run_case("ADR-145: 即時進場 (A 即時跌破X%就買B,不等K棒收盤;看A做B/風控/時段閘門不變)",
+         _realtime_entry_145)
+
+
 print(f"{'案例':60s} 結果")
 print("-" * 76)
 for name, st, msg in results:
