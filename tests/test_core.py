@@ -9076,5 +9076,104 @@ class TestTimedEntryADR147(unittest.TestCase):
         self.assertIsNotNone(strategy_engine.check_timed_entry(s2, rt, None))
 
 
+class TestTransientEnvError(unittest.TestCase):
+    """【ADR-148】外部環境問題 vs 策略邏輯壞掉 —— 型別分野不可以被打破。"""
+
+    def test_kbars_and_contract_errors_share_the_transient_base(self):
+        """呼叫端只認基底型別;掛錯基底就會走進「自動停用」那條路。"""
+        for cls in (strategy_engine.KBarsFetchError,
+                    strategy_engine.KBarsPending,
+                    strategy_engine.KBarsUnavailable,
+                    strategy_engine.ContractResolveError):
+            self.assertTrue(issubclass(cls, strategy_engine.TransientEnvError), cls.__name__)
+
+    def test_contract_error_is_not_a_kbars_error(self):
+        """反向對照:合約解析失敗不是 K 線錯誤 —— 訊息要分開,才不會叫使用者
+        去查資料源,而真正該看的是連線。"""
+        self.assertFalse(issubclass(strategy_engine.ContractResolveError,
+                                    strategy_engine.KBarsFetchError))
+
+    def test_plain_errors_are_not_transient(self):
+        """反向對照:策略邏輯真的壞掉仍要走自動停用那條路,不可以被一起保護。"""
+        for cls in (RuntimeError, ValueError, KeyError, TypeError):
+            self.assertFalse(issubclass(cls, strategy_engine.TransientEnvError), cls.__name__)
+
+
+class TestTelegramBurstThrottle(unittest.TestCase):
+    """【ADR-148】同一個根因的訊息合併。用的是使用者 16:47 實際收到的那幾則。"""
+
+    # 使用者截圖裡的原文 (只差策略名稱與商品代碼)
+    M1 = "【自動交易-異常】策略「5-60-空15分」第 1 次錯誤: RuntimeError: 執行商品 (做B) 合約解析失敗: TXF"
+    M2 = "【自動交易-異常】策略「空-5分K」第 1 次錯誤: RuntimeError: 執行商品 (做B) 合約解析失敗: MXFR1"
+    M3 = "【自動交易-異常】策略「5-60 多15分」第 1 次錯誤: RuntimeError: 執行商品 (做B) 合約解析失敗: TXF"
+    KBARS = ("【自動交易-資料異常】策略「多-5分K」連 3 次抓不到K線: "
+             "ShioajiTimeoutError: Timeout Topic: api/v1/data/kbars")
+    FILL = "【自動交易-模擬】🧪 策略「多-5分K」買進 10 MXFR1 @ 44240"
+    LIVE = "【自動交易-實單】🔥 策略「多-5分K」買進 10 MXFR1 @ 44240"
+
+    def test_same_root_cause_collapses_to_one(self):
+        st = {}
+        self.assertTrue(telegram_notify.should_send(self.M1, 1000.0, st)[0])
+        self.assertFalse(telegram_notify.should_send(self.M2, 1000.0, st)[0])
+        self.assertFalse(telegram_notify.should_send(self.M3, 1001.0, st)[0])
+
+    def test_different_root_causes_are_not_merged(self):
+        """反向對照:合併過頭比洗版更危險 —— 會把不同的問題蓋掉。"""
+        st = {}
+        self.assertTrue(telegram_notify.should_send(self.M1, 1000.0, st)[0])
+        self.assertTrue(telegram_notify.should_send(self.KBARS, 1000.0, st)[0])
+        self.assertNotEqual(telegram_notify.burst_key(self.M1),
+                            telegram_notify.burst_key(self.KBARS))
+
+    def test_fills_are_never_merged(self):
+        """錢動了的紀錄一則都不能少 —— 這是紅線。"""
+        st = {}
+        for _ in range(5):
+            self.assertTrue(telegram_notify.should_send(self.FILL, 1000.0, st)[0])
+            self.assertTrue(telegram_notify.should_send(self.LIVE, 1000.0, st)[0])
+
+    def test_auto_disable_notice_is_never_merged(self):
+        """「策略已自動停用」也不能被合併掉 —— 使用者必須知道有東西被關了。"""
+        st = {}
+        msg = "【自動交易-保護】策略「多-5分K」連續 3 次錯誤,已自動停用 (不影響其他策略與主系統)。"
+        for _ in range(3):
+            self.assertTrue(telegram_notify.should_send(msg, 1000.0, st)[0])
+
+    def test_window_expiry_reports_how_many_were_held(self):
+        """被壓下的則數不可以安靜消失,要補報出來。"""
+        st = {}
+        telegram_notify.should_send(self.M1, 1000.0, st)
+        telegram_notify.should_send(self.M2, 1000.0, st)
+        telegram_notify.should_send(self.M3, 1000.0, st)
+        send, text = telegram_notify.should_send(
+            self.M1, 1000.0 + telegram_notify.BURST_WINDOW_SEC, st)
+        self.assertTrue(send)
+        self.assertIn('2', text)
+        self.assertIn('已合併', text)
+
+    def test_nothing_held_means_no_extra_note(self):
+        """沒被壓下任何訊息時,不可以硬加一句「已合併 0 則」的雜訊。"""
+        st = {}
+        _, t1 = telegram_notify.should_send(self.M1, 1000.0, st)
+        self.assertEqual(t1, self.M1)
+        _, t2 = telegram_notify.should_send(
+            self.M1, 1000.0 + telegram_notify.BURST_WINDOW_SEC, st)
+        self.assertEqual(t2, self.M1)
+
+    def test_key_ignores_strategy_name_and_attempt_count(self):
+        """同一個根因只差策略名與「第 N 次」,必須算出同一把 key。"""
+        a = "【自動交易-異常】策略「甲」第 1 次錯誤: RuntimeError: 執行商品 (做B) 合約解析失敗: TXF"
+        b = "【自動交易-異常】策略「乙丙丁戊」第 2 次錯誤: RuntimeError: 執行商品 (做B) 合約解析失敗: MXFR1"
+        self.assertEqual(telegram_notify.burst_key(a), telegram_notify.burst_key(b))
+
+    def test_key_separates_different_message_categories(self):
+        """反向對照:類別不同就不可以同組。"""
+        keys = {telegram_notify.burst_key(m) for m in
+                ("【自動交易-異常】策略「甲」第 1 次錯誤: RuntimeError: 合約解析失敗",
+                 "【自動交易-風控擋單】策略「甲」買進 1 TXF — 已達每日進場上限",
+                 "【自動交易-休市待命】策略「甲」目前非交易時間")}
+        self.assertEqual(len(keys), 3)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

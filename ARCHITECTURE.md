@@ -199,6 +199,33 @@ PITFALLS P-101）。K 棒邊界閘門（`_qt_last_boundary`）對每個週期一
 重試到做成為止。**節拍（多久醒一次）與訊號週期（看哪一種 K 棒）是兩件事，
 不可以共用同一個設定欄位**（P-100）。
 
+**「外部環境問題」與「策略邏輯壞掉」是兩條路,型別決定走哪一條**（ADR-121 /
+ADR-148，PITFALLS P-129）。錯誤分類的單一出處是例外型別階層:
+
+```
+strategy_engine.TransientEnvError     外部環境暫時性 → 重試、永不自動停用
+├─ KBarsFetchError (ADR-121)
+│   ├─ KBarsPending     (ADR-122，資料正在背景補,連錯誤都不算)
+│   └─ KBarsUnavailable (ADR-122)
+└─ ContractResolveError (ADR-148，合約表隨連線失效)
+其餘 Exception                        策略邏輯壞掉 → 連 3 次自動停用
+```
+
+`_quant_eval_pass()` 的 `except` **認基底型別**,新的外部性錯誤掛上去就自動受
+保護 —— 合約解析失敗當初被漏掉,正是因為 except 綁死在 `KBarsFetchError` 上。
+自動停用的代價是「連持倉的即時停損一起關掉、而且連線恢復不會自己開回來」,
+所以分類錯的方向只能往「暫時性」錯,不能往「策略壞了」錯。
+
+另外:連線可能在**同一輪評估的中途**斷掉,迴圈外的「已登入」檢查擋不住,
+迴圈內要補 `break`,否則後面每一檔策略都會噴誤導性的「合約解析失敗」。
+
+**手機通知有 burst 節流,但成交訊息是紅線**（ADR-148，PITFALLS P-130）。
+`log_message()` 凡是 `【自動交易` 前綴都推播,一次斷線會依策略數推 N 則,
+真正重要的那一則被淹掉。節流規則在 `core/telegram_notify.py`(純函式,狀態由
+GUI 持有):同根因指紋 120 秒內只送第一則,被壓下的則數併進下一則回報。
+`ALWAYS_SEND_TAGS`(實單/模擬成交、自動停用通知)**永遠逐則送出**,
+有反向對照測試釘住 —— 節流最危險的失敗模式是連該送的也一起吃掉。
+
 三條規則（違反就會踩 PITFALLS P-04 / P-22 / P-23）：
 1. **報價暫存跨執行緒讀寫一律經 `self.quote_lock`**；零股/整股暫存永遠分開。
 2. **任何背景執行緒要更新 UI，一律 `self.safe_after(...)`**，不裸用 `self.after`。
@@ -320,6 +347,7 @@ G:\StockBuild\
 │   ├─ indicators.py
 │   ├─ futures_session.py
 │   ├─ telegram_control.py  遠端控制:授權/確認碼/指令解析 (ADR-108)
+│   ├─ telegram_notify.py   推播判斷 + 同根因合併節流 (ADR-108/148;成交不合併)
 │   ├─ order_intent.py      券商中立的委託意圖 (ADR-110)
 │   ├─ broker_ipc.py        券商子行程 IPC 協定 (ADR-112)
 │   ├─ sj_compat.py        shioaji 1.5.6/1.7 相容 (指數代碼/合約型別/簽名, ADR-114)

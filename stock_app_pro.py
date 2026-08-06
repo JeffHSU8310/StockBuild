@@ -7174,7 +7174,16 @@ class StockTradingAppPro(tk.Tk):
         if (getattr(self, '_qt_running', False)
                 and telegram_notify.is_quant_message(msg)
                 and telegram_notify.config_ready(getattr(self, 'telegram_cfg', None))):
-            self._send_telegram_async(str(msg))
+            # 【ADR-148】同一個根因在短時間內只推一則:一次斷線會讓每檔策略各
+            # 報一則,策略愈多洗得愈兇,真正重要的那一則反而被淹掉。被壓下的
+            # 則數會附在下一則後面,不是安靜吞掉。
+            # 成交訊息 (實單/模擬) 與自動停用永遠逐則送出,見 ALWAYS_SEND_TAGS。
+            if not hasattr(self, '_tg_burst_state'):
+                self._tg_burst_state = {}
+            _send, _text = telegram_notify.should_send(
+                str(msg), time.time(), self._tg_burst_state)
+            if _send:
+                self._send_telegram_async(_text)
 
     def _send_telegram_async(self, text):
         """背景執行緒送出 Telegram 訊息 (urllib,零新依賴)。成功/失敗都只記
@@ -8948,8 +8957,14 @@ class StockTradingAppPro(tk.Tk):
                         f"{self.QT_OPEN_WARMUP_SEC} 秒避開開盤尖峰再開始抓K線 —— "
                         f"開盤後第一根「已收盤」K棒本來就還沒生出來,不影響訊號。")
 
-    def _qt_on_kbars_fetch_error(self, s, rt, exc, boundary_key, prev_boundary):
-        """【ADR-121】抓 K 線失敗:先重試,重試用完才記錄;永不自動停用策略。
+    def _qt_on_transient_env_error(self, s, rt, exc, boundary_key, prev_boundary):
+        """【ADR-121 / ADR-148】外部環境的暫時性錯誤:先重試,重試用完才記錄;
+        **永不自動停用策略**。
+
+        【ADR-148 改名的理由】原本叫 `_qt_on_kbars_fetch_error`,只想著 K 線。
+        但合約解析失敗是同一類東西 (見 strategy_engine.ContractResolveError),
+        名字綁死在「kbars」上會讓下一個人以為這條路只管抓資料 —— 而那正是
+        合約解析失敗當初被漏掉、走進「策略邏輯壞掉」那條路的原因。
 
         【為什麼重試不用 time.sleep()】量化 runner 是單執行緒,原地睡會一併
         拖住其他策略與 _qt_update_realtime_pnl (每 3 秒,期貨即時停損停利靠
@@ -8994,6 +9009,27 @@ class StockTradingAppPro(tk.Tk):
             return
 
         rt['data_error_count'] = int(rt.get('data_error_count', 0)) + 1
+
+        # 【ADR-148】合約解析失敗與抓不到 K 線的**處置相同**(重試、不停用),
+        # 但**訊息不可以相同** —— 說成「抓不到K線」會讓使用者往資料源查,
+        # 而真正該看的是連線;說成「代碼錯了」又會讓他去改一個沒問題的設定。
+        if isinstance(exc, strategy_engine.ContractResolveError):
+            self.safe_after(0, self.log_message,
+                            f"【自動交易-資料異常】策略「{s.get('name')}」連 {n} 次{exc}"
+                            f" —— 已自動重試,策略維持啟用 (解析不到合約時本來就不會下單)。"
+                            f"合約表是登入時下載、掛在連線上的,**連線中斷會讓所有代碼都查不到**,"
+                            f"不一定是代碼寫錯。")
+            # 連線正常卻一直解析不到,才有可能真的是代碼打錯。這時候「提醒」,
+            # 不「停用」—— 停用的代價(所有策略靜悄悄關掉、連線恢復也不會自己
+            # 開回來)遠大於「一個設定錯的策略一直重試」(它本來就不會下單)。
+            if rt['data_error_count'] % 5 == 0:
+                self.safe_after(0, self.log_message,
+                                f"【自動交易-資料異常】⚠ 策略「{s.get('name')}」已累計 "
+                                f"{rt['data_error_count']} 次解析不到合約。若券商連線正常"
+                                f"(狀態列不是紅色),請檢查這檔策略的商品代碼是否正確。"
+                                f"策略仍維持啟用。")
+            return
+
         self.safe_after(0, self.log_message,
                         f"【自動交易-資料異常】策略「{s.get('name')}」連 {n} 次抓不到K線: {exc}"
                         f" —— 已自動重試,策略維持啟用 (抓不到資料時本來就不會下單)。")
@@ -9046,6 +9082,21 @@ class StockTradingAppPro(tk.Tk):
         if not hasattr(self, '_qt_last_boundary'):
             self._qt_last_boundary = {}
         for s in list(self.strategies):
+            # 【ADR-148】連線可能在**這一輪的中途**斷掉:迴圈上一圈的策略碰到
+            # ShioajiConnectionError → `_mark_session_dead()` 把 api_logged_in
+            # 撥回 False,並在背景對舊連線做 logout()。合約表是掛在連線物件上
+            # 的,logout 之後整份查不到 —— 於是同一輪剩下的每一檔策略都會報
+            # 「執行商品(做B)合約解析失敗: XXX」。
+            #
+            # 那些訊息是**我們自己製造的,而且指向錯的地方**:使用者看到
+            # 「合約解析失敗: TXF」會去檢查策略代碼,但代碼沒問題,是連線斷了。
+            # (使用者 16:47 的實測:一則 Session error 後面跟著三則合約解析失敗。)
+            #
+            # 迴圈開頭的「已登入」檢查在 for 之外,只擋得住「進來時就沒連線」,
+            # 擋不住中途斷線。這裡補上,斷了就整輪停手,下一輪自然會被外面那道
+            # 檢查擋掉。
+            if not _forced and not self.api_logged_in:
+                break
             if not s.get('enabled'):
                 continue
             rt = self._qt_runtime(s['id'])
@@ -9120,7 +9171,11 @@ class StockTradingAppPro(tk.Tk):
                 # 條件/指標看它 (可為指數;看A做B 關閉時 A=B)。
                 contract, asset_type = self._qt_resolve(s)
                 if contract is None:
-                    raise RuntimeError(f"執行商品(做B)合約解析失敗: {s.get('symbol')}")
+                    # 【ADR-148】改用 ContractResolveError:合約表是掛在連線物件上的,
+                    # 連線一斷就整份查不到,任何合法代碼都會解析失敗。當成「策略邏輯
+                    # 壞掉」去累加 error_count,一次網路瞬斷就會把所有策略自動停用。
+                    raise strategy_engine.ContractResolveError(
+                        f"執行商品(做B)合約解析失敗: {s.get('symbol')}")
 
                 if s.get('kind') == chukuangren_band.KIND:
                     # 【新ADR 終極波段策略】獨立分派:A固定用日K做突破/停損/停利
@@ -9143,7 +9198,8 @@ class StockTradingAppPro(tk.Tk):
                     # 都能重試,反而比原本可靠。
                     w_contract, w_asset, w_sym, w_mkt = self._qt_resolve_watch(s)
                     if w_contract is None:
-                        raise RuntimeError(f"看盤商品(看A)合約解析失敗: {strategy_engine.watch_symbol_of(s)}")
+                        raise strategy_engine.ContractResolveError(
+                            f"看盤商品(看A)合約解析失敗: {strategy_engine.watch_symbol_of(s)}")
                     daily_df = self._qt_fetch_closed_bars(s, w_contract, w_asset, tf='日K',
                                                           cache_sym=w_sym, cache_market=w_mkt)
                     if daily_df is None or daily_df.empty:
@@ -9165,7 +9221,8 @@ class StockTradingAppPro(tk.Tk):
                 else:
                     w_contract, w_asset, w_sym, w_mkt = self._qt_resolve_watch(s)
                     if w_contract is None:
-                        raise RuntimeError(f"訊號來源(看A)合約解析失敗: {strategy_engine.watch_symbol_of(s)}")
+                        raise strategy_engine.ContractResolveError(
+                            f"訊號來源(看A)合約解析失敗: {strategy_engine.watch_symbol_of(s)}")
                     w_tf = strategy_engine.watch_timeframe_of(s)
                     df = self._qt_fetch_closed_bars(s, w_contract, w_asset, tf=w_tf,
                                                     cache_sym=w_sym, cache_market=w_mkt)
@@ -9257,10 +9314,12 @@ class StockTradingAppPro(tk.Tk):
                             self.safe_after(0, self.log_message, f"【自動交易-模擬】🧪 {label} | {intent['reason']} (模擬)")
                 rt['error_count'] = 0
                 rt['data_error_count'] = 0
-            except strategy_engine.KBarsFetchError as e:
-                # 【ADR-121】抓不到K線是外部環境問題,先重試;重試用完才記錄,
-                # 而且**永遠不會**因此自動停用策略 (見 _qt_on_kbars_fetch_error)。
-                self._qt_on_kbars_fetch_error(s, rt, e, boundary_key, _prev_boundary)
+            except strategy_engine.TransientEnvError as e:
+                # 【ADR-121 / ADR-148】外部環境問題 (抓不到K線、合約表因斷線查不到)
+                # 先重試;重試用完才記錄,而且**永遠不會**因此自動停用策略。
+                # 認的是基底型別 TransientEnvError —— 日後再多一種外部性錯誤,
+                # 掛在那個基底底下就自動受保護,不必記得回來改這一行 (ADR-148)。
+                self._qt_on_transient_env_error(s, rt, e, boundary_key, _prev_boundary)
             except Exception as e:
                 # 【ADR-121】這裡只剩「策略邏輯/下單路徑」的錯誤。自動停用維持
                 # 原本的行為 —— 真的壞掉的策略就該停手。
@@ -9843,7 +9902,7 @@ class StockTradingAppPro(tk.Tk):
             try:
                 w_contract, w_asset, w_sym, w_mkt = self._qt_resolve_watch(s)
                 if w_contract is None:
-                    raise RuntimeError(
+                    raise strategy_engine.ContractResolveError(
                         f"看盤商品(看A)合約解析失敗: {strategy_engine.watch_symbol_of(s)}")
                 if self._qt_chukuangren_confirm_one(
                         s, rt, chukuangren_band.params_of(s), w_contract, w_asset,

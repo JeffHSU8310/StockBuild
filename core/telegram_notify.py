@@ -63,6 +63,95 @@ def build_send_request(bot_token, chat_id, text):
     return {'url': url, 'data': data, 'headers': headers}
 
 
+# ======================================================================
+# 【ADR-148】同一個根因的訊息合併(burst 節流)
+#
+# 使用者 16:47 的實測:券商連線斷一次,手機在同一分鐘收到
+#   · 1 則 ShioajiConnectionError(真正的根因)
+#   · 3 則「策略「X」第 1 次錯誤: 執行商品(做B)合約解析失敗: TXF / MXFR1」
+# 四則訊息、一個事件,而且策略數愈多就愈多則。手機被洗版的下場是**真正重要的
+# 那一則被淹掉** —— 這跟 P-05「失敗要看得見」是同一個目標,只是反方向的失敗。
+#
+# 【絕對不節流成交訊息】實單/模擬成交每一則都必須送達,一則都不能合併掉:
+# 那是「錢動了」的紀錄,不是狀態提醒。ALWAYS_SEND_TAGS 就是這條紅線,
+# 對應的反向對照測試也釘在 tests/test_core.py。
+# ======================================================================
+
+# 這幾類前綴永遠逐則送出,不參與任何合併
+ALWAYS_SEND_TAGS = ('【自動交易-實單', '【自動交易-模擬', '【自動交易-保護')
+
+# 同一個 key 在這個窗口內只送第一則,其餘累計後併進下一則
+BURST_WINDOW_SEC = 120.0
+
+# 指紋取正規化後的前 N 個字元。為什麼是「截斷」而不是精確比對:同一個根因的
+# 訊息只差在**策略名稱**與**商品代碼**,前者被引號剝除處理掉、後者落在訊息
+# 尾端被截斷切掉,剩下的「類別 + 例外型別 + 錯誤語意」正好是我們要分組的東西。
+# 調這個數字會改變分組粗細,測試裡有正反對照把預期行為釘住。
+BURST_KEY_LEN = 45
+
+_QUOTED = ('「', '」')
+
+
+def _strip_quoted(text):
+    """把「...」裡的內容拿掉(策略名稱)。同一個根因的訊息只差在這裡。"""
+    out = []
+    depth = 0
+    for ch in str(text or ''):
+        if ch == _QUOTED[0]:
+            depth += 1
+            continue
+        if ch == _QUOTED[1]:
+            depth = max(0, depth - 1)
+            continue
+        if depth == 0:
+            out.append(ch)
+    return ''.join(out)
+
+
+def burst_key(msg):
+    """同一個根因的訊息要算出同一把 key。
+
+    步驟:剝掉「策略名稱」→ 數字換成空(「第 1 次」「第 2 次」要同組)→
+    收斂空白 → 取前 BURST_KEY_LEN 個字元。
+    """
+    t = _strip_quoted(msg)
+    t = ''.join((' ' if ch.isdigit() else ch) for ch in t)
+    t = ' '.join(t.split())
+    return t[:BURST_KEY_LEN]
+
+
+def always_send(msg):
+    """這則訊息是不是「一則都不能合併」的那種(成交/自動停用)。"""
+    m = str(msg or '')
+    return any(m.startswith(tag) for tag in ALWAYS_SEND_TAGS)
+
+
+def should_send(msg, now_ts, state, window_sec=None):
+    """要不要把這則訊息送出去。回傳 (send: bool, text: str)。
+
+    `state` 是呼叫端保管的 dict(GUI 層持有,本模組不存任何狀態,才能離線測):
+        {key: {'ts': 上次送出時間, 'held': 這個窗口內被壓下的則數}}
+
+    被壓下的則數**不會消失** —— 下一則同 key 通過時會附在文字後面
+    (「同類訊息 N 則已合併」)。安靜吞掉才是這個專案禁止的事;
+    這裡吞的是「重複」,不是「資訊」。
+    """
+    m = str(msg or '')
+    if always_send(m):
+        return True, m
+    win = BURST_WINDOW_SEC if window_sec is None else float(window_sec)
+    k = burst_key(m)
+    ent = state.get(k)
+    if ent is None or (float(now_ts) - float(ent.get('ts', 0))) >= win:
+        held = int((ent or {}).get('held', 0))
+        state[k] = {'ts': float(now_ts), 'held': 0}
+        if held > 0:
+            return True, f"{m}\n(過去 {win:.0f} 秒內另有 {held} 則同類訊息已合併)"
+        return True, m
+    ent['held'] = int(ent.get('held', 0)) + 1
+    return False, m
+
+
 def parse_response(body):
     """解析 Telegram sendMessage 的回應 body (bytes 或 str)。
     回傳 (ok: bool, message: str)。Telegram 成功回傳 {"ok":true,...},

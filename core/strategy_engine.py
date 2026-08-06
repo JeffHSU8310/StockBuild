@@ -33,7 +33,30 @@ from core import futures_session as _fs
 from core import quote_book as _qb
 
 
-class KBarsFetchError(Exception):
+class TransientEnvError(Exception):
+    """【ADR-148】**外部環境的暫時性問題**,不是這檔策略壞掉。
+
+    ADR-121 為「抓不到 K 線」建立了這個分野,理由寫在 `KBarsFetchError` 的
+    說明裡:外部問題重試就會過,而策略在沒有資料時本來就不會產生任何 intent;
+    把它跟「策略邏輯壞掉」混進同一個錯誤計數,會讓一次網路瞬斷把**持有部位**
+    的策略自動停用,連帶把即時停損也一起關掉。
+
+    ADR-148 發現同一個分野**漏掉了合約解析失敗**。使用者實測(16:47)的訊息
+    序列是:先一則 `ShioajiConnectionError: Session error ... timed out waiting
+    for connection`,緊接著三檔策略各報一則「執行商品 (做B) 合約解析失敗:
+    TXF / MXFR1」。那三則不是三個獨立問題,是**同一次斷線的後果** —— 而它們
+    走的是通用 `except Exception`,各自累加 error_count,連 3 次就自動停用。
+
+    也就是說:券商連線抖三下,所有策略會被關掉,而且連線恢復後不會自己開回來。
+    這正是 ADR-121 已經判定「不可以發生」的那件事,只是換了一個入口。
+
+    所以把「外部環境」抽成共同基底型別,新的外部性錯誤一律掛在這底下,
+    呼叫端只認基底 —— 下次再多一種外部問題,不必再記得去改 except 子句。
+    """
+    pass
+
+
+class KBarsFetchError(TransientEnvError):
     """【ADR-121】抓 K 線資料失敗 (逾時/券商端暫時性管制等)。
 
     存在的理由是**型別區分**,不是為了帶什麼額外資訊:呼叫端必須能分辨
@@ -59,6 +82,27 @@ class KBarsPending(KBarsFetchError):
 
 class KBarsUnavailable(KBarsFetchError):
     """【ADR-122】真的抓不到 (逾時/券商端拒絕/分段有段失敗)。要記錄與診斷。"""
+    pass
+
+
+class ContractResolveError(TransientEnvError):
+    """【ADR-148】合約解析不出來(`Contracts.Stocks/Futures` 查不到這個代碼)。
+
+    **為什麼歸類成「暫時性」而不是「設定錯了」**:這兩種原因在錯誤現場長得
+    一模一樣 —— 合約表是登入時下載、存在連線物件上的,連線一斷(或 ADR-060
+    的 `_mark_session_dead()` 在背景做 logout)就整份查不到,任何合法代碼都會
+    解析失敗。系統無法在當下分辨「代碼打錯」與「連線沒了」。
+
+    兩種猜法的代價完全不對稱:
+      · 猜「設定錯了」→ 自動停用 → 網路瞬斷把使用者所有策略關掉,人在外面
+        不知道,而且連線恢復也不會自己開回來。
+      · 猜「連線問題」→ 繼續重試 → 代碼真的打錯的話就一直重試,但**抓不到
+        合約時本來就不會下單**,唯一的成本是日誌吵一點(而吵的部分由
+        ADR-148 的通知合併處理)。
+
+    所以一律當暫時性處理,但連續失敗到一定次數要**明確提醒**「這個代碼可能
+    真的不存在,請檢查策略設定」——提醒,不停用。
+    """
     pass
 
 

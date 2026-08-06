@@ -3546,12 +3546,47 @@ def _qt_kbars_resilience_121():
         assert rt5.get('error_count', 0) == 0, "資料錯誤不可以累加到『會停用』的那個計數"
 
         # ---- 5b. 策略邏輯錯誤照樣 3 次自動停用 (保護沒有被整個拿掉) ----
+        #
+        # 【ADR-148 修正了這一段的替身】原本用 `_qt_resolve → (None, None)`
+        # (合約解析失敗) 當「策略邏輯錯誤」的替身,註解還寫著「合約解析失敗 →
+        # 邏輯錯誤」。ADR-148 查出**那個分類本身就是 bug**:合約表是登入時
+        # 下載、掛在連線物件上的,連線一斷就整份查不到,任何合法代碼都會解析
+        # 失敗 —— 那是外部環境問題,不是策略壞掉。使用者實測(16:47)一次
+        # Session error 之後三檔策略同時報「合約解析失敗」,再抖三下就會被全部
+        # 自動停用。
+        #
+        # 這一段要守的**意圖沒有變**(自動停用的保護沒有被整個拿掉),只是替身
+        # 換成真正的策略邏輯錯誤。合約解析失敗的正確行為改由 ADR-148 的案例守。
+        # 替身要挑「合約解析成功之後才會炸」的位置:日K 策略在取資料那一步會先
+        # 走進 ADR-122 的背景預抓 (KBarsPending),所以把非預期例外放在
+        # _qt_fetch_closed_bars 上 —— 它拋的是普通 ValueError,不屬於
+        # TransientEnvError,正是「這檔策略的路徑真的壞了」該有的樣子。
         st6, rt6 = _reset(session_gate=False)
-        app._qt_resolve = lambda _s: (None, None)     # 合約解析失敗 → 邏輯錯誤
-        for _ in range(3):
+        _orig_fetch = app._qt_fetch_closed_bars
+        try:
+            def _boom(*a, **k):
+                raise ValueError("策略邏輯壞了 (診斷刻意製造)")
+            app._qt_fetch_closed_bars = _boom
+            for _ in range(3):
+                app._qt_last_boundary = {}
+                eval_pass(); app.flush_after()
+        finally:
+            app._qt_fetch_closed_bars = _orig_fetch
+        assert st6['enabled'] is False, "策略邏輯連續 3 次錯誤仍應自動停用"
+        assert rt6.get('error_count', 0) >= 3, \
+            f"策略邏輯錯誤要累加會停用的那個計數,實際 {rt6.get('error_count')}"
+
+        # ---- 5c. 反向對照:合約解析失敗**不**屬於「策略邏輯錯誤」(ADR-148) ----
+        st7, rt7 = _reset(session_gate=False)
+        app._qt_resolve = lambda _s: (None, None)
+        for _ in range(6):
             app._qt_last_boundary = {}
             eval_pass(); app.flush_after()
-        assert st6['enabled'] is False, "策略邏輯連續 3 次錯誤仍應自動停用"
+        assert st7['enabled'] is True, \
+            ("合約解析失敗不可以自動停用策略 —— 連線抖一下就會把所有策略關掉,"
+             "而且連線恢復後不會自己開回來 (ADR-148)")
+        assert rt7.get('error_count', 0) == 0, \
+            "合約解析失敗不可以累加到『會停用』的那個計數"
     finally:
         app.__dict__.pop('QT_TF_DAYS', None)
         app.log_message = orig_log
@@ -7256,6 +7291,186 @@ def _timed_entry_odd_lot_147():
 
 run_case("ADR-147: 定時下單 (12:01 用當時的五檔進場;零股無K線/五檔第N檔+讓價/取不到就不送)",
          _timed_entry_odd_lot_147)
+
+
+def _session_drop_not_strategy_fault_148():
+    """【ADR-148】券商連線中斷不可以把策略關掉,也不可以報成「合約解析失敗」。
+
+    使用者 16:47 的實測(Telegram 截圖):一則
+    `ShioajiConnectionError: Session error ... _solClient_waitForSessionEstablished
+    for session '(c6,s1)_sinopac', timed out waiting for connection`,
+    緊接著三則「策略「X」第 1 次錯誤: 執行商品 (做B) 合約解析失敗: TXF / MXFR1」。
+
+    那三則不是三個獨立問題:合約表是登入時下載、掛在連線物件上的,
+    `_mark_session_dead()` 在背景做 logout 之後整份查不到,同一輪剩下的每一檔
+    策略都會解析失敗。兩個後果:
+      · 訊息指向錯的地方(使用者會去改一個沒問題的代碼)。
+      · 走通用 `except Exception` → 各自累加 error_count → **連 3 次自動停用**。
+        券商連線抖三下,所有策略被關掉,而且連線恢復不會自己開回來。
+
+    純規則(型別分野、通知合併)已在 tests/test_core.py 釘死。這個案例守接線:
+      A. 合約解析失敗**不會**讓策略被自動停用(這是最重要的一條)。
+      B. 反向對照:策略邏輯真的壞掉,仍然要在 3 次後自動停用。
+      C. 連線在同一輪中途斷掉 → 整輪停手,不再對後面的策略噴合約解析失敗。
+      D. 訊息用的是「解析不到合約」的說法,而且講明可能是連線而非代碼寫錯。
+    """
+    import re as _re48
+    import pandas as _pd48
+    from core import strategy_engine as _se48
+
+    class FakeContract:
+        def __init__(self, code='TXF'):
+            self.code = code
+            self.symbol = code
+
+    _now = stock_app_pro.datetime.now()
+    _df = _pd48.DataFrame({'Open': [100.0] * 3, 'High': [100.0] * 3, 'Low': [100.0] * 3,
+                           'Close': [100.0] * 3, 'Volume': [1] * 3},
+                          index=[_now - stock_app_pro.timedelta(minutes=15),
+                                 _now - stock_app_pro.timedelta(minutes=10),
+                                 _now - stock_app_pro.timedelta(minutes=5)])
+
+    logs = []
+    orig_log = app.log_message
+    orig_resolve, orig_resolve_watch = app._qt_resolve, app._qt_resolve_watch
+    orig_fetch = app._qt_fetch_closed_bars
+    orig_place = app._place_strategy_order
+    orig_api, orig_login, orig_running = app.sj_api, app.api_logged_in, app._qt_running
+    orig_strats, orig_rts = app.strategies, app.strategy_runtimes
+    orig_attempts = dict(getattr(app, '_qt_fetch_attempts', {}) or {})
+
+    def _mk(name='診斷ADR148', **over):
+        st = _se48.new_strategy()
+        st.update({'name': name, 'symbol': 'TXF', 'trade_type': '期貨',
+                   'market': '台期貨', 'qty': 1, 'direction': '做多', 'mode': '模擬',
+                   'enabled': True, 'timeframe': '1分K', 'session_gate': False,
+                   'stop_loss_pct': 2.0, 'cooldown_sec': 0, 'max_trades_per_day': 99,
+                   'entry': [{'type': 'always_true', 'params': {}}], 'exit_signals': []})
+        st.update(over)
+        return st
+
+    def _mount(*sts):
+        app.strategies = list(sts)
+        app.strategy_runtimes = {x['id']: _se48.new_runtime() for x in sts}
+        app._qt_last_boundary = {}
+        app._qt_session_state = {}
+        app._qt_fetch_attempts = {}
+        return [app.strategy_runtimes[x['id']] for x in sts]
+
+    def _pass():
+        app._qt_last_boundary = {}
+        eval_pass()
+        app.flush_after()
+
+    try:
+        app.log_message = lambda m: (logs.append(str(m)), orig_log(m))[0]
+        app._qt_fetch_closed_bars = lambda *a, **k: _df
+        app._place_strategy_order = lambda *a, **k: (True, 'OK')
+        app.sj_api = object(); app.api_logged_in = True; app._qt_running = True
+
+        # ---- A. 合約解析失敗:重試很多輪,策略仍然要維持啟用 ----
+        app._qt_resolve = lambda _s: (None, None)          # 合約表查不到 (= 連線斷了)
+        app._qt_resolve_watch = lambda _s: (FakeContract(), 'future', 'TXF', '台期貨')
+        st = _mk(); rt = _mount(st)[0]
+        logs.clear()
+        for _ in range(12):
+            _pass()
+        assert st.get('enabled'), \
+            ("合約解析失敗把策略自動停用了 —— 這正是 ADR-121 判定不可以發生的事:"
+             "外部環境問題不該關掉一個可能持有部位的策略 (停損也會跟著停)")
+        assert rt.get('error_count', 0) == 0, \
+            f"合約解析失敗不可以累加『策略邏輯錯誤』計數,實際 error_count={rt.get('error_count')}"
+        assert rt.get('data_error_count', 0) > 0, \
+            "要記進資料類的計數,否則等於完全沒有紀錄"
+        assert not any('已自動停用' in m for m in logs), \
+            f"不可以出現自動停用的訊息: {[m for m in logs if '停用' in m][:3]}"
+
+        # ---- D. 訊息要指向連線,不可以讓使用者去改一個沒問題的代碼 ----
+        _hits = [m for m in logs if '解析不到合約' in m]
+        assert _hits, f"要講『解析不到合約』而不是『抓不到K線』: {logs[:5]}"
+        assert any('連線中斷' in m for m in _hits), \
+            f"要講明可能是連線而不是代碼寫錯: {_hits[:2]}"
+        assert not any('抓不到K線' in m for m in logs), \
+            "合約解析失敗說成『抓不到K線』會把使用者導去查資料源,真正該看的是連線"
+        assert any('維持啟用' in m for m in _hits), "要明講策略仍維持啟用"
+
+        # ---- B. 反向對照:策略邏輯真的壞掉,仍然要自動停用 ----
+        #      少了這條,上面那條就可能是「把自動停用整個拆掉」而不是「分類正確」。
+        app._qt_resolve = lambda _s: (FakeContract(), 'future')
+        def _boom(*a, **k):
+            raise ValueError("策略邏輯壞了 (診斷刻意製造)")
+        app._qt_fetch_closed_bars = _boom
+        st_b = _mk('診斷ADR148壞策略'); rt_b = _mount(st_b)[0]
+        logs.clear()
+        for _ in range(4):
+            _pass()
+        assert not st_b.get('enabled'), \
+            "策略邏輯真的壞掉時,連續 3 次錯誤仍然必須自動停用 (ADR-121 的原意)"
+        assert any('已自動停用' in m for m in logs), f"停用要有訊息: {logs[:5]}"
+        app._qt_fetch_closed_bars = lambda *a, **k: _df
+
+        # ---- C. 連線在同一輪中途斷掉 → 整輪停手,不對後面的策略噴合約解析失敗 ----
+        s1, s2, s3 = _mk('甲'), _mk('乙'), _mk('丙')
+        _mount(s1, s2, s3)
+        def _resolve_then_die(_s):
+            # 第一檔就把連線判定為斷線 (真實情況是 ShioajiConnectionError 觸發
+            # _mark_session_dead(),這裡直接模擬它的結果)
+            if _s.get('name') == '甲':
+                app.api_logged_in = False
+                return (FakeContract(), 'future')
+            return (None, None)      # 後面的策略在斷線後一定解析不到
+        app._qt_resolve = _resolve_then_die
+        logs.clear()
+        # 要跑滿重試次數才驗得到:`_qt_on_transient_env_error` 前 QT_KBARS_MAX_ATTEMPTS
+        # 次是靜默重試,只跑一輪的話「有沒有停手」兩種寫法都不會產生訊息 ——
+        # 這個案例的第一版就是只跑一輪,突變測試(把 break 拿掉)因此沒被抓到。
+        # 每輪都要把 api_logged_in 撥回 True,否則第二輪起會被迴圈外那道檢查擋掉,
+        # 就驗不到「迴圈**內**有沒有停手」。
+        for _ in range(app.QT_KBARS_MAX_ATTEMPTS + 3):
+            app.api_logged_in = True
+            _pass()
+        _bad = [m for m in logs if '解析不到合約' in m or '合約解析失敗' in m]
+        assert not _bad, \
+            (f"連線已判定中斷後,同一輪剩下的策略不可以再報合約解析失敗 —— "
+             f"那是我們自己製造、而且指向錯地方的訊息: {_bad[:3]}")
+        app.api_logged_in = True
+    finally:
+        app.log_message = orig_log
+        app._qt_resolve, app._qt_resolve_watch = orig_resolve, orig_resolve_watch
+        app._qt_fetch_closed_bars = orig_fetch
+        app._place_strategy_order = orig_place
+        app.sj_api, app.api_logged_in, app._qt_running = orig_api, orig_login, orig_running
+        app.strategies, app.strategy_runtimes = orig_strats, orig_rts
+        app._qt_fetch_attempts = orig_attempts
+
+    _src48 = open('stock_app_pro.py', encoding='utf-8').read()
+
+    # ---- E. 接線:三處合約解析失敗都要拋 ContractResolveError,不可以留 RuntimeError ----
+    _i = _src48.index('    def _quant_eval_pass(')
+    _m = _re48.search(r'\n    def (?!_quant_eval_pass\b)\w+', _src48[_i:])
+    _seg = _src48[_i:_i + _m.start()]
+    assert 'RuntimeError' not in _seg or '合約解析失敗' not in _seg.split('RuntimeError')[0][-200:], \
+        "合約解析失敗不可以再用 RuntimeError (會走進自動停用那條路)"
+    assert _seg.count('ContractResolveError') >= 3, \
+        f"_quant_eval_pass 裡三處合約解析都要用 ContractResolveError,實際 {_seg.count('ContractResolveError')}"
+    assert 'except strategy_engine.TransientEnvError' in _seg, \
+        "except 要認基底型別,日後新增的外部性錯誤才會自動受保護"
+
+    # ---- F. 通知合併要真的接上 log_message,否則純函式白寫 (P-64) ----
+    _i = _src48.index('    def log_message(')
+    _m = _re48.search(r'\n    def (?!log_message\b)\w+', _src48[_i:])
+    _lseg = _src48[_i:_i + _m.start()]
+    assert 'telegram_notify.should_send' in _lseg, \
+        "log_message 沒有走通知合併,ADR-148 的節流等於沒生效"
+
+    # ---- G. 反向對照:成交訊息的紅線不可以被改掉 ----
+    from core import telegram_notify as _tn48
+    for _tag in ('【自動交易-實單', '【自動交易-模擬', '【自動交易-保護'):
+        assert _tag in _tn48.ALWAYS_SEND_TAGS, f"{_tag} 必須永遠逐則送出,不可以被合併"
+
+
+run_case("ADR-148: 連線中斷不可以關掉策略 (合約解析失敗歸類為外部問題 + 訊息不誤導 + 通知合併)",
+         _session_drop_not_strategy_fault_148)
 
 
 def _diag_self_check_no_raw_eval_pass():
