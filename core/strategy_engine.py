@@ -369,7 +369,7 @@ def _day_ref_price(df, base='昨收'):
     return None
 
 
-def day_pct_change(df, base='昨收', use='盤中觸價', side='down'):
+def day_pct_change(df, base='昨收', use='盤中觸價', side='down', live_price=None):
     """當日漲跌幅 %(負數=跌)。算不出來回 None。
 
     use='盤中觸價' → 拿**當日到目前為止**的最低價(side='down')或最高價
@@ -386,7 +386,7 @@ def day_pct_change(df, base='昨收', use='盤中觸價', side='down'):
     if ref is None or ref <= 0:
         return None
     if use == '收盤價':
-        px = float(df['Close'].iloc[-1])
+        px = float(live_price) if live_price is not None else float(df['Close'].iloc[-1])
     else:
         col = 'Low' if side == 'down' else 'High'
         if col not in df.columns:
@@ -394,6 +394,11 @@ def day_pct_change(df, base='昨收', use='盤中觸價', side='down'):
         dates = _bar_dates(df.index)
         today = dates[-1] if dates else None
         vals = [float(df[col].iloc[i]) for i, d in enumerate(dates) if d == today]
+        # 【ADR-145】即時價當成「當日又多了一個成交價」一起納入極值。
+        # 這保證即時判斷是 K 棒判斷的**超集**:會更早發現,但不會發現到
+        # K 棒模式最終不認同的東西 —— 回測與實盤才對得起來 (ADR-136 的教訓)。
+        if live_price is not None:
+            vals.append(float(live_price))
         if not vals:
             return None
         px = min(vals) if side == 'down' else max(vals)
@@ -771,6 +776,10 @@ def new_strategy():
         #   第二筆」—— 那正是回測一年只買一次的元兇。
         # 預設仍是 1,既有策略行為**完全不變**;要分批/加碼才自己調大。
         'max_entries': 1,
+        # 【ADR-145】即時進場:用即時報價判斷「當日漲跌幅」類的進場條件,
+        # 不等 K 棒收盤。**預設關閉** —— 這條路會下單,不可以預設打開。
+        # 只有進場條件全部是「當日漲跌幅」類時才生效 (見 live_entry_supported)。
+        'realtime_entry': False,
         'max_trades_per_day': 3,      # 每日最多進場次數
         'cooldown_sec': 300,          # 兩次下單間最短間隔 (秒)
         'daily_loss_limit': 0.0,      # 每日虧損熔斷 (價差×數量, 0=停用)
@@ -1222,6 +1231,106 @@ def can_scale_in(strategy, runtime):
                            '要先平倉才能再進場。想分批/加碼請把它調大。')
         return False, f'已持倉,分批進場次數已達上限 ({used}/{cap})。'
     return True, ''
+
+
+# ---------------------------------------------------------------------------
+# 【ADR-145】即時進場(用即時報價,不等 K 棒收盤)
+#
+# 使用者要的是「當 A 盤中**即時**跌幅超過 X% 就買進 B」。ADR-143 的條件本身
+# 是對的,但引擎的**進場**判斷只在 K 棒收盤時發生 —— A 選 1分K 也要等最多
+# 一分鐘。即時報價那條路 (_qt_check_realtime_futures_stops) 原本**只做出場**。
+#
+# 這一段補上「進場」那一半,而且刻意設計成 K 棒模式的**超集**:
+# 即時價只是「當日又多了一個成交價」,所以它只會讓同一個訊號**更早**被發現,
+# 不會產生 K 棒模式最終不認同的訊號。回測仍用當根 K 棒的高低點模型,
+# 兩邊語意一致 —— 回測與實盤不同模型 = 回測數字是假的 (ADR-136)。
+# ---------------------------------------------------------------------------
+
+#: 哪些進場條件可以「只憑昨收 + 現在的價」判斷。
+# 均線 / KD / MACD 那些一定要 K 棒序列,即時價給不出來。
+LIVE_ENTRY_CONDITIONS = frozenset({'day_drop_over', 'day_rise_over'})
+
+
+def realtime_entry_enabled(strategy):
+    """有沒有開「即時進場」。**預設 False** —— 這條路會下單,不可以預設打開。"""
+    return bool((strategy or {}).get('realtime_entry'))
+
+
+def live_entry_supported(strategy):
+    """這檔策略的進場條件能不能用即時價評估。回傳 (可否, 原因)。
+
+    進場條件是 AND ——只要有**一條**需要 K 棒序列(均線/KD/MACD…),就不能
+    只憑即時價判斷,否則會在其他條件根本還沒成立時就進場。這種情況一律退回
+    「等 K 棒收盤」,而且要把原因說出來(不可以靜默失效 —— 使用者會以為
+    即時進場在跑,其實沒有)。
+    """
+    conds = list((strategy or {}).get('entry') or [])
+    if not conds:
+        return False, '沒有設定任何進場條件'
+    bad = [condition_label(c) for c in conds
+           if str(c.get('type')) not in LIVE_ENTRY_CONDITIONS]
+    if bad:
+        return False, ('這些進場條件需要完整的 K 棒序列,無法只憑即時價判斷:'
+                       + '、'.join(bad) + ' —— 這檔策略的進場仍會等 K 棒收盤。')
+    return True, ''
+
+
+def check_realtime_entry(strategy, runtime, df_closed, live_price):
+    """即時進場判斷。回傳 OPEN intent 或 None。
+
+    df_closed 是 A 的已收盤 K 棒(拿來算「昨收」與「當日已收盤的極值」),
+    live_price 是 A 的即時價。兩者合起來才算得出「當日到**此刻**為止的跌幅」。
+
+    這裡**不**負責:
+      - 有沒有開即時進場(呼叫端先問 realtime_entry_enabled)
+      - 交易時段閘門、風控(呼叫端用既有那一套,與 K 棒路徑同一份)
+    這樣這個函式維持純判斷,可以離線測。
+    """
+    if live_price is None or df_closed is None or len(df_closed) < 2:
+        return None
+    ok, _why = live_entry_supported(strategy)
+    if not ok:
+        return None
+    can, _ = can_scale_in(strategy, runtime)
+    if not can:
+        return None
+
+    details = []
+    for c in (strategy.get('entry') or []):
+        t = str(c.get('type'))
+        p = c.get('params', {})
+        # 【明確拒絕,不靠巧合】上面的 live_entry_supported() 已經擋過一次,
+        # 這裡再擋一次是刻意的:少了這行,不認得的條件會落進下面的
+        # `side = 'up'` 分支被當成「漲幅條件」硬算一個數字出來 —— 那個數字
+        # 有可能剛好成立,於是在使用者其他條件根本沒到的時候就進場下單。
+        # 這條路會下單,不可以把安全性寄託在「剛好算出 False」。
+        if t not in LIVE_ENTRY_CONDITIONS:
+            return None
+        try:
+            v = abs(float(p.get('value', 3.0)))
+            side = 'down' if t == 'day_drop_over' else 'up'
+            chg = day_pct_change(df_closed, p.get('base', '昨收'),
+                                 p.get('use', '盤中觸價'), side, live_price=live_price)
+            if chg is None:
+                return None
+            hit = (chg <= -v) if side == 'down' else (chg >= v)
+        except Exception:
+            return None
+        if not hit:
+            return None
+        details.append(f"{condition_label(c)} [即時 {chg:+.2f}%]")
+
+    state = str((runtime or {}).get('state', 'FLAT'))
+    if state == 'FLAT':
+        action = '買進' if strategy.get('direction') == '做多' else '賣出'
+        prefix = '即時進場'
+    else:
+        action = '買進' if state == 'LONG' else '賣出'
+        prefix = f"即時加碼 (第 {entries_of(runtime) + 1} 筆)"
+    return {'kind': 'OPEN', 'action': action,
+            'qty': int(strategy.get('qty', 1)),
+            'price': float(live_price),
+            'reason': f"{prefix}: " + " 且 ".join(details)}
 
 
 def evaluate_strategy(strategy, runtime, df_closed, now_ts, today_str):
