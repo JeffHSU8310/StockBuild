@@ -6995,6 +6995,269 @@ run_case("ADR-146: 零股機制稽核 (09:10開盤/只能限價/數量1~999股)"
          _odd_lot_audit_146)
 
 
+def _timed_entry_odd_lot_147():
+    """【ADR-147】定時下單:到了指定時刻用當時的五檔進場(零股專用)。
+
+    使用者的原話:
+      「零股也可以在指定時間下單(比如12:01分),零股沒有K線圖,那可以抓當時的
+        五檔即時報價快照的價格嗎?然後,有設定可以議價幾檔。」
+
+    純函式(quote_book 取價、should_fire_timed 觸發)已經在 tests/test_core.py
+    釘死了。這個案例守的是**接線**,而接線正是這一筆最容易出錯的地方:
+
+      · 五檔串流原本只收「主畫面正在看的那一檔」——訂閱成功了卻永遠收不到
+        策略標的的資料,而且完全無聲,一直到 12:01 才發現「取不到五檔」。
+      · 使用者換股時,原本會把離開那一檔的四路訂閱全退掉——剛好是策略標的
+        的話,常駐訂閱就這樣被誤殺。
+      · 取不到五檔時若「退回 K 棒收盤價」,零股拿到的會是**整股價**
+        (ADR-146 記過的既有近似),那是一張錯價的真錢單。
+    """
+    from core import strategy_engine as _se47
+    from core import quote_book as _qb47
+    from core import order_intent as _oi47
+
+    class FakeContract:
+        def __init__(self, code='2330'):
+            self.code = code
+            self.symbol = code
+
+    class FakeBidAsk:
+        """模仿 shioaji v1 的 BidAsk 物件 (四條平行陣列 + intraday_odd)。"""
+        def __init__(self, code, bid, ask, odd=True):
+            self.code = code
+            self.bid_price = [p for p, _ in bid]
+            self.bid_volume = [v for _, v in bid]
+            self.ask_price = [p for p, _ in ask]
+            self.ask_volume = [v for _, v in ask]
+            self.intraday_odd = odd
+
+    subs, unsubs = [], []
+
+    class _Quote:
+        def subscribe(self, contract, quote_type=None, version=None, intraday_odd=False):
+            subs.append((getattr(contract, 'code', ''), str(quote_type), bool(intraday_odd)))
+        def unsubscribe(self, contract, quote_type=None, intraday_odd=False):
+            unsubs.append((getattr(contract, 'code', ''), str(quote_type), bool(intraday_odd)))
+
+    class _Stocks:
+        def get(self, sym): return FakeContract(sym)
+
+    class FakeApi:
+        def __init__(self):
+            self.quote = _Quote()
+            self.Contracts = type('C', (), {'Stocks': _Stocks()})()
+
+    orders, logs = [], []
+    orig_log = app.log_message
+    orig_resolve = app._qt_resolve
+    orig_place = app._place_strategy_order
+    orig_open = stock_app_pro.market_session.is_market_open
+    orig_running, orig_login, orig_api = app._qt_running, app.api_logged_in, app.sj_api
+    orig_strats, orig_rts = app.strategies, app.strategy_runtimes
+    orig_cur = getattr(app, 'current_contract', None)
+    orig_books = dict(getattr(app, '_qt_books', {}) or {})
+    orig_subs_map = dict(getattr(app, '_qt_book_subs', {}) or {})
+
+    # 五檔:買 100/99.5/99  賣 100.5/101/101.5
+    BID = [(100.0, 10), (99.5, 20), (99.0, 30)]
+    ASK = [(100.5, 40), (101.0, 50), (101.5, 60)]
+
+    def _mk(**over):
+        st = _se47.new_strategy()
+        st.update({'name': '診斷ADR147', 'symbol': '2330', 'trade_type': '零股',
+                   'market': '台股', 'qty': 500, 'direction': '做多', 'mode': '實單',
+                   'enabled': True, 'timeframe': '5分K', 'session_gate': False,
+                   'stop_loss_pct': 0.0, 'take_profit_pct': 0.0,
+                   'cooldown_sec': 0, 'max_trades_per_day': 99,
+                   'slippage_ticks': 0, 'entry': [], 'exit_signals': [],
+                   'timed_entry': True, 'timed_entry_time': '12:01',
+                   'timed_entry_window_min': 5, 'timed_book_level': 1})
+        st.update(over)
+        return st
+
+    def _mount(st):
+        rt = _se47.new_runtime()
+        app.strategies = [st]
+        app.strategy_runtimes = {st['id']: rt}
+        return rt
+
+    def _at(h, m, s=0):
+        return stock_app_pro.datetime(2026, 8, 6, h, m, s)
+
+    def _push(code='2330', odd=True, bid=None, ask=None):
+        app.on_bidask_stk_v1('TSE', FakeBidAsk(code, bid or BID, ask or ASK, odd))
+
+    try:
+        app.log_message = lambda m: (logs.append(str(m)), orig_log(m))[0]
+        app._qt_resolve = lambda _s: (FakeContract(str(_s.get('symbol', '2330'))), 'stock')
+        app._place_strategy_order = lambda st, it, c, k, exec_price=None, **kw: (
+            orders.append((it['kind'], it['action'], it['qty'], exec_price)), (True, 'OK'))[1]
+        app.sj_api = FakeApi(); app.api_logged_in = True; app._qt_running = True
+        stock_app_pro.market_session.is_market_open = lambda *a, **k: True
+        app._qt_books = {}; app._qt_book_subs = {}
+        # 主畫面正在看**別檔** —— 這正是真實情境:策略標的通常不是你在看的那檔
+        app.current_contract = FakeContract('2454')
+
+        # ---- 1. 要為策略標的常駐訂閱「零股」五檔 ----
+        st = _mk(); rt = _mount(st)
+        subs.clear()
+        app._qt_sync_timed_subs(); app.flush_after()
+        assert ('2330', 'BidAsk', True) in subs, \
+            f"要為策略標的訂閱零股五檔,實際訂了 {subs}"
+
+        # ---- 2. 推送進來要收得到 (主畫面看的是 2454,原本這筆會被整包丟掉) ----
+        _push()
+        book = app._qt_get_book('2330', True)
+        assert book is not None, \
+            "策略標的的五檔沒有被收下 —— 訂閱成功卻收不到資料是完全無聲的失敗"
+        assert _qb47.depth(book, 'ask') == 3, f"五檔沒攤平好: {book}"
+        assert app.current_bidask_odd is None or getattr(app.current_bidask_odd, 'code', '') != '2330', \
+            "策略標的的五檔不可以污染主畫面那一份 (P-04)"
+
+        # ---- 3. 還沒到 12:01 不可以送 ----
+        orders.clear()
+        app._qt_check_timed_entries(_at(12, 0, 59)); app.flush_after()
+        assert not orders, f"12:00:59 不該送單,實際 {orders}"
+        assert rt['state'] == 'FLAT', f"還沒到時刻不該進場 (實際 {rt['state']})"
+
+        # ---- 4. 12:01 到了 → 用「賣一」的價送出買進 ----
+        orders.clear()
+        app._qt_check_timed_entries(_at(12, 1, 2)); app.flush_after()
+        assert orders, f"12:01 應該送出定時單,實際沒有 (日誌:{logs[-3:]})"
+        assert orders[-1][:3] == ('OPEN', '買進', 500), f"實際 {orders[-1]}"
+        assert orders[-1][3] == 100.5, \
+            f"買進要吃「賣一」的 100.5,實際 {orders[-1][3]} —— 取到買價就是接反了"
+        assert rt['state'] == 'LONG'
+
+        # ---- 5. 當天只送一次 ----
+        orders.clear()
+        app._qt_check_timed_entries(_at(12, 2, 0)); app.flush_after()
+        assert not orders, f"同一天不可以送第二次,實際 {orders}"
+
+        # ---- 6. 「五檔第 N 檔」是真的參數 (議價旋鈕一) ----
+        st3 = _mk(timed_book_level=3); rt3 = _mount(st3)
+        orders.clear()
+        app._qt_check_timed_entries(_at(12, 1, 2)); app.flush_after()
+        assert orders and orders[-1][3] == 101.5, \
+            f"第3檔要用「賣三」的 101.5,實際 {orders and orders[-1][3]} —— 檔數沒被真的讀取"
+
+        # ---- 7. 讓價檔數疊加在五檔基準上 (議價旋鈕二,兩個都要) ----
+        st4 = _mk(timed_book_level=1, slippage_ticks=2)
+        rt4 = _mount(st4)
+        orders.clear()
+        app._qt_check_timed_entries(_at(12, 1, 2)); app.flush_after()
+        assert orders, "應該送出"
+        _px = orders[-1][3]
+        _oi = _oi47.build_live_order(st4, {'action': '買進', 'qty': 500, 'price': _px},
+                                     'stock', exec_price=_px)
+        assert _oi['limit_price'] > _px, \
+            f"讓價 2 檔要讓成交價高於五檔基準 {_px},實際 {_oi['limit_price']}"
+        # 【鐵則6】零股仍然只能限價,而且價格不是 0
+        assert _oi['price_type'] == '限價' and _oi['price'] > 0, f"零股必須限價: {_oi}"
+        assert _oi['order_lot'] == _oi47.LOT_ODD, f"零股的 order_lot 不對: {_oi}"
+
+        # ---- 8. 取不到五檔就**不送單**,而且絕不退回整股/K棒價 ----
+        app._qt_books = {}
+        st5 = _mk(); rt5 = _mount(st5)
+        orders.clear(); logs.clear()
+        app._qt_check_timed_entries(_at(12, 1, 2)); app.flush_after()
+        assert not orders, \
+            f"取不到五檔就不可以送單 (退回整股價=錯價的真錢單),實際 {orders}"
+        assert rt5['state'] == 'FLAT'
+        assert any('還沒送出' in m for m in logs), \
+            f"取不到五檔要講話,不可以靜默不動:{logs[-3:]}"
+        # 而且**不可以**收尾 —— 窗口內下一個 tick 還要再試
+        assert not rt5.get('timed_done_day'), "取不到五檔不該當成今天處理完了"
+
+        # ---- 9. 五檔太舊也不採用 (串流斷了但快取還在) ----
+        _push()
+        _b = app._qt_get_book('2330', True)
+        with app.quote_lock:
+            app._qt_books[('2330', True)] = dict(_b, ts=_b['ts'] - 999.0)
+        orders.clear()
+        app._qt_check_timed_entries(_at(12, 1, 2)); app.flush_after()
+        assert not orders, f"五檔已經 999 秒沒更新,不可以拿來下單,實際 {orders}"
+
+        # ---- 10. 窗口過了要收尾並講一次話 ----
+        orders.clear(); logs.clear()
+        app._qt_check_timed_entries(_at(12, 9, 0)); app.flush_after()
+        assert not orders
+        assert rt5.get('timed_done_day') == '2026-08-06', "窗口過了要標成今天處理完"
+        assert any('窗口' in m for m in logs), f"窗口過期要講一次:{logs[-3:]}"
+
+        # ---- 11. 反向對照:沒開定時下單的策略完全不受影響 ----
+        _push()
+        st6 = _mk(timed_entry=False, entry=[{'type': 'ma_cross_up', 'params': {}}])
+        rt6 = _mount(st6)
+        orders.clear()
+        app._qt_check_timed_entries(_at(12, 1, 2)); app.flush_after()
+        assert not orders and rt6['state'] == 'FLAT', \
+            f"沒開定時下單的策略不可以被這條路動到,實際 {orders}"
+        # 也不該為它佔訂閱配額
+        subs.clear()
+        app._qt_book_subs = {}
+        app._qt_sync_timed_subs(); app.flush_after()
+        assert not subs, f"沒開定時下單就不該訂閱五檔 (別浪費配額),實際 {subs}"
+
+        # ---- 12. 換股時不可以把策略的常駐五檔訂閱一起退掉 ----
+        st7 = _mk(); _mount(st7)
+        app._qt_book_subs = {}
+        app._qt_sync_timed_subs(); app.flush_after()
+        unsubs.clear()
+        app._resubscribe_quotes_worker(FakeContract('2330'), FakeContract('2454'), 'stock')
+        app.flush_after()
+        assert ('2330', 'BidAsk', True) not in unsubs, \
+            f"換股時誤退了策略標的的零股五檔 —— 之後永遠取不到價,實際退了 {unsubs}"
+        assert ('2330', 'Tick', True) in unsubs, \
+            f"反向對照:Tick 該退的還是要退 (策略不看 Tick),實際 {unsubs}"
+
+        # ---- 13. 風控仍然有效 (不可以因為換一條路進場就繞過去) ----
+        _push()
+        st8 = _mk(max_trades_per_day=0); rt8 = _mount(st8)
+        orders.clear(); logs.clear()
+        app._qt_check_timed_entries(_at(12, 1, 2)); app.flush_after()
+        assert not orders, f"每日進場上限 0 要擋下定時單,實際 {orders}"
+        assert any('風控擋單' in m for m in logs), f"風控擋單要記日誌:{logs[-3:]}"
+
+        # ---- 14. 交易時段閘門仍然有效 (ADR-124 同一道) ----
+        _push()
+        st9 = _mk(session_gate=True); rt9 = _mount(st9)
+        stock_app_pro.market_session.is_market_open = lambda *a, **k: False
+        orders.clear()
+        app._qt_check_timed_entries(_at(12, 1, 2)); app.flush_after()
+        assert not orders, f"市場關閉時不可以送定時單,實際 {orders}"
+        stock_app_pro.market_session.is_market_open = lambda *a, **k: True
+
+        # ---- 15. runner 真的有呼叫這條路 (P-64:接線才是重點) ----
+        import re as _re47
+        _src47 = open('stock_app_pro.py', encoding='utf-8').read()
+        _i = _src47.index('    def quant_runner_worker(')
+        _m = _re47.search(r'\n    def (?!quant_runner_worker\b)\w+', _src47[_i:])
+        _seg = _src47[_i:_i + _m.start()]
+        for _need in ('_qt_check_timed_entries', '_qt_sync_timed_subs'):
+            assert _need in _seg, f"runner 沒有呼叫 {_need},功能永遠不會跑"
+        # 而且 on_bidask_stk_v1 要在「只收主畫面那一檔」的 if 之外收策略的五檔
+        _j = _src47.index('    def on_bidask_stk_v1(')
+        _m2 = _re47.search(r'\n    def (?!on_bidask_stk_v1\b)\w+', _src47[_j:])
+        assert '_qt_store_book' in _src47[_j:_j + _m2.start()], \
+            "on_bidask_stk_v1 沒有把策略標的的五檔存下來"
+
+    finally:
+        app.log_message = orig_log
+        app._qt_resolve = orig_resolve
+        app._place_strategy_order = orig_place
+        stock_app_pro.market_session.is_market_open = orig_open
+        app._qt_running, app.api_logged_in, app.sj_api = orig_running, orig_login, orig_api
+        app.strategies, app.strategy_runtimes = orig_strats, orig_rts
+        app.current_contract = orig_cur
+        app._qt_books = orig_books
+        app._qt_book_subs = orig_subs_map
+
+
+run_case("ADR-147: 定時下單 (12:01 用當時的五檔進場;零股無K線/五檔第N檔+讓價/取不到就不送)",
+         _timed_entry_odd_lot_147)
+
+
 def _diag_self_check_no_raw_eval_pass():
     """【P-127】診斷檔自己的自我檢查:不可以有人再直接呼叫 `_quant_eval_pass()`。
 

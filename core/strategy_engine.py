@@ -29,6 +29,8 @@ from core import chips_features as _cf
 from core import order_rules as _order_rules
 # 【ADR-143】當日漲跌幅要照「交易日」分組 (期貨夜盤歸下一個交易日, ADR-007)。
 from core import futures_session as _fs
+# 【ADR-147】定時下單的「五檔第幾檔」界線與手動取價共用同一份定義。
+from core import quote_book as _qb
 
 
 class KBarsFetchError(Exception):
@@ -782,6 +784,13 @@ def new_strategy():
         # 不等 K 棒收盤。**預設關閉** —— 這條路會下單,不可以預設打開。
         # 只有進場條件全部是「當日漲跌幅」類時才生效 (見 live_entry_supported)。
         'realtime_entry': False,
+        # 【ADR-147】定時下單:到了指定時刻就用當時的五檔進場,不等 K 棒收盤。
+        # 零股沒有自己的 K 線,這是它唯一能「在 12:01 這種時間點」下單的方式。
+        # 同樣**預設關閉** —— 會下單的功能不可以預設打開。
+        'timed_entry': False,
+        'timed_entry_time': '',       # 'HH:MM' 或 'HH:MM:SS'
+        'timed_entry_window_min': TIMED_ENTRY_DEFAULT_WINDOW_MIN,
+        'timed_book_level': 1,        # 用五檔的第幾檔當基準價 (1=最佳檔)
         'max_trades_per_day': 3,      # 每日最多進場次數
         'cooldown_sec': 300,          # 兩次下單間最短間隔 (秒)
         'daily_loss_limit': 0.0,      # 每日虧損熔斷 (價差×數量, 0=停用)
@@ -1009,6 +1018,9 @@ def new_runtime():
         'error_count': 0,
         'condition_errors': [],       # 【ADR-065】[(條件標籤, 例外訊息), ...];最近一次評估時哪些條件拋了例外
         'time_window_skips': [],      # 【ADR-066】最近一次評估時,有哪些 intent 被進/出場時間窗設定排除
+        # 【ADR-147】定時下單今天處理完了沒 ('YYYY-MM-DD')。送出去算處理完,
+        # 窗口過了沒送到也算 —— 否則過期之後每個 tick 都會重算並重記日誌。
+        'timed_done_day': '',
     }
 
 VALID_TIMEFRAMES = ("1分K", "5分K", "15分K", "30分K", "60分K", "日K", "周K", "月K")
@@ -1072,8 +1084,28 @@ def validate_strategy(s):
                            f"不是交易所規則)")
     except (TypeError, ValueError):
         return False, "數量必須為正整數"
-    if not s.get('entry'):
-        return False, "至少要有一個進場條件"
+    # 【ADR-147】定時下單本身就是進場觸發:「12:01 幫我買一張」是完全合理的
+    # 策略,不該被逼著隨便掛一個條件湊數 —— 湊出來的條件會真的影響下單。
+    # 沒開定時下單時行為完全不變。
+    if not s.get('entry') and not timed_entry_enabled(s):
+        return False, "至少要有一個進場條件 (或改用定時下單:到了指定時刻就進場)"
+    if timed_entry_enabled(s):
+        if not timed_entry_time_of(s):
+            return False, ("啟用定時下單就必須填「指定時刻」,格式 HH:MM "
+                           f"(目前:{s.get('timed_entry_time', '')!r})")
+        try:
+            _lv = int(s.get('timed_book_level', 1))
+        except (TypeError, ValueError):
+            return False, "五檔基準檔數必須是 1~5 的整數"
+        if not (1 <= _lv <= _qb.MAX_LEVELS):
+            return False, f"五檔基準檔數只能是 1~{_qb.MAX_LEVELS} (目前 {_lv})"
+        try:
+            _wm = int(s.get('timed_entry_window_min', TIMED_ENTRY_DEFAULT_WINDOW_MIN))
+        except (TypeError, ValueError):
+            return False, "有效窗口必須是正整數 (分鐘)"
+        if not (1 <= _wm <= TIMED_ENTRY_MAX_WINDOW_MIN):
+            return False, (f"有效窗口只能是 1~{TIMED_ENTRY_MAX_WINDOW_MIN} 分鐘 "
+                           f"(目前 {_wm})")
     for c in list(s.get('entry', [])) + list(s.get('exit_signals', [])):
         if c.get('type') not in CONDITIONS:
             return False, f"未知的條件類型: {c.get('type')}"
@@ -1342,6 +1374,149 @@ def check_realtime_entry(strategy, runtime, df_closed, live_price):
             'qty': int(strategy.get('qty', 1)),
             'price': float(live_price),
             'reason': f"{prefix}: " + " 且 ".join(details)}
+
+
+# ============================================================================
+# 【ADR-147】定時下單 —— 「到了 12:01 就用當時的五檔買一張零股」
+# ============================================================================
+#
+# 為什麼不能沿用既有的 specific_entry_time:那個欄位比對的是 **K 棒時間戳**
+# (filter_intents_by_time 裡的 `bar_time_str != sp_entry`)。5分K 的時間戳是
+# 12:00 / 12:05 …,永遠不會等於 12:01 —— 使用者填 12:01 等於這檔策略永遠
+# 不進場,而且它是**安靜**的(只留在 time_window_skips 裡)。
+#
+# 定時下單改成掛在即時通道上,用**時鐘**而不是 K 棒時間戳判斷,所以任何
+# 分鐘數都成立,也不需要把週期改成 1分K 去遷就它。
+
+TIMED_ENTRY_DEFAULT_WINDOW_MIN = 5
+TIMED_ENTRY_MAX_WINDOW_MIN = 60
+
+
+def timed_entry_enabled(strategy):
+    """有沒有開定時下單。**預設關閉** —— 會下單的功能不可以預設打開。"""
+    return bool((strategy or {}).get('timed_entry', False))
+
+
+def timed_entry_time_of(strategy):
+    """指定時刻,正規化成 'HH:MM:SS';沒設定或格式壞掉回空字串。"""
+    return _normalize_time((strategy or {}).get('timed_entry_time', ''))
+
+
+def timed_window_min_of(strategy):
+    """有效窗口幾分鐘。收進 1~60。
+
+    為什麼一定要有窗口:即時通道的節拍是秒級以上(鐵則 5 的節流),不可能
+    剛好命中 12:01:00 那一秒,所以觸發條件必須是「已經到了而且還沒過太久」。
+    沒有上界的話,中午 12:40 才把 App 打開會立刻補送一張 12:01 的單 ——
+    那個決策的價格前提早就不存在了。
+    """
+    try:
+        n = int((strategy or {}).get('timed_entry_window_min',
+                                     TIMED_ENTRY_DEFAULT_WINDOW_MIN))
+    except (TypeError, ValueError):
+        return TIMED_ENTRY_DEFAULT_WINDOW_MIN
+    return max(1, min(TIMED_ENTRY_MAX_WINDOW_MIN, n))
+
+
+def timed_book_level_of(strategy):
+    """用五檔的第幾檔當基準價。收進 1~5 (界線的單一出處在 core/quote_book)。"""
+    return _qb.clamp_level((strategy or {}).get('timed_book_level',
+                                                _qb.DEFAULT_LEVEL))
+
+
+def should_fire_timed(strategy, runtime, now_dt):
+    """現在該不該送這檔策略的定時單。→ (要送嗎, 原因)。
+
+    原因字串在兩種情況都要用得上:不送要說得出為什麼(靜默不動最難查),
+    要送也要能寫進日誌。
+
+    `runtime['timed_done_day']` 記「今天這檔已經處理完了」—— 送出去算處理完,
+    過了窗口沒送到也算處理完。兩者都要記,否則過期之後每一個 tick 都會再算
+    一次、再記一次日誌,一天洗幾千行。
+    """
+    if not timed_entry_enabled(strategy):
+        return False, "沒有啟用定時下單"
+    t = timed_entry_time_of(strategy)
+    if not t:
+        return False, "沒有設定指定時刻 (或格式不正確)"
+    day = now_dt.strftime('%Y-%m-%d')
+    if str((runtime or {}).get('timed_done_day', '')) == day:
+        return False, "今天已經處理過了"
+    hh, mm, ss = (int(x) for x in t.split(':'))
+    target = now_dt.replace(hour=hh, minute=mm, second=ss, microsecond=0)
+    elapsed = (now_dt - target).total_seconds()
+    if elapsed < 0:
+        return False, f"還沒到指定時刻 {t} (還有 {-elapsed:.0f} 秒)"
+    win = timed_window_min_of(strategy) * 60
+    if elapsed > win:
+        return False, (f"已經超過 {t} 起算的 {timed_window_min_of(strategy)} 分鐘窗口 "
+                       f"({elapsed / 60:.1f} 分),今天不再送")
+    return True, f"到達指定時刻 {t}"
+
+
+def timed_window_expired(strategy, runtime, now_dt):
+    """窗口過了但今天還沒處理過 → True。呼叫端據此記一次日誌並收尾。"""
+    if not timed_entry_enabled(strategy) or not timed_entry_time_of(strategy):
+        return False
+    if str((runtime or {}).get('timed_done_day', '')) == now_dt.strftime('%Y-%m-%d'):
+        return False
+    t = timed_entry_time_of(strategy)
+    hh, mm, ss = (int(x) for x in t.split(':'))
+    target = now_dt.replace(hour=hh, minute=mm, second=ss, microsecond=0)
+    return (now_dt - target).total_seconds() > timed_window_min_of(strategy) * 60
+
+
+def mark_timed_done(runtime, now_dt):
+    """把今天標成處理完 (送出去了,或窗口過了)。"""
+    if runtime is not None:
+        runtime['timed_done_day'] = now_dt.strftime('%Y-%m-%d')
+
+
+def check_timed_entry(strategy, runtime, df_closed=None):
+    """定時單要送什麼。回傳 OPEN intent 或 None。
+
+    **進場條件仍然要成立**,只是判斷的時機從「K 棒收盤」換成「指定時刻」:
+    條件用最近的已收盤 K 棒評估(df_closed 由呼叫端提供,與即時進場共用同一份
+    快取,不另外抓 K 線,P-90)。沒有設進場條件的策略就是「到點必送」——
+    那正是「12:01 幫我買一張」最單純的用法。
+
+    這裡**不**負責:時段閘門、風控、五檔取價、時刻判斷。那些在呼叫端,而且
+    與既有路徑用同一份程式碼 —— 定時下單不是另一套下單系統,只是另一個
+    「什麼時候評估」的觸發點。
+
+    價格刻意留 0.0:定時下單的成交基準價一定來自五檔 (quote_book),不是
+    K 棒收盤價。留一個看起來合理的收盤價在這裡,只會讓「五檔取不到時
+    悄悄用了 K 棒價」變成一個很容易犯的錯。
+    """
+    can, _why = can_scale_in(strategy, runtime)
+    if not can:
+        return None
+
+    conds = list((strategy or {}).get('entry') or [])
+    if conds:
+        if df_closed is None or len(df_closed) < 1:
+            return None
+        try:
+            ok, details = eval_conditions(df_closed, conds, 'AND')
+        except Exception:
+            return None
+        if not ok:
+            return None
+        why = "進場條件成立: " + " 且 ".join(lab for lab, _ in details)
+    else:
+        why = "無進場條件 (到點即進場)"
+
+    state = str((runtime or {}).get('state', 'FLAT'))
+    if state == 'FLAT':
+        action = '買進' if strategy.get('direction') == '做多' else '賣出'
+        prefix = '定時進場'
+    else:
+        action = '買進' if state == 'LONG' else '賣出'
+        prefix = f"定時加碼 (第 {entries_of(runtime) + 1} 筆)"
+    return {'kind': 'OPEN', 'action': action,
+            'qty': int(strategy.get('qty', 1)),
+            'price': 0.0,
+            'reason': f"{prefix}: {why}"}
 
 
 def evaluate_strategy(strategy, runtime, df_closed, now_ts, today_str):

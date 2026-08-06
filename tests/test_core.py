@@ -28,6 +28,7 @@ import numpy as np
 from core import tick_rules
 from core import futures_session
 from core import market_session
+from core import quote_book
 from core import secure_store
 from core import order_rules
 from core import order_intent
@@ -8860,6 +8861,219 @@ class TestTelegramQueryCommands(unittest.TestCase):
         for bad in ('/buy', '/sell', '/order', '/close'):
             self.assertNotIn(bad, telegram_control.COMMANDS)
 
+
+
+class TestQuoteBookADR147(unittest.TestCase):
+    """【ADR-147】五檔取價。零股沒有 K 線、snapshots() 的價又永遠是整股價
+    (P-06),所以五檔是定時下單**唯一**的價格來源 —— 取錯就是一張真錢的錯價單,
+    而且定時下單只有一次機會,沒有下一根 K 棒可以修正。"""
+
+    def _book(self, ts=1000.0):
+        # 買 100 / 99.5 / 99   (由高到低)
+        # 賣 100.5 / 101 / 101.5 (由低到高)
+        return quote_book.make([100.0, 99.5, 99.0], [1, 2, 3],
+                               [100.5, 101.0, 101.5], [4, 5, 6],
+                               ts=ts, symbol='2330', odd=True)
+
+    def test_buy_eats_ask_sell_eats_bid(self):
+        b = self._book()
+        self.assertEqual(quote_book.pick_price(b, '買進', 1)[0], 100.5)
+        self.assertEqual(quote_book.pick_price(b, '賣出', 1)[0], 100.0)
+
+    def test_deeper_level_is_more_aggressive(self):
+        """越深的檔位 = 越願意成交:買進越貴、賣出越便宜。方向寫反的話,
+        單會掛在一個排在自己後面的價位,永遠不成交,而使用者以為買到了。"""
+        b = self._book()
+        buys = [quote_book.pick_price(b, '買進', n)[0] for n in (1, 2, 3)]
+        sells = [quote_book.pick_price(b, '賣出', n)[0] for n in (1, 2, 3)]
+        self.assertEqual(buys, sorted(buys))
+        self.assertTrue(buys[2] > buys[0])
+        self.assertEqual(sells, sorted(sells, reverse=True))
+        self.assertTrue(sells[2] < sells[0])
+
+    def test_level_deeper_than_book_refuses(self):
+        """掛單不夠深就不下單 —— 不可以退回最佳檔充數。使用者選第 5 檔是
+        「我願意追到第 5 檔」,只有 3 檔時用第 1 檔成交機率完全不同。"""
+        b = self._book()
+        px, why = quote_book.pick_price(b, '買進', 5)
+        self.assertIsNone(px)
+        self.assertIn('只有 3 檔', why)
+
+    def test_zero_padded_levels_are_truncated(self):
+        """券商在檔位不足時補 0。那些 0 不是「價格是零」,是「沒有這一檔」;
+        留著就會挑到 0.0 送出一張 0 元的委託。"""
+        b = quote_book.make([100.0, 0.0, 0.0], [1, 0, 0],
+                            [100.5, 0.0, 0.0], [2, 0, 0], ts=1.0)
+        self.assertEqual(quote_book.depth(b, 'bid'), 1)
+        self.assertEqual(quote_book.depth(b, 'ask'), 1)
+        self.assertIsNone(quote_book.pick_price(b, '買進', 2)[0])
+        self.assertEqual(quote_book.pick_price(b, '買進', 1)[0], 100.5)
+
+    def test_empty_side_refuses(self):
+        b = quote_book.make([100.0], [1], [], [], ts=1.0)
+        px, why = quote_book.pick_price(b, '買進', 1)
+        self.assertIsNone(px)
+        self.assertIn('賣方', why)
+        # 反向對照:另一邊還是能取
+        self.assertEqual(quote_book.pick_price(b, '賣出', 1)[0], 100.0)
+
+    def test_inconsistent_book_refuses(self):
+        """賣二比賣一低 = 資料本身壞了 (陣列沒對齊/買賣接反)。這時候取值會
+        取到一個離譜的價然後真的送出去,所以寧可不下單。"""
+        b = quote_book.make([100.0, 99.0], [1, 1], [100.5, 90.0], [1, 1], ts=1.0)
+        px, why = quote_book.pick_price(b, '買進', 2)
+        self.assertIsNone(px)
+        self.assertIn('不一致', why)
+
+    def test_freshness(self):
+        b = self._book(ts=1000.0)
+        self.assertTrue(quote_book.is_fresh(b, 1005.0)[0])
+        self.assertFalse(quote_book.is_fresh(b, 1020.0)[0])
+        # 沒有時間戳一律當不新鮮 —— 否則「串流從沒推過的空殼」會被當成剛更新
+        b2 = quote_book.make([100.0], [1], [100.5], [1], ts=None)
+        self.assertFalse(quote_book.is_fresh(b2, 1000.0)[0])
+        # 時鐘倒退也不採用
+        self.assertFalse(quote_book.is_fresh(b, 900.0)[0])
+        self.assertFalse(quote_book.is_fresh(None, 1000.0)[0])
+
+    def test_clamp_level(self):
+        self.assertEqual(quote_book.clamp_level(0), 1)
+        self.assertEqual(quote_book.clamp_level(-3), 1)
+        self.assertEqual(quote_book.clamp_level(99), quote_book.MAX_LEVELS)
+        self.assertEqual(quote_book.clamp_level('x'), quote_book.DEFAULT_LEVEL)
+        self.assertEqual(quote_book.clamp_level(3), 3)
+
+
+class TestTimedEntryADR147(unittest.TestCase):
+    """【ADR-147】定時下單的觸發規則。
+
+    既有的 specific_entry_time 比對的是 **K 棒時間戳**,5分K 的時間戳是
+    12:00/12:05…,永遠不等於 12:01 —— 使用者填 12:01 等於永遠不進場,而且
+    是安靜的。這一組測試釘住「改用時鐘之後,任何分鐘數都成立」。
+    """
+
+    def _mk(self, **kw):
+        s = strategy_engine.new_strategy()
+        s.update({'name': '定時', 'symbol': '2330', 'trade_type': '零股',
+                  'qty': 500, 'direction': '做多', 'entry': [],
+                  'timed_entry': True, 'timed_entry_time': '12:01'})
+        s.update(kw)
+        return s
+
+    def _at(self, h, m, sec=0):
+        return datetime.datetime(2026, 8, 6, h, m, sec)
+
+    def test_fires_at_a_non_bar_boundary_minute(self):
+        """12:01 不是任何常用週期的 K 棒邊界 —— 這正是舊做法做不到的那件事。"""
+        s, rt = self._mk(), strategy_engine.new_runtime()
+        self.assertFalse(strategy_engine.should_fire_timed(s, rt, self._at(12, 0, 59))[0])
+        self.assertTrue(strategy_engine.should_fire_timed(s, rt, self._at(12, 1, 0))[0])
+        self.assertTrue(strategy_engine.should_fire_timed(s, rt, self._at(12, 3, 30))[0])
+
+    def test_window_expires(self):
+        """窗口是刻意的:中午 12:40 才開 App 不可以立刻補送一張 12:01 的單,
+        那個決策的價格前提早就不存在了。"""
+        s, rt = self._mk(timed_entry_window_min=5), strategy_engine.new_runtime()
+        self.assertTrue(strategy_engine.should_fire_timed(s, rt, self._at(12, 5, 59))[0])
+        ok, why = strategy_engine.should_fire_timed(s, rt, self._at(12, 6, 1))
+        self.assertFalse(ok)
+        self.assertIn('窗口', why)
+        self.assertTrue(strategy_engine.timed_window_expired(s, rt, self._at(12, 6, 1)))
+        self.assertFalse(strategy_engine.timed_window_expired(s, rt, self._at(12, 3, 0)))
+
+    def test_only_once_per_day(self):
+        s, rt = self._mk(), strategy_engine.new_runtime()
+        self.assertTrue(strategy_engine.should_fire_timed(s, rt, self._at(12, 1, 5))[0])
+        strategy_engine.mark_timed_done(rt, self._at(12, 1, 5))
+        self.assertFalse(strategy_engine.should_fire_timed(s, rt, self._at(12, 2, 0))[0])
+        # 隔天要重新來過 (反向對照:不可以一次就永遠關掉)
+        nxt = datetime.datetime(2026, 8, 7, 12, 1, 5)
+        self.assertTrue(strategy_engine.should_fire_timed(s, rt, nxt)[0])
+        # 過期也算處理完 —— 否則過期後每個 tick 都會重算並重記一次日誌
+        rt2 = strategy_engine.new_runtime()
+        strategy_engine.mark_timed_done(rt2, self._at(12, 9, 0))
+        self.assertFalse(strategy_engine.timed_window_expired(s, rt2, self._at(12, 9, 1)))
+
+    def test_disabled_by_default(self):
+        """會下單的功能不可以預設打開。"""
+        self.assertFalse(strategy_engine.timed_entry_enabled(strategy_engine.new_strategy()))
+        s = strategy_engine.new_strategy()
+        s['timed_entry_time'] = '12:01'
+        self.assertFalse(strategy_engine.should_fire_timed(
+            s, strategy_engine.new_runtime(), self._at(12, 1, 5))[0])
+
+    def test_bad_time_never_fires(self):
+        for bad in ('', '  ', '25', 'abc', '12:'):
+            s, rt = self._mk(timed_entry_time=bad), strategy_engine.new_runtime()
+            ok, why = strategy_engine.should_fire_timed(s, rt, self._at(12, 1, 5))
+            self.assertFalse(ok, f"{bad!r} 不該觸發")
+            self.assertIn('指定時刻', why)
+
+    def test_intent_without_conditions(self):
+        """沒設進場條件 = 到點必送。那正是「12:01 幫我買一張」最單純的用法。"""
+        s, rt = self._mk(), strategy_engine.new_runtime()
+        it = strategy_engine.check_timed_entry(s, rt, None)
+        self.assertIsNotNone(it)
+        self.assertEqual((it['kind'], it['action'], it['qty']), ('OPEN', '買進', 500))
+        # 價格刻意留 0:成交基準價一定來自五檔,留一個像樣的收盤價在這裡
+        # 會讓「五檔取不到時悄悄用了 K 棒價」變成很容易犯的錯
+        self.assertEqual(it['price'], 0.0)
+
+    def test_intent_respects_entry_conditions(self):
+        """有設條件就要成立才送 —— 定時下單是多一個觸發時機,不是繞過條件。"""
+        idx = pd.date_range('2026-08-06 09:00', periods=30, freq='5min')
+        up = pd.DataFrame({'Open': np.linspace(90, 120, 30), 'High': np.linspace(91, 121, 30),
+                           'Low': np.linspace(89, 119, 30), 'Close': np.linspace(90, 120, 30),
+                           'Volume': [1000] * 30}, index=idx)
+        dn = pd.DataFrame({'Open': np.linspace(120, 90, 30), 'High': np.linspace(121, 91, 30),
+                           'Low': np.linspace(119, 89, 30), 'Close': np.linspace(120, 90, 30),
+                           'Volume': [1000] * 30}, index=idx)
+        cond = [{'type': 'price_above_ma', 'params': {'period': 5}}]
+        s, rt = self._mk(entry=cond), strategy_engine.new_runtime()
+        self.assertIsNotNone(strategy_engine.check_timed_entry(s, rt, up))
+        self.assertIsNone(strategy_engine.check_timed_entry(s, rt, dn))
+
+    def test_validate_allows_no_entry_only_when_timed(self):
+        """「12:01 幫我買一張」是完全合理的策略,不該被逼著隨便掛一個條件湊數
+        —— 湊出來的條件會真的影響下單。"""
+        ok, why = strategy_engine.validate_strategy(self._mk())
+        self.assertTrue(ok, why)
+        # 反向對照:沒開定時下單時,「至少一個進場條件」的規則不可以被鬆掉
+        s = self._mk(timed_entry=False)
+        ok2, why2 = strategy_engine.validate_strategy(s)
+        self.assertFalse(ok2)
+        self.assertIn('進場條件', why2)
+
+    def test_validate_rejects_bad_settings(self):
+        for kw, frag in ((dict(timed_entry_time=''), '指定時刻'),
+                         (dict(timed_book_level=0), '1~5'),
+                         (dict(timed_book_level=6), '1~5'),
+                         (dict(timed_entry_window_min=0), '窗口'),
+                         (dict(timed_entry_window_min=999), '窗口')):
+            ok, why = strategy_engine.validate_strategy(self._mk(**kw))
+            self.assertFalse(ok, f"{kw} 應該被擋下")
+            self.assertIn(frag, why)
+
+    def test_level_and_window_are_clamped_at_read_time(self):
+        """舊策略檔沒有這些欄位、或被手動改壞,讀的時候要收斂而不是炸掉。"""
+        self.assertEqual(strategy_engine.timed_book_level_of({}), 1)
+        self.assertEqual(strategy_engine.timed_book_level_of({'timed_book_level': 99}),
+                         quote_book.MAX_LEVELS)
+        self.assertEqual(strategy_engine.timed_window_min_of({}),
+                         strategy_engine.TIMED_ENTRY_DEFAULT_WINDOW_MIN)
+        self.assertEqual(strategy_engine.timed_window_min_of({'timed_entry_window_min': 0}), 1)
+        self.assertEqual(strategy_engine.timed_window_min_of({'timed_entry_window_min': 9999}),
+                         strategy_engine.TIMED_ENTRY_MAX_WINDOW_MIN)
+
+    def test_scale_in_limit_still_applies(self):
+        """分批上限 (ADR-144) 對定時下單一樣有效 —— 不可以因為換一條路進場
+        就把既有的閘門繞過去。"""
+        s = self._mk(max_entries=1)
+        rt = strategy_engine.new_runtime()
+        rt.update({'state': 'LONG', 'qty': 500, 'entries': 1})
+        self.assertIsNone(strategy_engine.check_timed_entry(s, rt, None))
+        s2 = self._mk(max_entries=2)
+        self.assertIsNotNone(strategy_engine.check_timed_entry(s2, rt, None))
 
 
 if __name__ == "__main__":

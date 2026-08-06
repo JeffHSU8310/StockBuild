@@ -47,6 +47,7 @@ from core import optimizer
 from core import paper_account
 from core import taifex_daily
 from core import market_session
+from core import quote_book
 from core import secure_store
 from core import chukuangren_band
 from core import telegram_notify
@@ -214,8 +215,12 @@ class StockTradingAppPro(tk.Tk):
         
         # ================= 串流 Quote 五檔報價暫存 =================
         self.current_contract = None
-        self.current_bidask_normal = None  
-        self.current_bidask_odd = None     
+        self.current_bidask_normal = None
+        self.current_bidask_odd = None
+        # 【ADR-147】策略專用的五檔快取,與上面兩個「主畫面正在看的那一檔」
+        # 完全分開 (P-04:共用暫存會互相污染)。key = (代碼, 是不是零股)。
+        self._qt_books = {}
+        self._qt_book_subs = {}   # 目前常駐訂閱了哪些標的:{代碼: 是不是零股}
         self.current_tick_normal = None    
         self.current_tick_odd = None       
         self.is_odd_lot = False
@@ -2352,12 +2357,17 @@ class StockTradingAppPro(tk.Tk):
 
     def on_bidask_stk_v1(self, exchange, bidask):
         try:
+            odd = bool(getattr(bidask, 'intraday_odd', False))
             if self.current_contract and bidask.code == self.current_contract.code:
                 with self.quote_lock:
-                    if bool(getattr(bidask, 'intraday_odd', False)):
+                    if odd:
                         self.current_bidask_odd = bidask
                     else:
                         self.current_bidask_normal = bidask
+            # 【ADR-147】策略標的的五檔另外存一份。刻意在上面那個 if 之外:
+            # 定時下單的標的通常**不是**主畫面正在看的那一檔,原本的判斷會把
+            # 它整筆丟掉 —— 訂閱成功了卻永遠收不到資料,而且完全無聲。
+            self._qt_store_book(bidask, odd)
         except Exception: pass
 
     @staticmethod
@@ -5474,9 +5484,18 @@ class StockTradingAppPro(tk.Tk):
         with self.subscribe_lock:
             try:
                 if prev_contract is not None:
+                    # 【ADR-147】定時下單為策略標的開了**常駐**五檔訂閱。使用者
+                    # 換股時,如果剛好離開的就是某檔策略的標的,原本這裡會把它
+                    # 一起退掉 —— 訂閱記錄還在、資料卻再也不來,而且完全無聲,
+                    # 一直到 12:01 那一刻才發現「取不到五檔」。所以策略要用的
+                    # 那一路 BidAsk 要跳過。Tick 不受影響 (策略不看 Tick)。
+                    _keep = str(getattr(prev_contract, 'code', '') or '').upper()
+                    _keep_odd = (getattr(self, '_qt_book_subs', {}) or {}).get(_keep)
                     for odd_flag in [True, False]:
                         try: self.sj_api.quote.unsubscribe(prev_contract, quote_type=sj.constant.QuoteType.Tick, intraday_odd=odd_flag)
                         except: pass
+                        if _keep_odd is not None and bool(_keep_odd) == odd_flag:
+                            continue
                         try: self.sj_api.quote.unsubscribe(prev_contract, quote_type=sj.constant.QuoteType.BidAsk, intraday_odd=odd_flag)
                         except: pass
 
@@ -9435,6 +9454,239 @@ class StockTradingAppPro(tk.Tk):
                 self.safe_after(0, self.log_message,
                                 f"【自動交易-即時進場異常】策略「{s.get('name')}」: {type(e).__name__}: {e}")
 
+    # ==================================================================
+    # 【ADR-147】定時下單 —— 「到了 12:01 就用當時的五檔買一張零股」
+    # ==================================================================
+    #
+    # 零股沒有自己的 K 線,`snapshots()` 的價又永遠是整股價 (P-06),所以
+    # 這條路的價格**只能**來自零股五檔串流。而五檔串流原本只訂閱主畫面正在
+    # 看的那一檔 (_resubscribe_quotes_worker 換股就退訂),策略標的根本收不到
+    # —— 下面這幾個方法補的就是這一段:為策略標的常駐訂閱、把推送存進策略
+    # 專用的快取、時間到了用它取價下單。
+
+    def _qt_timed_targets(self):
+        """→ {symbol: (contract, 是不是零股)};哪些標的需要常駐五檔訂閱。
+
+        只收「已啟用 + 有開定時下單」的策略。停用的策略不該佔訂閱配額。
+        """
+        out = {}
+        for s in list(getattr(self, 'strategies', []) or []):
+            if not s.get('enabled') or not strategy_engine.timed_entry_enabled(s):
+                continue
+            tt = strategy_engine.trade_type_of(s)
+            if tt == '期貨':
+                continue        # 期貨不在這一筆的範圍 (見 ADR-147「刻意不做」)
+            sym = str(s.get('symbol', '')).upper()
+            if not sym or sym in out:
+                continue
+            try:
+                contract, _asset = self._qt_resolve(s)
+            except Exception:
+                contract = None
+            if contract is None:
+                continue
+            out[sym] = (contract, tt == '零股')
+        return out
+
+    def _qt_sync_timed_subs(self):
+        """讓常駐五檔訂閱與目前的策略設定一致 (訂新的、退掉不要的)。
+
+        跟 `_resubscribe_quotes_worker` 共用 `self.subscribe_lock`:那邊會把
+        「上一檔」的四路全部退訂,如果兩邊同時動,一檔標的可能被那邊退掉之後
+        我們這邊還以為訂著 —— 五檔就這樣安靜地停在最後一筆舊資料上。
+        (真正防住「用到舊資料」的是 quote_book.is_fresh();這裡的鎖是防
+         訂閱狀態本身錯亂。兩道都要。)
+
+        每一路訂閱各自 try/except 並記錄成敗 (鐵則 8),不可包成一個大 try。
+        """
+        if not (self.api_logged_in and HAS_SJ and getattr(self, 'sj_api', None)):
+            return
+        want = self._qt_timed_targets()
+        have = dict(getattr(self, '_qt_book_subs', {}) or {})
+        if set(want) == set(have):
+            return
+        with self.subscribe_lock:
+            for sym, (contract, odd) in want.items():
+                if sym in have:
+                    continue
+                try:
+                    try:
+                        self.sj_api.quote.subscribe(
+                            contract, quote_type=sj.constant.QuoteType.BidAsk,
+                            version=sj.constant.QuoteVersion.v1, intraday_odd=odd)
+                    except TypeError:
+                        self.sj_api.quote.subscribe(
+                            contract, quote_type=sj.constant.QuoteType.BidAsk,
+                            intraday_odd=odd)
+                    have[sym] = odd
+                    self.safe_after(0, self.log_message,
+                                    f"【定時下單】已訂閱 {sym} 的{'零股' if odd else '整股'}五檔 (常駐)")
+                except Exception as e:
+                    self.safe_after(0, self.log_message,
+                                    f"【定時下單】訂閱 {sym} 五檔失敗: {e} —— "
+                                    "沒有五檔就不會送單,請確認是否在交易時段且已登入")
+            for sym in [k for k in have if k not in want]:
+                odd = have.pop(sym)
+                try:
+                    c = self.sj_api.Contracts.Stocks.get(sym)
+                    if c is not None:
+                        self.sj_api.quote.unsubscribe(
+                            c, quote_type=sj.constant.QuoteType.BidAsk, intraday_odd=odd)
+                    self.safe_after(0, self.log_message, f"【定時下單】已退訂 {sym} 的五檔")
+                except Exception:
+                    pass
+            self._qt_book_subs = have
+
+    def _qt_store_book(self, bidask, odd):
+        """把券商推來的五檔存進**策略專用**的快取。
+
+        跟 `current_bidask_odd` / `current_bidask_normal` 完全分開:那兩個是
+        「主畫面正在看的那一檔」,會隨著使用者換股被蓋掉 (P-04 的教訓就是
+        零股與整股共用暫存會互相污染)。策略要的是它自己那一檔,兩者不可共用。
+
+        時間戳用**收到的當下**而不是物件上的交易所時間:`is_fresh()` 要回答的
+        是「這份資料在我手上放多久了」,而交易所時間還要處理時區與時鐘偏差,
+        一旦算錯就是「明明斷線了卻以為很新鮮」。
+        """
+        code = str(getattr(bidask, 'code', '') or '')
+        if not code:
+            return
+        if code not in (getattr(self, '_qt_book_subs', {}) or {}):
+            return
+        try:
+            book = quote_book.make(
+                getattr(bidask, 'bid_price', None), getattr(bidask, 'bid_volume', None),
+                getattr(bidask, 'ask_price', None), getattr(bidask, 'ask_volume', None),
+                ts=time.time(), symbol=code, odd=odd)
+        except Exception:
+            return
+        with self.quote_lock:
+            if not hasattr(self, '_qt_books'):
+                self._qt_books = {}
+            self._qt_books[(code, bool(odd))] = book
+
+    def _qt_get_book(self, symbol, odd):
+        """讀策略用的五檔快取 (鐵則 3:讀寫一律經 quote_lock)。"""
+        with self.quote_lock:
+            return (getattr(self, '_qt_books', {}) or {}).get((str(symbol).upper(), bool(odd)))
+
+    def _qt_check_timed_entries(self, now_dt=None):
+        """時間到了就用當時的五檔進場。掛在 runner 的 2 秒節拍上。
+
+        這條路**不打任何 API**:五檔來自串流快取,進場條件用的是
+        `_quant_eval_pass` already 快取好的已收盤 K 棒 (P-90:跟即時停損共用
+        同一個節拍,阻塞會拖住停損)。所以它不受鐵則 5 的 snapshots 節流影響。
+
+        與既有路徑共用的東西刻意一件都沒少:交易時段閘門 (ADR-124)、風控
+        (每日上限/冷卻/熔斷)、分批上限 (ADR-144)、下單與記帳路徑。
+        定時下單只是**另一個「什麼時候評估」的觸發點**,不是另一套下單系統。
+        """
+        now_dt = now_dt or datetime.now()
+        for s in list(getattr(self, 'strategies', []) or []):
+            if not s.get('enabled') or not strategy_engine.timed_entry_enabled(s):
+                continue
+            rt = self._qt_runtime(s['id'])
+            try:
+                # 窗口過了還沒送到 → 講一次話再收尾,不要每個 tick 都算一次
+                if strategy_engine.timed_window_expired(s, rt, now_dt):
+                    strategy_engine.mark_timed_done(rt, now_dt)
+                    self.safe_after(0, self.log_message,
+                                    f"【定時下單】策略「{s.get('name')}」"
+                                    f"{strategy_engine.timed_entry_time_of(s)} 的單今天沒送成 —— "
+                                    f"已超過 {strategy_engine.timed_window_min_of(s)} 分鐘窗口。"
+                                    "常見原因:當時取不到五檔 (非交易時段/沒掛單/訂閱失敗)。")
+                    self._qt_save_state()
+                    continue
+                ok_fire, why_fire = strategy_engine.should_fire_timed(s, rt, now_dt)
+                if not ok_fire:
+                    continue
+                tt = strategy_engine.trade_type_of(s)
+                # 【ADR-124 的閘門】與 K 棒路徑、即時停損同一道
+                if s.get('session_gate', True) and not market_session.is_market_open(
+                        tt, include_night=strategy_engine.include_night_of(s)):
+                    continue
+                intent = strategy_engine.check_timed_entry(s, rt, rt.get('_live_a_df'))
+                if intent is None:
+                    continue
+
+                sym = str(s.get('symbol', '')).upper()
+                odd = (tt == '零股')
+                book = self._qt_get_book(sym, odd)
+                fresh, why_fresh = quote_book.is_fresh(book, time.time())
+                if not fresh:
+                    # **不** mark_timed_done:窗口內下一個 tick 還要再試。
+                    # 這裡刻意不退回 K 棒收盤價 —— 零股的 K 棒是整股的價
+                    # (ADR-146 記過的既有近似),拿它去下零股限價單就是錯價,
+                    # 而定時下單只有一次機會,沒有下一根 K 棒可以修正。
+                    self._qt_timed_log_once(s, rt, f"取不到可用的五檔:{why_fresh}")
+                    continue
+                level = strategy_engine.timed_book_level_of(s)
+                px, why_px = quote_book.pick_price(book, intent['action'], level)
+                if px is None:
+                    self._qt_timed_log_once(s, rt, f"五檔取價失敗:{why_px} | "
+                                                   f"{quote_book.describe(book)}")
+                    continue
+
+                ok_risk, why_risk = strategy_engine.risk_check(s, rt, intent, time.time())
+                if not ok_risk:
+                    strategy_engine.mark_timed_done(rt, now_dt)
+                    self.safe_after(0, self.log_message,
+                                    f"【自動交易-風控擋單】策略「{s.get('name')}」[定時下單] — {why_risk}")
+                    self._qt_save_state()
+                    continue
+
+                contract, asset_type = self._qt_resolve(s)
+                if contract is None:
+                    self._qt_timed_log_once(s, rt, "合約解析失敗")
+                    continue
+                label = (f"策略「{s.get('name')}」{intent['action']} {intent['qty']} {sym} "
+                         f"@ {px:g} [定時下單 {strategy_engine.timed_entry_time_of(s)},"
+                         f"{'賣' if intent['action'] == '買進' else '買'}{level}檔 | "
+                         f"{quote_book.describe(book)}]")
+                if s.get('mode') == '實單' and self._qt_running:
+                    sent, msg = self._place_strategy_order(s, intent, contract, asset_type,
+                                                           exec_price=px)
+                    if not sent:
+                        # 送單失敗不收尾:窗口內還可以再試 (與即時進場同樣的取捨)
+                        self._qt_timed_log_once(s, rt, f"送單失敗:{msg}")
+                        continue
+                    strategy_engine.apply_fill(s, rt, intent, time.time(), exec_price=px)
+                    strategy_engine.mark_timed_done(rt, now_dt)
+                    self.safe_after(0, self.log_message,
+                                    f"【自動交易-實單】🔥 {label} | {intent['reason']} | {msg}")
+                else:
+                    strategy_engine.apply_fill(s, rt, intent, time.time(), exec_price=px)
+                    strategy_engine.mark_timed_done(rt, now_dt)
+                    acct = self._qt_paper_acct_for(s)
+                    paper_account.apply_fill(
+                        acct, now_dt.strftime('%Y-%m-%d %H:%M:%S'),
+                        s.get('market', '台股'), sym, intent['action'], intent['kind'],
+                        intent['qty'], px, trade_type=tt)
+                    paper_account.mark_price(acct, sym, px)
+                    self._qt_save_paper()
+                    self.safe_after(0, self.log_message,
+                                    f"【自動交易-模擬】🧪 {label} | {intent['reason']} → 已記入模擬帳戶")
+                self._qt_save_state()
+                self.safe_after(0, self._qt_refresh_tree)
+                if getattr(self, '_paper_win', None) and self._paper_win.winfo_exists():
+                    self.safe_after(0, self._qt_refresh_paper_account)
+            except Exception as e:
+                self.safe_after(0, self.log_message,
+                                f"【自動交易-定時下單異常】策略「{s.get('name')}」: {type(e).__name__}: {e}")
+
+    def _qt_timed_log_once(self, s, rt, msg):
+        """同一個原因在同一個窗口內只講一次。
+
+        這條路每 2 秒重試一次,照實記的話「取不到五檔」會在 5 分鐘內洗出
+        150 行,把真正重要的訊息沖走 —— 但完全不講又會變成靜默失效
+        (使用者以為 12:01 買到了,其實從頭到尾沒送)。所以「換了原因才再講」。
+        """
+        if rt.get('_timed_last_msg') == msg:
+            return
+        rt['_timed_last_msg'] = msg
+        self.safe_after(0, self.log_message,
+                        f"【定時下單】策略「{s.get('name')}」還沒送出 — {msg} (窗口內會再試)")
+
     def _qt_check_realtime_futures_stops(self, live_price_by_symbol):
         """【新ADR】期貨標的用內建停損%/停利%/停損點數(元)/停利點數(元) 時,
         不等該策略訊號週期的K棒收盤,即時價 (live_price_by_symbol,來自
@@ -9782,6 +10034,12 @@ class StockTradingAppPro(tk.Tk):
                 # on_execute_armed 要等 60 秒,但順序寫對比較不容易誤讀)。
                 self._qt_chukuangren_confirm_pass()
                 self._qt_chukuangren_execute_pass()
+                # 【ADR-147】定時下單。刻意掛在 2 秒節拍上而**不是**下面那個
+                # 3 秒的 snapshots 節流裡:這條路一個 API 都不打 (五檔來自串流
+                # 快取、進場條件用已經快取好的 K 棒),不受鐵則 5 的節流管轄,
+                # 而「指定時刻」本來就該用最密的節拍去逼近。
+                self._qt_sync_timed_subs()
+                self._qt_check_timed_entries()
 
                 now_ts = _time.time()
                 # 【修正】ADR-091 把 self.paper_acct (單一帳戶) 改成 self.paper_accts
@@ -11023,6 +11281,29 @@ class StockTradingAppPro(tk.Tk):
                        variable=var_rt_entry, bg="#1A2026", fg="#29B6F6", selectcolor="#2A323D",
                        font=('微軟正黑體', 9)).grid(row=16, column=0, columnspan=6,
                                                     sticky='w', pady=(2, 0))
+        # 【ADR-147】定時下單:零股沒有自己的 K 線,這是它唯一能在「12:01」
+        # 這種非 K 棒邊界的時刻進場的方式。價格一律來自當下的五檔快照。
+        var_timed = tk.BooleanVar(value=strategy_engine.timed_entry_enabled(s))
+        tk.Checkbutton(top, text="⏰ 定時下單 (到指定時刻用當時的五檔進場;零股專用,不需要K線)",
+                       variable=var_timed, bg="#1A2026", fg="#FFCA28", selectcolor="#2A323D",
+                       font=('微軟正黑體', 9)).grid(row=17, column=0, columnspan=6,
+                                                    sticky='w', pady=(2, 0))
+        _lbl(top, "指定時刻").grid(row=18, column=0, sticky='w', pady=(2, 0))
+        e_timed_t = _ent(top, s.get('timed_entry_time', ''), 8)
+        e_timed_t.grid(row=18, column=1, padx=4, pady=(2, 0))
+        _lbl(top, "有效窗口(分)").grid(row=18, column=2, sticky='w', padx=(10, 0), pady=(2, 0))
+        e_timed_w = _ent(top, s.get('timed_entry_window_min',
+                                    strategy_engine.TIMED_ENTRY_DEFAULT_WINDOW_MIN), 5)
+        e_timed_w.grid(row=18, column=3, padx=4, pady=(2, 0))
+        _lbl(top, "五檔基準").grid(row=18, column=4, sticky='w', padx=(10, 0), pady=(2, 0))
+        cb_timed_lv = ttk.Combobox(top, values=[str(i) for i in range(1, quote_book.MAX_LEVELS + 1)],
+                                   width=4, state='readonly', style="BlackText.TCombobox")
+        cb_timed_lv.set(str(strategy_engine.timed_book_level_of(s)))
+        cb_timed_lv.grid(row=18, column=5, padx=4, pady=(2, 0))
+        tk.Label(top, text="格式 HH:MM(例 12:01)。五檔基準=買進吃「賣N」、賣出吃「買N」,"
+                           "數字越大越積極;再往上疊「讓價檔數」。窗口內取不到五檔就不送單(絕不用整股價頂替)。",
+                 bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8), justify='left',
+                 wraplength=680).grid(row=19, column=0, columnspan=6, sticky='w', pady=(0, 2))
         _lbl(top, "每日進場上限").grid(row=3, column=0, sticky='w', pady=(6, 0))
         e_maxd = _ent(top, s.get('max_trades_per_day', 3), 6); e_maxd.grid(row=3, column=1, padx=4, pady=(6, 0))
         _lbl(top, "冷卻秒數").grid(row=3, column=2, sticky='w', padx=(10, 0), pady=(6, 0))
@@ -11287,6 +11568,17 @@ class StockTradingAppPro(tk.Tk):
             try: s['max_entries'] = int(e_maxent.get().strip())
             except (TypeError, ValueError): s['max_entries'] = 1
             s['realtime_entry'] = bool(var_rt_entry.get())
+            # 【ADR-147】定時下單。時刻保留使用者填的原字串,由
+            # strategy_engine.timed_entry_time_of() 統一正規化 —— 這裡自己解析
+            # 就會變成第二份格式規則 (P-67),而且存檔時擋不掉的格式錯誤會在
+            # 12:01 那一刻才變成「什麼都沒發生」。
+            s['timed_entry'] = bool(var_timed.get())
+            s['timed_entry_time'] = e_timed_t.get().strip()
+            try: s['timed_entry_window_min'] = int(e_timed_w.get().strip())
+            except (TypeError, ValueError):
+                s['timed_entry_window_min'] = strategy_engine.TIMED_ENTRY_DEFAULT_WINDOW_MIN
+            try: s['timed_book_level'] = int(cb_timed_lv.get().strip())
+            except (TypeError, ValueError): s['timed_book_level'] = 1
             try: s['max_trades_per_day'] = int(e_maxd.get().strip())
             except (TypeError, ValueError): s['max_trades_per_day'] = 3
             s['entry_time_start'] = e_en_st.get().strip()
