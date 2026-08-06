@@ -7856,6 +7856,143 @@ run_case("ADR-150: 回測照策略的風控設定跑 (每日進場上限真的�
          _backtest_risk_guards_150)
 
 
+def _chukuangren_daily_status_152():
+    """【ADR-152】終極波段的每日晨間狀態報告要**真的送得出去**。
+
+    使用者:「終極波段策略,有在啟動中,有辦法每天判斷報告目前策略的狀況…
+    然後在市場交易日,每天 09:10 用訊息通知我。」
+
+    報告內容與時刻判斷是純函式,已在 tests/test_core.py 釘死 (19 案)。
+    這裡守接線 —— 純函式再對,沒接上去也是白的 (P-64):
+      A. runner 真的會呼叫這條路。
+      B. 走完整條路真的產生一則帶正確前綴的訊息 (前綴決定會不會推到手機)。
+      C. 同一天只送一次;隔天要再送。
+      D. 抓不到日K 時**不可以**標記成已送 (否則那天就永遠不會補送)。
+      E. 編輯器有勾選框與時刻欄位,而且存得進去。
+    """
+    import re as _re52
+    import pandas as _pd52
+    from core import chukuangren_band as _ck52
+
+    class FakeContract:
+        def __init__(self, code='^TWII'):
+            self.code = code
+            self.symbol = code
+
+    _idx = _pd52.date_range("2026-06-01", periods=40, freq="D")
+    _c = [41000.0 + i * 40 for i in range(40)]
+    _daily = _pd52.DataFrame({'Open': _c, 'High': [x + 50 for x in _c],
+                              'Low': [x - 50 for x in _c], 'Close': _c,
+                              'Volume': [1] * 40}, index=_idx)
+
+    logs = []
+    orig_log = app.log_message
+    orig_resolve_watch = app._qt_resolve_watch
+    orig_fetch = app._qt_fetch_closed_bars
+    orig_strats, orig_rts = app.strategies, app.strategy_runtimes
+    orig_last = dict(getattr(app, '_ck_status_last_date', {}) or {})
+
+    def _mk():
+        st = _ck52.default_strategy()
+        st.update({'name': '診斷ADR152', 'symbol': 'TXF', 'trade_type': '期貨',
+                   'market': '台期貨', 'qty': 1, 'enabled': True, 'mode': '模擬',
+                   'direction': '做多', 'ck_x': 41500.0, 'ck_y': 41200.0,
+                   'ck_c': 300.0, 'ck_f': 100.0})
+        return st
+
+    _wed = stock_app_pro.datetime(2026, 8, 5, 9, 10)     # 週三 09:10
+    try:
+        app.log_message = lambda m: (logs.append(str(m)), orig_log(m))[0]
+        app._qt_resolve_watch = lambda _s: (FakeContract(), 'index_tw', '^TWII', '台股')
+        app._qt_fetch_closed_bars = lambda *a, **k: _daily
+        st = _mk()
+        app.strategies = [st]
+        app.strategy_runtimes = {st['id']: _ck52.ensure_runtime(
+            {'state': 'LONG', 'qty': 1, 'entry_index_price': 41600.0})}
+        app._ck_status_last_date = {}
+
+        # ---- B. 走完整條路要產生一則帶正確前綴的訊息 ----
+        logs.clear()
+        app._qt_chukuangren_status_pass(now_dt=_wed); app.flush_after()
+        _hits = [m for m in logs if m.startswith('【自動交易-終極波段】')]
+        assert _hits, f"每日狀態報告沒有送出 (或前綴不對,推不到手機):{logs[:3]}"
+        _rep = _hits[0]
+        for _need in ('晨間狀態', '目前損益', '停損條件', '月線(SMA20)', '待確認'):
+            assert _need in _rep, f"報告缺少「{_need}」:{_rep[:120]}"
+
+        # ---- C. 同一天只送一次;隔天要再送 ----
+        logs.clear()
+        app._qt_chukuangren_status_pass(now_dt=_wed); app.flush_after()
+        assert not [m for m in logs if m.startswith('【自動交易-終極波段】')], \
+            "同一天不可以送第二則"
+        logs.clear()
+        app._qt_chukuangren_status_pass(
+            now_dt=stock_app_pro.datetime(2026, 8, 6, 9, 10)); app.flush_after()
+        assert [m for m in logs if m.startswith('【自動交易-終極波段】')], \
+            "隔天要再送一則"
+
+        # ---- D. 抓不到日K 不可以標記成已送 (否則那天永遠不會補送) ----
+        app._ck_status_last_date = {}
+        app._qt_fetch_closed_bars = lambda *a, **k: None
+        logs.clear()
+        app._qt_chukuangren_status_pass(now_dt=_wed); app.flush_after()
+        assert not app._ck_status_last_date.get(st['id']), \
+            ("抓不到日K 就標記成已送的話,那天永遠不會補送 —— "
+             "一天一則的通知最糟的失敗模式就是安靜漏掉")
+        # 資料補齊後要補送
+        app._qt_fetch_closed_bars = lambda *a, **k: _daily
+        logs.clear()
+        app._qt_chukuangren_status_pass(now_dt=_wed); app.flush_after()
+        assert [m for m in logs if m.startswith('【自動交易-終極波段】')], \
+            "資料補齊後要補送當天那一則"
+
+        # ---- 反向對照:非終極波段的策略不該被這條路動到 ----
+        from core import strategy_engine as _se52
+        other = _se52.new_strategy()
+        other.update({'name': '一般策略', 'symbol': '2330', 'enabled': True,
+                      'entry': [{'type': 'always_true', 'params': {}}]})
+        app.strategies = [other]
+        app.strategy_runtimes = {other['id']: _se52.new_runtime()}
+        app._ck_status_last_date = {}
+        logs.clear()
+        app._qt_chukuangren_status_pass(now_dt=_wed); app.flush_after()
+        assert not [m for m in logs if m.startswith('【自動交易-終極波段】')], \
+            "只有終極波段策略才有這則報告"
+    finally:
+        app.log_message = orig_log
+        app._qt_resolve_watch = orig_resolve_watch
+        app._qt_fetch_closed_bars = orig_fetch
+        app.strategies, app.strategy_runtimes = orig_strats, orig_rts
+        app._ck_status_last_date = orig_last
+
+    _src52 = open('stock_app_pro.py', encoding='utf-8').read()
+
+    # ---- A. runner 要真的呼叫這條路 ----
+    _i = _src52.index('    def quant_runner_worker(')
+    _m = _re52.search(r'\n    def (?!quant_runner_worker\b)\w+', _src52[_i:])
+    assert '_qt_chukuangren_status_pass' in _src52[_i:_i + _m.start()], \
+        "runner 沒有呼叫每日狀態報告,這條路一輩子不會跑 (P-64)"
+
+    # ---- E. 編輯器要有勾選框與時刻,而且存得進去、不撞格 ----
+    _i = _src52.index('    def _qt_open_chukuangren_editor(')
+    _m = _re52.search(r'\n    def (?!_qt_open_chukuangren_editor\b)\w+', _src52[_i:])
+    _eseg = _src52[_i:_i + _m.start()]
+    assert '每日狀態報告' in _eseg, "終極波段編輯器要有每日狀態報告的勾選框"
+    assert "s['status_notify']" in _eseg, "存檔要寫入 status_notify"
+    assert "s['status_notify_time']" in _eseg, "存檔要寫入 status_notify_time"
+    assert not _grid_overlaps('_qt_open_chukuangren_editor'), \
+        "新欄位不可以撞格 (P-104)"
+
+    # ---- 反向對照:這則報告不可以被 ADR-148 的通知合併吃掉 ----
+    from core import telegram_notify as _tn52
+    assert '【自動交易-終極波段' in _tn52.ALWAYS_SEND_TAGS, \
+        "一天一則的報告被合併掉就是整天沒看到,必須列在永不合併名單"
+
+
+run_case("ADR-152: 終極波段每日晨間狀態報告 (交易日固定時刻推到手機,一天一則)",
+         _chukuangren_daily_status_152)
+
+
 def _diag_self_check_no_raw_eval_pass():
     """【P-127】診斷檔自己的自我檢查:不可以有人再直接呼叫 `_quant_eval_pass()`。
 

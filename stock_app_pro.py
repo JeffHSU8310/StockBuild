@@ -9987,6 +9987,56 @@ class StockTradingAppPro(tk.Tk):
                 self.safe_after(0, self.log_message,
                                 f"【自動交易-即時停損異常】策略「{s.get('name')}」: {type(e).__name__}: {e}")
 
+    def _qt_chukuangren_status_pass(self, now_dt=None, force=False):
+        """【ADR-152】終極波段策略的每日晨間狀態報告 (預設交易日 09:10 推到手機)。
+
+        終極波段是「每天只看一次日收盤、隔天中午 12:00 才確認」的慢節奏策略 ——
+        使用者除了自己去翻策略清單,沒有別的管道知道「它今天打算做什麼」:
+        移動停利線移到哪了?離停損還有幾點?今天 12:00 會不會出手?
+
+        沿用 ADR-132 每日推播的兩個做法:
+          · 「**過了時刻就送**」而不是「剛好等於那一分鐘」—— 程式可能在 09:10
+            當下沒開或正忙,錯過就整天不發,那是一天一則的通知最糟的失敗模式。
+          · 每日去重 (`_ck_status_last_date`),所以「過了就送」不會變成重複轟炸。
+
+        抓不到日K 就**不標記已送**,下一個 tick 再試 (ADR-122 的背景預抓可能還沒
+        補完)。這條路一天只跑一次成功,不會加重 API 負擔。
+
+        now_dt / force 是測試接縫:production 兩者都不傳。
+        """
+        now_dt = now_dt or datetime.now()
+        if not hasattr(self, '_ck_status_last_date'):
+            self._ck_status_last_date = {}
+        for s in list(getattr(self, 'strategies', []) or []):
+            if s.get('kind') != chukuangren_band.KIND:
+                continue
+            sid = s.get('id')
+            last = self._ck_status_last_date.get(sid)
+            if not force and not chukuangren_band.should_send_daily_status(s, now_dt, last):
+                continue
+            try:
+                rt = self._qt_runtime(sid)
+                w_contract, w_asset, w_sym, w_mkt = self._qt_resolve_watch(s)
+                if w_contract is None:
+                    continue        # 連線/合約還沒好,下一個 tick 再試 (不標記已送)
+                daily_df = self._qt_fetch_closed_bars(s, w_contract, w_asset, tf='日K',
+                                                      cache_sym=w_sym, cache_market=w_mkt)
+                if daily_df is None or len(daily_df) < 20:
+                    continue        # 資料還沒補齊,下一個 tick 再試
+                text = chukuangren_band.daily_status_report(s, rt, daily_df, now_dt)
+                if not text:
+                    continue
+                self._ck_status_last_date[sid] = now_dt.strftime('%Y-%m-%d')
+                self.safe_after(0, self.log_message, text)
+            except strategy_engine.TransientEnvError:
+                continue            # 外部環境問題,下一個 tick 再試 (ADR-148)
+            except Exception as e:
+                # 報告本身失敗不可以影響策略運作,但也不可以無聲無息
+                self._ck_status_last_date[sid] = now_dt.strftime('%Y-%m-%d')
+                self.safe_after(0, self.log_message,
+                                f"【自動交易-終極波段】策略「{s.get('name')}」的每日狀態報告"
+                                f"產生失敗: {type(e).__name__}: {e} (不影響策略運作)")
+
     def _qt_chukuangren_confirm_one(self, s, rt, params, w_contract, w_asset,
                                     w_sym, w_mkt, today_key, now_ts):
         """【ADR-128】對單一終極波段策略做一次「12:00 二次確認」。
@@ -10255,6 +10305,9 @@ class StockTradingAppPro(tk.Tk):
                 # on_execute_armed 要等 60 秒,但順序寫對比較不容易誤讀)。
                 self._qt_chukuangren_confirm_pass()
                 self._qt_chukuangren_execute_pass()
+                # 【ADR-152】終極波段的每日晨間狀態報告 (交易日 09:10,一天一則)。
+                # 內部自己做時刻判斷與每日去重,沒到時間就是一個 dict 查詢。
+                self._qt_chukuangren_status_pass()
                 # 【ADR-147】定時下單。刻意掛在 2 秒節拍上而**不是**下面那個
                 # 3 秒的 snapshots 節流裡:這條路一個 API 都不打 (五檔來自串流
                 # 快取、進場條件用已經快取好的 K 棒),不受鐵則 5 的節流管轄,
@@ -11108,6 +11161,27 @@ class StockTradingAppPro(tk.Tk):
         tk.Label(top, text="(只在「模式=模擬」時有意義)", bg="#1A2026", fg="#8A99AD",
                  font=('微軟正黑體', 8)).grid(row=6, column=2, columnspan=3, sticky='w', padx=(8, 0), pady=(8, 0))
 
+        # 【ADR-152】每日晨間狀態報告。終極波段是「每天只看一次日收盤、隔天中午
+        # 12:00 才確認」的慢節奏策略 —— 使用者除了自己去翻策略清單,沒有別的管道
+        # 知道「它今天打算做什麼」:移動停利線移到哪了?離停損還有幾點?今天
+        # 12:00 會不會出手?這一列讓他每個交易日固定收到一則。
+        # 用獨立的 pack 列,不進 watch_fr 的 grid —— 撞格不報錯只會蓋掉 (P-104)。
+        st_fr = tk.Frame(body, bg="#12181F"); st_fr.pack(fill=tk.X, padx=12, pady=(8, 0))
+        v_status = tk.BooleanVar(value=chukuangren_band.status_notify_enabled(s))
+        tk.Checkbutton(st_fr, text="📣 每日狀態報告 (交易日固定時刻,把目前部位/損益/"
+                                   "移動停利線/停損距離/月線條件/今天12:00會不會出手 傳到手機)",
+                       variable=v_status, bg="#12181F", fg="#29B6F6",
+                       selectcolor="#2A323D", activebackground="#12181F",
+                       font=('微軟正黑體', 9)).pack(side=tk.LEFT, anchor='w')
+        tk.Label(st_fr, text="時刻", bg="#12181F", fg="white",
+                 font=('微軟正黑體', 9)).pack(side=tk.LEFT, padx=(10, 2))
+        e_status_t = tk.Entry(st_fr, width=7, bg="#2A323D", fg="white", justify="center")
+        e_status_t.insert(0, chukuangren_band.status_notify_time_of(s))
+        e_status_t.pack(side=tk.LEFT)
+        tk.Label(st_fr, text="(HH:MM;只在交易日發,一天一則。程式沒開錯過時刻的話,"
+                            "開啟後仍會補送當天那一則)",
+                 bg="#12181F", fg="#8A99AD", font=('微軟正黑體', 8)).pack(side=tk.LEFT, padx=(6, 0))
+
         watch_fr = tk.Frame(body, bg="#12181F"); watch_fr.pack(fill=tk.X, padx=12, pady=(8, 4))
         tk.Label(watch_fr, text="看盤(A) — 固定看指數,決定進出場方向 (不下單)", bg="#12181F",
                  fg="#29B6F6", font=('微軟正黑體', 9, 'bold')).grid(row=0, column=0, columnspan=4, sticky='w', pady=(4, 2))
@@ -11169,6 +11243,9 @@ class StockTradingAppPro(tk.Tk):
 
         def _collect():
             s['kind'] = chukuangren_band.KIND
+            s['status_notify'] = bool(v_status.get())
+            s['status_notify_time'] = e_status_t.get().strip() or \
+                chukuangren_band.STATUS_NOTIFY_DEFAULT_TIME
             s['name'] = e_name.get().strip() or chukuangren_band.STRATEGY_NAME
             s['symbol'] = e_sym.get().strip().upper()
             s['trade_type'] = cb_tt.get()
