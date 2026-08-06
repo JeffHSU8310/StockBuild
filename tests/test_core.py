@@ -9459,6 +9459,131 @@ class TestBacktestGuardsSetting(unittest.TestCase):
             {'backtest_risk_guards': None}))
 
 
+class TestBacktestTimedEntryAndSession(unittest.TestCase):
+    """【ADR-151】回測要實作「定時下單」,而且要套用交易時段閘門。
+
+    使用者實測:策略設「指定時刻 10:30」,回測每一筆卻都在 **09:03** 進場;
+    而且那是**零股**策略 —— 盤中零股 09:10 才開盤,那筆交易在實盤根本不可能
+    發生。查下來是同一類問題的第三次:回測不知道 `timed_entry` 這回事
+    (`core/backtest.py` 裡一次都沒出現),也**完全沒有**交易時段閘門。
+    """
+
+    def _df(self, days=3, start_day=5):
+        idx = []
+        for d in range(days):
+            idx += list(pd.date_range(f"2026-01-{start_day + d} 09:00",
+                                      periods=271, freq="1min"))
+        idx = pd.DatetimeIndex(idx)
+        base = np.linspace(100, 104, len(idx))
+        return pd.DataFrame({'Open': base, 'High': base + 0.3, 'Low': base - 0.3,
+                             'Close': base + 0.1, 'Volume': [1000] * len(idx)}, index=idx)
+
+    def _s(self, **kw):
+        s = strategy_engine.new_strategy()
+        s.update({'name': 'T', 'symbol': '0050', 'trade_type': '零股', 'market': '台股',
+                  'qty': 501, 'timeframe': '1分K', 'direction': '做多',
+                  'max_trades_per_day': 1, 'cooldown_sec': 0,
+                  'stop_loss_pct': 0.0, 'take_profit_pct': 0.0,
+                  'buy_and_hold': True, 'bnh_mode': 'accumulate', 'max_entries': 2,
+                  'session_gate': True,
+                  'entry': [{'type': 'always_true', 'params': {}}], 'exit_signals': []})
+        s.update(kw)
+        return s
+
+    # ---------- 定時下單 ----------
+
+    def test_entries_land_on_the_specified_time(self):
+        """使用者原話:「進場時間跟我設定的不一樣」。設 10:30 就要在 10:30。"""
+        r = backtest.run_backtest(
+            self._s(timed_entry=True, timed_entry_time='10:30',
+                    timed_entry_window_min=10), self._df())
+        self.assertTrue(r['trades'])
+        for t in r['trades']:
+            self.assertEqual(str(t['entry_ts'])[11:16], '10:30',
+                             f"進場時間 {t['entry_ts']} 不是設定的 10:30")
+
+    def test_one_timed_entry_per_day(self):
+        days = 3
+        r = backtest.run_backtest(
+            self._s(timed_entry=True, timed_entry_time='10:30',
+                    timed_entry_window_min=10), self._df(days=days))
+        self.assertEqual(len(r['trades']), days, '每天一筆定時單')
+
+    def test_timed_entry_is_the_only_entry_trigger(self):
+        """反向對照:開了定時下單,K 棒路徑就**不可以搶先**開倉。
+
+        舊行為是「多一個觸發時機」,配上每日上限 1 的結果是:條件 09:03 成立
+        → K 棒路徑先進場 → 額度用完 → 10:30 的定時單永遠送不出去,
+        **定時下單實質失效**。"""
+        s = self._s(timed_entry=True, timed_entry_time='10:30',
+                    timed_entry_window_min=10)
+        rt = strategy_engine.new_runtime()
+        df = self._df(days=1)
+        intents = strategy_engine.evaluate_strategy(
+            s, rt, df.iloc[:100], 100.0, '2026-01-05')
+        self.assertFalse([i for i in intents if i.get('kind') == 'OPEN'],
+                         'K 棒路徑不可以在定時下單啟用時產生進場單')
+
+    def test_realtime_entry_also_yields_to_timed(self):
+        """即時進場同樣不可以搶先。"""
+        s = self._s(timed_entry=True, timed_entry_time='10:30',
+                    realtime_entry=True, trade_type='股票',
+                    entry=[{'type': 'day_drop_over', 'params': {'value': 3.0}}])
+        rt = strategy_engine.new_runtime()
+        idx = pd.to_datetime(['2026-01-04 13:30', '2026-01-05 09:05'])
+        df = pd.DataFrame({'Open': [100.0, 100.0], 'High': [100.0, 100.0],
+                           'Low': [100.0, 100.0], 'Close': [100.0, 100.0]}, index=idx)
+        self.assertIsNone(
+            strategy_engine.check_realtime_entry(s, rt, df, 95.0, now_hhmmss='09:05:00'))
+
+    def test_no_timed_entry_keeps_old_behaviour(self):
+        """反向對照:沒開定時下單的策略行為完全不變。"""
+        r = backtest.run_backtest(self._s(trade_type='股票'), self._df(days=1))
+        self.assertTrue(r['trades'])
+        self.assertEqual(str(r['trades'][0]['entry_ts'])[11:16], '09:03')
+
+    # ---------- 交易時段閘門 ----------
+
+    def test_odd_lot_cannot_trade_before_0910(self):
+        """盤中零股 09:10 才開盤 —— 09:03 的成交在實盤不可能發生。"""
+        r = backtest.run_backtest(self._s(), self._df(days=1))
+        self.assertTrue(r['trades'])
+        self.assertGreaterEqual(str(r['trades'][0]['entry_ts'])[11:16], '09:10',
+                                '零股在 09:10 之前不該有成交')
+
+    def test_round_lot_is_unaffected(self):
+        """反向對照:整股 09:00 就開盤,不可以被零股的規則帶歪。"""
+        r = backtest.run_backtest(self._s(trade_type='股票'), self._df(days=1))
+        self.assertEqual(str(r['trades'][0]['entry_ts'])[11:16], '09:03')
+
+    def test_session_gate_can_be_turned_off(self):
+        """反向對照:使用者關掉時段閘門就照舊 (與實盤同一個設定)。"""
+        r = backtest.run_backtest(self._s(session_gate=False), self._df(days=1))
+        self.assertEqual(str(r['trades'][0]['entry_ts'])[11:16], '09:03')
+
+    def test_pure_signal_mode_skips_the_session_gate_too(self):
+        """關掉風控 = 不要任何實盤限制,時段閘門也一併不套用。"""
+        r = backtest.run_backtest(self._s(), self._df(days=1),
+                                  apply_risk_guards=False)
+        self.assertEqual(str(r['trades'][0]['entry_ts'])[11:16], '09:03')
+
+    # ---------- 零股用整股 K 線的先天限制 ----------
+
+    def test_odd_lot_report_states_it_uses_round_lot_bars(self):
+        """零股沒有 K 線,回測吃的一定是整股的 —— 不講明,使用者會以為
+        回測的價格就是零股的成交價。"""
+        r = backtest.run_backtest(self._s(), self._df(days=1))
+        txt = " ".join(str(l.get('_raw') or l.get('text', '')) for l in r['log'])
+        self.assertIn('整股', txt)
+        self.assertIn('零股', txt)
+
+    def test_round_lot_report_has_no_such_warning(self):
+        """反向對照:整股策略不該出現這句警語 (那會變成雜訊)。"""
+        r = backtest.run_backtest(self._s(trade_type='股票'), self._df(days=1))
+        txt = " ".join(str(l.get('_raw') or l.get('text', '')) for l in r['log'])
+        self.assertNotIn('零股**沒有 K 線**', txt)
+
+
 class TestResetDailyCounters(unittest.TestCase):
     """【ADR-150】換日重置抽成共用函式 —— 回測的自訂策略路徑不經過
     evaluate_strategy,少了這一份 trades_today 會一路累加。"""

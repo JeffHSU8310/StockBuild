@@ -1389,6 +1389,9 @@ def check_realtime_entry(strategy, runtime, df_closed, live_price, now_hhmmss=No
     ok, _why = live_entry_supported(strategy)
     if not ok:
         return None
+    # 【ADR-151】定時下單是唯一的進場觸發,即時進場也不可以搶先開倉
+    if timed_entry_enabled(strategy):
+        return None
     if now_hhmmss is not None:
         ok_t, _why_t = entry_time_gate(strategy, now_hhmmss)
         if not ok_t:
@@ -1815,6 +1818,22 @@ def filter_intents_by_time(intents, strategy, bar_ts_str, runtime=None):
     的時間窗擋下了這筆」。"""
     if runtime is not None:
         runtime['time_window_skips'] = []
+    # 【ADR-151】啟用「定時下單」時,它是**唯一**的進場觸發 —— K 棒路徑不可以
+    # 搶先開倉。
+    #
+    # 舊行為是「定時下單只是多一個觸發時機」,但配上「每日進場上限 1」的結果是:
+    # 條件在 09:03 成立 → K 棒路徑先進場 → 額度用完 → 10:30 的定時單永遠送不
+    # 出去。**定時下單實質上等於失效**,而使用者看到的是「進場時間跟我設定的
+    # 不一樣」(實測:設 10:30,每一筆都在 09:03)。UI 上那句「到指定時刻用當時
+    # 的五檔進場」本來就只有一種讀法。
+    #
+    # 放在這個函式而不是 evaluate_strategy 結尾:Buy & Hold 那幾條分支會**提早
+    # return**,自訂策略也走自己的路,但**每一條 return 路徑都會先經過這裡**。
+    # 放在結尾的那一版就是被 Buy & Hold 繞過去的 (測試抓到)。
+    #
+    # 出場不受影響 —— 定時下單只管進場,持倉一定要出得去。
+    if intents and timed_entry_enabled(strategy):
+        intents = [it for it in intents if it.get('kind') != 'OPEN']
     if not intents or not bar_ts_str or ' ' not in str(bar_ts_str):
         return intents
 

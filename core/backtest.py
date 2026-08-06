@@ -20,6 +20,8 @@ import copy
 import pandas as pd
 
 from . import strategy_engine
+# 【ADR-151】回測要套用與實盤同一道交易時段閘門 (零股 09:10 才開盤)
+from . import market_session as _msess
 
 
 def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
@@ -85,6 +87,24 @@ def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
     # 也需要同一個數字。兩處各寫一份遲早分歧 (P-67),統一到共用函式。
     contract_size = _se.unit_size(s)
     rt = strategy_engine.new_runtime()
+    _tt_bt = _se.trade_type_of(s)          # 【ADR-151】時段閘門要看交易種類
+    # 【ADR-151】時段閘門**只對盤中資料有意義**。日K/周K/月K 的一根代表一整天
+    # (含),沒有「盤中第幾分鐘」這回事;拿去比「盤中 09:00~13:30」會把每一根
+    # 都判成休市,整份回測一筆交易都不會有(第一版就是這樣,單元測試當場紅了
+    # 33 個)。
+    #
+    # 判斷依據刻意用**實際的 K 棒間距**,不是策略宣告的 timeframe:兩者可能不
+    # 一致(測試餵日線給宣告 5分K 的策略就是一例),而會不會有盤中時刻這件事
+    # 是**資料的性質**,不是設定的性質。用中位數而不是頭兩根,避免資料中間有
+    # 缺口時判錯。
+    _intraday_bt = False
+    try:
+        if len(df) >= 3:
+            _steps = df.index.to_series().diff().dropna().dt.total_seconds()
+            _med = float(_steps.median())
+            _intraday_bt = 0 < _med < 86400
+    except Exception:
+        _intraday_bt = False
     # 【ADR-150】回測是否套用「每日進場上限 / 冷卻 / 熔斷」。
     #
     # 舊版一律**不套用**,理由寫的是「回測要看策略訊號本身的績效」,並註明
@@ -198,6 +218,17 @@ def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
         # 重置 —— 沒有這一段,trades_today 會一路累加,跑幾天之後全部被擋。
         if is_custom:
             strategy_engine.reset_daily_counters(rt, today_eval)
+        # 【ADR-151】交易時段閘門:回測原本**完全沒有**這一道 (`market_session`
+        # 在這個檔案裡一次都沒出現),所以零股會在 09:03「成交」—— 而盤中零股
+        # 09:10 才開盤,那筆交易在實盤根本不可能發生。使用者實測回報的正是這個。
+        # 與實盤同一道 `market_session.is_market_open()`,也同樣尊重 session_gate。
+        _in_session = True
+        if apply_risk_guards and s.get('session_gate', True) and _intraday_bt:
+            try:
+                _in_session = _msess.is_market_open(
+                    _tt_bt, dt=ts, include_night=strategy_engine.include_night_of(s))
+            except Exception:
+                _in_session = True      # 判斷不出來就不擋 (不憑空製造拒絕)
         
         if is_custom:
             try:
@@ -241,6 +272,37 @@ def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
                 _ti = strategy_engine._close_intent(rt, _tp, _treason)
                 _ti['_touch_price'] = _tp      # 成交價用觸價,不用開盤價 (見下)
                 intents = [_ti] + [it for it in intents if it.get('kind') != 'OPEN']
+
+        # 【ADR-151】定時下單:回測原本**完全不知道有這個功能**(`timed_entry`
+        # 在這個檔案裡一次都沒出現),所以照舊在條件一成立的那根 K 棒就進場。
+        # 使用者設「指定時刻 10:30」,回測每一筆卻都在 09:03。
+        #
+        # 這裡補上與實盤同一份判斷:`should_fire_timed()` 決定「這一根落不落在
+        # 窗口裡」,`check_timed_entry()` 決定「條件成不成立」。上面
+        # evaluate_strategy 已經把 OPEN 濾掉了 (定時下單是唯一的進場觸發),
+        # 自訂策略那條路不經過它,所以這裡再濾一次。
+        if strategy_engine.timed_entry_enabled(s):
+            intents = [it for it in intents if it.get('kind') != 'OPEN']
+            _fire, _why_t = strategy_engine.should_fire_timed(s, rt, ts)
+            if _fire:
+                _timed_it = strategy_engine.check_timed_entry(s, rt, eval_window)
+                strategy_engine.mark_timed_done(rt, ts)
+                if _timed_it is not None:
+                    intents = intents + [_timed_it]
+                else:
+                    _log(ts, '未進場',
+                         f"到達指定時刻 {strategy_engine.timed_entry_time_of(s)},"
+                         f"但進場條件不成立 (或已達可分批進場次數上限)", collapse=True)
+            elif strategy_engine.timed_window_expired(s, rt, ts):
+                strategy_engine.mark_timed_done(rt, ts)
+                _log(ts, '未進場',
+                     f"定時下單:{strategy_engine.timed_entry_time_of(s)} 起算的窗口已過,"
+                     f"今天不再送", collapse=True)
+
+        # 【ADR-151】休市時段一律不成交 —— 進場、出場都是。與實盤一致:
+        # session_gate 打開時,非交易時間整檔策略不評估。
+        if not _in_session:
+            intents = []
 
         # 【ADR-064】強制將所有訊號的預期成交價改為「隔天(今日)開盤價」
         # 【ADR-075】intent['price'] 用 A 的開盤 (→ apply_fill 的 entry_price,
@@ -500,6 +562,15 @@ def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
     # 【ADR-150】把「這次回測有沒有照策略的風控設定跑」寫進訊息紀錄。
     # 沒有這一行,使用者無法分辨「策略本來就只買一次」與「回測忽略了我的設定」——
     # 而那正是這一筆 ADR 要修的那種看不見的落差。
+    # 【ADR-151】零股沒有 K 線,回測吃的一定是**整股**的 K 線 —— 這是先天限制
+    # (P-06:shioaji 沒有零股 K 線,也沒有零股 snapshot)。不講明的話,使用者會
+    # 以為回測的價格就是零股的成交價。
+    if _tt_bt == '零股':
+        _log(df.index[-1] if len(df) else None, '總結',
+             '⚠ 零股**沒有 K 線**,本次回測用的是**整股**的歷史 K 棒 —— '
+             '盤中零股是獨立市場、有自己的成交價,實際成交價會與這裡不同。'
+             '實盤的零股掛價走的是零股五檔 (ADR-147/149),回測無法模擬 '
+             '(沒有歷史五檔資料)。')
     _log(df.index[-1] if len(df) else None, '總結',
          ('本次回測**已套用**策略的風控設定:每日進場上限 '
           f"{s.get('max_trades_per_day')} 次、冷卻 {s.get('cooldown_sec')} 秒、"
