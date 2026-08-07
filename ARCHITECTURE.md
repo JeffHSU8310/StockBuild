@@ -159,7 +159,12 @@ PITFALLS P-27）。它們存在的唯一理由就是「可離線單元測試」�
   模組（假 mplfinance 用**真 matplotlib `add_axes`** 建面板，見 PITFALLS P-28），
   讓 `StockTradingAppPro` 能在無畫面環境建構並實跑 `draw_chart` 等路徑。
 - `diag_repro_issues.py`：重現/驗證使用者回報問題的診斷腳本（版面 set_position、
-  委託 seed、小數點即時轉換等）。
+  委託 seed、小數點即時轉換等）。**全程共用同一個 app 物件**，所以建構時
+  一律攔掉那 6 條無窮迴圈的 daemon worker（ADR-156，PITFALLS P-138）——
+  它們活著就會去呼叫案例臨時 patch 上去的假 API、蓋掉案例的記錄變數，
+  結果是整份腳本偶發紅而且每次紅的案例都不一樣。攔截在診斷這一端做
+  （建構那一瞬間換掉 `threading.Thread`），**產品程式碼不加任何測試專用旗標**；
+  `__init__` 之後多起一條 worker 時，診斷的自我檢查案例會紅著提醒補名單。
 - 兩個 diag 是開發除錯用，不隨 App 發布。
 
 ---

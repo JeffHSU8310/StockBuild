@@ -56,7 +56,90 @@ StockTradingAppPro.CLOSE_FORCE_EXIT = False
 # _quant_eval_pass 就檢查結果) 維持有效。ADR-122 自己的案例會臨時關掉它,
 # 去驗真正的「背景預抓」時序。
 StockTradingAppPro.QT_PREFETCH_SYNC = True
-app = StockTradingAppPro()
+
+# ======================================================================
+# 【ADR-156】診斷期間**不啟動 App 的背景 daemon worker**。
+#
+# 症狀:整份診斷偶發紅,而且每次紅的案例不一樣 —— 實測 8 次跑出 2 次,
+# 一次是 ADR-133「同一格不該重抓,實際又抓了 ['日K','60分K','60分K']」,
+# 一次是 ADR-145「還沒進場時也要監看 A 的即時價,實際問了 ['TXFR1','001']」。
+# 那兩個代碼(當時主圖的期貨合約 + 加權指數)根本不屬於 ADR-145 那個案例,
+# 它 mount 的策略只有 2330/^TWII。
+#
+# 根因:`StockTradingAppPro.__init__` 會起 5 條 daemon thread。診斷全程共用
+# **同一個 app 物件**,所以這 5 條執行緒在後面每一個案例執行期間都還活著,
+# 而且會去呼叫案例臨時 patch 上去的假 API、改寫 `app` 上的共用狀態。案例用
+# 「最後一次呼叫」當斷言依據時,就變成跟背景執行緒搶寫同一個變數。
+#
+# 這個坑診斷自己在 ADR-100 的案例裡就寫過(「用最後一筆斷言會隨執行緒時序
+# 時而 PASS 時而 FAIL,實測 [1,2,1]」),但只在那一個案例局部繞過 ——
+# 繞過一個,剩下的每一個案例都還踩得到。這裡從源頭解決:診斷要的是**確定性
+# 重現**,背景 worker 對這個目標沒有任何貢獻,只會製造雜訊。
+#
+# 註:被擋掉的只有「無窮迴圈的 worker」。案例要驗某一輪的行為時,一律直接
+# 呼叫對應的單次函式(`_wl_fetch_quotes_once()`、`eval_pass()` …),
+# 那些完全不受影響。
+# ======================================================================
+DIAG_BLOCKED_WORKERS = {
+    'fetch_market_indices_worker',   # 每輪 snapshots(加權/櫃買)
+    'fetch_realtime_worker',         # 每輪 snapshots(主圖當前合約)
+    'watchlist_quote_worker',        # 每 10 秒批次 snapshots(自選股)
+    'quant_runner_worker',           # 每 2 秒跑策略評估/即時停損/定時下單
+    'regime_daily_notify_worker',    # 盤勢判斷每日推播
+    # 這一條是自我檢查抓出來的 —— 我第一版憑印象列了 5 條就以為列完了。
+    # 它會自己重抓主圖 K 線,正好對得上 ADR-133 那次偶發紅的內容
+    # (「同一格不該重抓,實際又抓了 ['日K','60分K','60分K']」)。
+    'chart_auto_refresh_worker',     # 主圖自動刷新 (會重抓 K 線)
+}
+_diag_worker_entries = []            # 有 worker 真的跑起來就會留下紀錄
+
+
+def _diag_wrap_worker(name, fn):
+    # `functools.wraps` 會設 `__wrapped__`,`inspect.getsource()` 會自己 unwrap
+    # 回原函式 —— 有案例是用 getsource 讀 worker 的內容去驗「production 有沒有
+    # 真的呼叫某個函式」(P-64),不設這個就會讀到這層包裝而誤判。
+    import functools as _ft
+
+    @_ft.wraps(fn)
+    def _wrapped(self, *a, **k):
+        # 只記「跑在**背景執行緒**上」的。有案例是刻意在主執行緒**同步**呼叫
+        # worker(把 time.sleep 換成跑 N 圈就中斷)去驗它的節流間隔 ——
+        # 那是受控的、跑完就結束,不會外洩到別的案例。會製造偶發紅的是
+        # 「跟後面所有案例並行、而且沒人管得到它什麼時候動」的那種。
+        _th_ = stock_app_pro.threading
+        if _th_.current_thread() is not _th_.main_thread():
+            _diag_worker_entries.append(name)
+        return fn(self, *a, **k)
+    return _wrapped
+
+
+for _wname in sorted(DIAG_BLOCKED_WORKERS):
+    setattr(StockTradingAppPro, _wname,
+            _diag_wrap_worker(_wname, getattr(StockTradingAppPro, _wname)))
+
+_diag_blocked_starts = []
+_diag_real_thread = stock_app_pro.threading.Thread
+
+
+class _DiagNoWorkerThread(_diag_real_thread):
+    """擋掉指定 target 的 `.start()`,其餘執行緒照舊(有案例自己開執行緒驗鎖)。"""
+
+    def __init__(self, *a, **kw):
+        self._diag_target_name = getattr(kw.get('target'), '__name__', '')
+        super().__init__(*a, **kw)
+
+    def start(self):
+        if self._diag_target_name in DIAG_BLOCKED_WORKERS:
+            _diag_blocked_starts.append(self._diag_target_name)
+            return
+        return super().start()
+
+
+stock_app_pro.threading.Thread = _DiagNoWorkerThread
+try:
+    app = StockTradingAppPro()
+finally:
+    stock_app_pro.threading.Thread = _diag_real_thread
 app.flush_after = getattr(app, "flush_after")  # 來自 _Tk mock
 # 【ADR-115 延伸 / ADR-120】app_settings.json 也是使用者的真實設定檔
 # (盤勢判斷面板的偏好存在裡面),診斷案例會存檔,同樣改指到暫存目錄。
@@ -8385,6 +8468,62 @@ def _diag_self_check_no_raw_eval_pass():
 
 run_case("診斷自我檢查:不可以繞過 eval_pass() 直接跑評估 (P-127)",
          _diag_self_check_no_raw_eval_pass)
+
+
+def _diag_self_check_no_background_workers():
+    """【ADR-156】診斷自我檢查:App 的背景 daemon worker 一條都不可以跑起來。
+
+    整份診斷共用**同一個 app 物件**,而那 5 條 worker 是無窮迴圈。它們活著的
+    每一秒都在呼叫案例臨時 patch 上去的假 API、改寫 `app` 上的共用狀態 ——
+    案例用「最後一次呼叫」當斷言依據時,就變成跟背景執行緒搶寫同一個變數。
+    實測 8 次跑出 2 次紅,而且每次紅的案例不一樣(ADR-133 / ADR-145),
+    紅的內容還會出現**別的案例的代碼**(TXFR1、001)。
+
+    這一條守的是「攔截機制本身還在」。少了它,下一個人把 `_DiagNoWorkerThread`
+    拿掉之後,診斷只會偶爾紅一下,而且會被當成「那個案例本來就不穩」——
+    偶發紅最貴的地方就是它會訓練人去忽略紅燈。
+    """
+    # 1. 最重要的不變式:整份診斷跑完,不可以有任何 worker 在背景執行緒上跑過
+    assert not _diag_worker_entries, \
+        (f"背景 worker 在**背景執行緒**上跑起來了:{sorted(set(_diag_worker_entries))}"
+         f" —— 它會在後面每一個案例執行期間呼叫假 API、改寫共用狀態。"
+         f"(案例在主執行緒同步呼叫 worker 去驗節流間隔是允許的,不會記在這裡)")
+
+    # 2. 攔截真的有發生 (每一條都被擋在 start())
+    assert set(_diag_blocked_starts) == DIAG_BLOCKED_WORKERS, \
+        (f"應該攔下 {sorted(DIAG_BLOCKED_WORKERS)},實際只攔到 "
+         f"{sorted(set(_diag_blocked_starts))} —— App 的 worker 清單改過了,"
+         f"診斷的攔截名單沒跟上,新的那條會在背景繼續製造偶發紅")
+
+    # 3. 反向對照:攔截只針對 worker,其他執行緒不可以被一起擋掉
+    #    (ADR-122 的案例自己開 5 條執行緒驗 kbars 鎖,擋掉就等於沒驗)
+    _ran = []
+    _t = stock_app_pro.threading.Thread(target=lambda: _ran.append(1))
+    _t.start(); _t.join()
+    assert _ran, "一般執行緒不可以被攔截 —— 有案例靠自己開執行緒驗併發鎖"
+
+    # 4. 原始碼層級:App 之後多起一條**建構期**的 worker 時,攔截名單要跟著補。
+    #
+    #    範圍刻意只看 `__init__`:全檔還有二十幾個 `_xxx_worker`,但那些是
+    #    **一次性**的(按鈕按下去才起、跑完就結束),不會活過整個診斷。
+    #    會製造偶發紅的,是「建構時無條件啟動 + 無窮迴圈」的那一批。
+    import re as _re156
+    import inspect as _insp156
+    _init_src = _insp156.getsource(stock_app_pro.StockTradingAppPro.__init__)
+    _started = set(_re156.findall(r'threading\.Thread\(target=self\.(\w+)', _init_src))
+    _missing = _started - DIAG_BLOCKED_WORKERS
+    assert not _missing, \
+        (f"stock_app_pro.__init__ 起了診斷沒攔的背景 worker:{sorted(_missing)} —— "
+         f"請加進 DIAG_BLOCKED_WORKERS,否則它會在背景製造偶發紅")
+    # 反向對照:名單裡不可以塞根本不是建構期起的東西 (那會給人虛假的安心)
+    _stale = DIAG_BLOCKED_WORKERS - _started
+    assert not _stale, \
+        (f"攔截名單裡有 __init__ 根本沒起的 worker:{sorted(_stale)} —— "
+         f"名單與現況已經脫節")
+
+
+run_case("診斷自我檢查:背景 daemon worker 一條都不可以跑起來 (ADR-156 偶發紅的根因)",
+         _diag_self_check_no_background_workers)
 
 
 print(f"{'案例':60s} 結果")

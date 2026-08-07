@@ -24,3 +24,15 @@ taifex_dlg.txt
 test_mpf*.py
 test_sj.py
 *.png
+
+# 【ADR-156】使用者的執行期狀態檔 —— 不進版控。
+#
+# 這三個檔是**每台機器自己的資料**(策略清單、部位/風控計數、模擬帳戶),
+# 程式每次存檔都會改寫。放在版控裡的後果是使用者本機每次 git pull 都撞衝突
+# (實測就是被這三個檔擋下來的),而且會有「A 機器的部位覆蓋 B 機器」的風險。
+#
+# 三個檔的讀取端都有 os.path.exists 保護,不存在時走預設值,新機器 clone
+# 下來可以直接跑 —— 只是不會帶著別台機器的策略,那正是我們要的。
+quant_strategies.json
+quant_state.json
+paper_account.json
