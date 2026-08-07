@@ -139,6 +139,78 @@ def pick_price(book, action, level=DEFAULT_LEVEL):
     return px, ""
 
 
+def walk_fill(book, action, qty, max_level=DEFAULT_LEVEL):
+    """限價單**實際會成交在哪些價位**。→ dict,取不到回 None。
+
+    【為什麼需要這個】`pick_price()` 給的是「掛單價」——「賣三檔」的意思是
+    「我願意付到賣三的價」,不是「我會成交在賣三」。真正送出去之後,買單是從
+    **賣一開始往上吃**,吃到數量滿足或觸及掛價上限為止。使用者實測:掛 103.05
+    (賣三),但賣一 102.95 就有 13,542 股,買 501 股根本吃不到賣二 ——
+    真實成交均價是 **102.95**,不是 103.05。
+
+    差 0.1 元 × 501 股看起來很小,但系統採樂觀成交模型 (ADR-035):記進帳的
+    價格就是後續**所有**損益、停損停利的基準。基準價一開始就偏高,整條線
+    都跟著偏。
+
+    回傳:
+      avg_price     加權平均成交價 (這才是「真實成交價」的最佳估計)
+      filled_qty    估計成交數量
+      fully_filled  五檔的量夠不夠吃滿
+      levels        [(價, 這一檔吃掉多少), ...] —— 訊息要講得出「怎麼算的」
+      limit_price   掛單價 (= pick_price 的結果,第 max_level 檔)
+
+    【誠實說明:這是估計,不是保證】
+      · 盤中零股是**集合競價**,實際成交價由撮合決定,可能比這裡更好。
+      · 五檔是快照,送出到撮合之間掛單量會變。
+      · 所以這個估計刻意**偏保守**(假設你一路吃上去),不會低估你要付的價。
+    """
+    if not book:
+        return None
+    try:
+        need = int(qty)
+    except (TypeError, ValueError):
+        return None
+    if need <= 0:
+        return None
+    side = 'ask' if action == BUY else 'bid'
+    rows = list((book.get(side) or []))[:clamp_level(max_level)]
+    if not rows:
+        return None
+
+    got = 0
+    cost = 0.0
+    used = []
+    for px, vol in rows:
+        if got >= need:
+            break
+        take = min(int(vol or 0), need - got)
+        if take <= 0:
+            continue
+        used.append((float(px), int(take)))
+        cost += float(px) * take
+        got += take
+    if got <= 0:
+        return None
+    return {
+        'avg_price': cost / got,
+        'filled_qty': got,
+        'fully_filled': got >= need,
+        'levels': used,
+        'limit_price': float(rows[-1][0]) if rows else None,
+    }
+
+
+def describe_fill(fill):
+    """把 walk_fill 的結果講成人話,給日誌/推播用。"""
+    if not fill:
+        return "(估不出成交價)"
+    parts = " + ".join(f"{p:g}x{q}" for p, q in (fill.get('levels') or []))
+    txt = f"預估成交均價 {fill['avg_price']:g} ({parts})"
+    if not fill.get('fully_filled'):
+        txt += f" ⚠ 五檔量只夠成交 {fill['filled_qty']} 股/口,其餘要等後續掛單"
+    return txt
+
+
 def describe(book):
     """一行人話,給系統日誌用。取價失敗時要看得出來當下的五檔長什麼樣。"""
     if not book:

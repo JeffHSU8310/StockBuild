@@ -7993,6 +7993,157 @@ run_case("ADR-152: 終極波段每日晨間狀態報告 (交易日固定時刻�
          _chukuangren_daily_status_152)
 
 
+def _timed_entry_now_and_fill_153():
+    """【ADR-153】定時下單:用觸發當下判斷、成交價用預估均價、訊息講清楚。
+
+    使用者三點:
+      1. 「當我有設定什麼時候下單,就要以這個時間去看 A 有沒有符合策略條件,
+         若沒有符合,就不會下單。」
+      2. 「賣3檔…實際成交價應該不會就是高三檔的價格,所以真實的成交價是多少?
+         訊息要跟我說。」
+      3. 「我實際看真實交易,在這個時間成交的價格落在 102.9。」
+
+    純規則已在 tests/test_core.py 釘死。這裡守接線:走完整條路,確認記進帳的
+    是**預估成交均價**而不是掛價,而且訊息講得出掛價/均價/怎麼算的。
+    """
+    import re as _re53
+    import pandas as _pd53
+    from core import strategy_engine as _se53
+    from core import quote_book as _qb53
+
+    class FakeContract:
+        def __init__(self, code='0050'):
+            self.code = code
+            self.symbol = code
+
+    # 使用者截圖裡的那一份真實五檔
+    _book = _qb53.make([102.9, 102.85, 102.8, 102.75, 102.7],
+                       [7261, 16519, 20027, 7813, 28368],
+                       [102.95, 103.0, 103.05, 103.1, 103.15],
+                       [13542, 14338, 10165, 4095, 1731],
+                       ts=time.time(), symbol='0050', odd=True)
+    # A(加權)昨收 100;今天曾經跌到 99.5,但最後一根收在 99.95
+    _a_df = _pd53.DataFrame(
+        {'Open': [100.0, 100.0, 99.6], 'High': [100.0, 100.0, 100.0],
+         'Low': [100.0, 99.5, 99.9], 'Close': [100.0, 99.6, 99.95]},
+        index=_pd53.to_datetime(['2026-08-05 13:30', '2026-08-06 09:05',
+                                 '2026-08-06 10:29']))
+
+    orders, logs = [], []
+    orig_log = app.log_message
+    orig_resolve = app._qt_resolve
+    orig_place = app._place_strategy_order
+    orig_running, orig_login, orig_api = app._qt_running, app.api_logged_in, app.sj_api
+    orig_strats, orig_rts = app.strategies, app.strategy_runtimes
+    orig_books = dict(getattr(app, '_qt_books', {}) or {})
+    orig_paper = app._qt_save_paper
+
+    def _mk(**over):
+        st = _se53.new_strategy()
+        st.update({'name': '診斷ADR153', 'symbol': '0050', 'trade_type': '零股',
+                   'market': '台股', 'qty': 501, 'direction': '做多', 'mode': '模擬',
+                   'enabled': True, 'timeframe': '1分K', 'session_gate': False,
+                   'stop_loss_pct': 0.0, 'take_profit_pct': 0.0,
+                   'cooldown_sec': 0, 'max_trades_per_day': 99, 'slippage_ticks': 0,
+                   'timed_entry': True, 'timed_entry_time': '10:30',
+                   'timed_entry_window_min': 10, 'timed_book_level': 3,
+                   'entry': [{'type': 'day_drop_over',
+                              'params': {'value': 0.2, 'base': '昨收', 'use': '盤中觸價'}}],
+                   'exit_signals': []})
+        st.update(over)
+        return st
+
+    def _mount(st, a_price):
+        rt = _se53.new_runtime()
+        rt['_live_a_df'] = _a_df
+        rt['_live_a_price'] = a_price
+        app.strategies = [st]
+        app.strategy_runtimes = {st['id']: rt}
+        with app.quote_lock:
+            if not hasattr(app, '_qt_books'):
+                app._qt_books = {}
+            app._qt_books[('0050', True)] = dict(_book, ts=time.time())
+        return rt
+
+    _t = stock_app_pro.datetime(2026, 8, 6, 10, 30, 0)
+    try:
+        app.log_message = lambda m: (logs.append(str(m)), orig_log(m))[0]
+        app._qt_resolve = lambda _s: (FakeContract(), 'stock')
+        app._place_strategy_order = lambda st, it, c, k, exec_price=None, **kw: (
+            orders.append((it['action'], it['qty'], exec_price)), (True, 'OK'))[1]
+        app._qt_save_paper = lambda *a, **k: None
+        app.sj_api = object(); app.api_logged_in = True; app._qt_running = True
+
+        # ---- 1. 當下不符合就**不下單** (今天曾經跌 0.5%,但當下只跌 0.05%) ----
+        st = _mk(); rt = _mount(st, 99.95)
+        orders.clear(); logs.clear()
+        app._qt_check_timed_entries(now_dt=_t); app.flush_after()
+        assert rt['state'] == 'FLAT' and not orders, \
+            (f"當下只跌 0.05% < 0.2%,不可以因為「今天曾經跌過」就下單 "
+             f"(state={rt['state']}, orders={orders})")
+        assert any('當下' in m and '不成立' in m for m in logs), \
+            f"不下單要講得出原因,不可以靜默:{logs[:3]}"
+
+        # ---- 2. 當下符合就送,而且記帳用**預估成交均價**不是掛價 ----
+        st2 = _mk(); rt2 = _mount(st2, 99.5)
+        orders.clear(); logs.clear()
+        app._qt_check_timed_entries(now_dt=_t); app.flush_after()
+        assert rt2['state'] == 'LONG', f"當下跌 0.5% 應該進場 (state={rt2['state']})"
+        assert abs(float(rt2.get('exec_entry_price', 0)) - 102.95) < 1e-9, \
+            (f"記帳價要用**預估成交均價 102.95**,不是掛價 103.05 —— "
+             f"實際 {rt2.get('exec_entry_price')}。樂觀成交模型下這個價是後續"
+             f"所有損益與停損停利的基準")
+
+        # ---- 3. 訊息要同時講出掛價、預估成交均價、怎麼算的 ----
+        _fill_msgs = [m for m in logs if '定時下單' in m and '預估成交均價' in m]
+        assert _fill_msgs, f"訊息要講出預估成交均價:{logs[:3]}"
+        _m = _fill_msgs[0]
+        assert '掛價 103.05' in _m, f"要講出掛價 (賣三檔):{_m[:160]}"
+        assert '102.95' in _m, f"要講出預估成交均價:{_m[:160]}"
+        assert '102.95x501' in _m, f"要講出怎麼算的 (吃了哪幾檔):{_m[:200]}"
+
+        # ---- 4. 實單要標明「實際成交價以券商回報為準」 ----
+        st4 = _mk(mode='實單'); _mount(st4, 99.5)
+        orders.clear(); logs.clear()
+        app._qt_check_timed_entries(now_dt=_t); app.flush_after()
+        assert orders, f"實單應該送出,實際 {orders}"
+        assert abs(float(orders[-1][2]) - 103.05) < 1e-9, \
+            (f"送給券商的**限價**仍要是掛價 103.05 (那是「最多願意付到這裡」),"
+             f"實際 {orders[-1][2]}")
+        assert any('券商回報為準' in m for m in logs), \
+            f"實單要標明實際成交價以券商回報為準:{logs[:3]}"
+    finally:
+        app.log_message = orig_log
+        app._qt_resolve = orig_resolve
+        app._place_strategy_order = orig_place
+        app._qt_save_paper = orig_paper
+        app._qt_running, app.api_logged_in, app.sj_api = orig_running, orig_login, orig_api
+        app.strategies, app.strategy_runtimes = orig_strats, orig_rts
+        with app.quote_lock:
+            app._qt_books = orig_books
+
+    _src53 = open('stock_app_pro.py', encoding='utf-8').read()
+
+    # ---- 5. 接線:定時下單要拿得到 A 的當下價 ----
+    _i = _src53.index('    def _qt_check_timed_entries(')
+    _m2 = _re53.search(r'\n    def (?!_qt_check_timed_entries\b)\w+', _src53[_i:])
+    _seg = _src53[_i:_i + _m2.start()]
+    assert 'live_price=' in _seg, \
+        "定時下單沒有把「當下的價」餵給 check_timed_entry,條件仍會用『今天曾經』判斷"
+    assert 'walk_fill' in _seg, "定時下單沒有算預估成交均價,記帳會用掛價"
+
+    # ---- 6. _live_a_df 要為定時下單策略快取 (原本只有即時進場才存) ----
+    _i = _src53.index('    def _quant_eval_pass(')
+    _m2 = _re53.search(r'\n    def (?!_quant_eval_pass\b)\w+', _src53[_i:])
+    assert 'timed_entry_enabled' in _src53[_i:_i + _m2.start()], \
+        ("_quant_eval_pass 沒有為定時下單策略快取 A 的 K 棒 —— "
+         "使用者關掉即時進場時,定時下單會靜默不下單")
+
+
+run_case("ADR-153: 定時下單看『當下』不看『曾經』+ 成交價用預估均價不用掛價",
+         _timed_entry_now_and_fill_153)
+
+
 def _diag_self_check_no_raw_eval_pass():
     """【P-127】診斷檔自己的自我檢查:不可以有人再直接呼叫 `_quant_eval_pass()`。
 
