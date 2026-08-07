@@ -9821,7 +9821,8 @@ class StockTradingAppPro(tk.Tk):
                                     f"【定時下單】策略「{s.get('name')}」"
                                     f"{strategy_engine.timed_entry_time_of(s)} 的單今天沒送成 —— "
                                     f"已超過 {strategy_engine.timed_window_min_of(s)} 分鐘窗口。"
-                                    "常見原因:當時取不到五檔 (非交易時段/沒掛單/訂閱失敗)。")
+                                    "常見原因:整段窗口內進場條件都沒成立,"
+                                    "或取不到五檔 (非交易時段/沒掛單/訂閱失敗)。")
                     self._qt_save_state()
                     continue
                 ok_fire, why_fire = strategy_engine.should_fire_timed(s, rt, now_dt)
@@ -9848,10 +9849,18 @@ class StockTradingAppPro(tk.Tk):
                 if intent is None:
                     # 到點了但條件不成立 —— 使用者要的正是「不符合就不下單」,
                     # 但**不可以靜默**:一天一次的機會沒動作,要講得出原因。
+                    #
+                    # 【ADR-154】這裡刻意**不** mark_timed_done:指定時刻是
+                    # 「從這裡開始看」不是「只看這一眼」,使用者原話「在設定的
+                    # 時間之後有符合策略條件,還是要下單」。窗口內每 2 秒再問
+                    # 一次,窗口過了才由上面的 timed_window_expired 收尾。
                     self._qt_timed_log_once(
                         s, rt,
-                        f"到達指定時刻,但**當下**進場條件不成立 (A 現價 "
-                        f"{'--' if _a_now is None else f'{_a_now:g}'}),今天不送單")
+                        f"**當下**進場條件不成立 (A 現價 "
+                        f"{'--' if _a_now is None else f'{_a_now:g}'}) —— "
+                        f"{strategy_engine.timed_entry_time_of(s)} 起算的 "
+                        f"{strategy_engine.timed_window_min_of(s)} 分鐘內會繼續看,"
+                        f"條件一成立就送")
                     continue
 
                 sym = str(s.get('symbol', '')).upper()
@@ -11650,7 +11659,7 @@ class StockTradingAppPro(tk.Tk):
         _lbl(top, "指定時刻").grid(row=18, column=0, sticky='w', pady=(2, 0))
         e_timed_t = _ent(top, s.get('timed_entry_time', ''), 8)
         e_timed_t.grid(row=18, column=1, padx=4, pady=(2, 0))
-        _lbl(top, "有效窗口(分)").grid(row=18, column=2, sticky='w', padx=(10, 0), pady=(2, 0))
+        _lbl(top, "持續看(分)").grid(row=18, column=2, sticky='w', padx=(10, 0), pady=(2, 0))
         e_timed_w = _ent(top, s.get('timed_entry_window_min',
                                     strategy_engine.TIMED_ENTRY_DEFAULT_WINDOW_MIN), 5)
         e_timed_w.grid(row=18, column=3, padx=4, pady=(2, 0))
@@ -11659,8 +11668,10 @@ class StockTradingAppPro(tk.Tk):
                                    width=4, state='readonly', style="BlackText.TCombobox")
         cb_timed_lv.set(str(strategy_engine.timed_book_level_of(s)))
         cb_timed_lv.grid(row=18, column=5, padx=4, pady=(2, 0))
-        tk.Label(top, text="格式 HH:MM(例 12:01)。五檔基準=買進吃「賣N」、賣出吃「買N」,"
-                           "數字越大越積極;再往上疊「讓價檔數」。窗口內取不到五檔就不送單(絕不用整股價頂替)。",
+        tk.Label(top, text="格式 HH:MM(例 12:01)。指定時刻是「從這裡開始看」:到點時條件不成立不會放棄,"
+                           "在「持續看」的分鐘數內每 2 秒再看一次,條件一成立就送(每天最多送一次)。"
+                           "五檔基準=買進吃「賣N」、賣出吃「買N」,數字越大越積極;再往上疊「讓價檔數」。"
+                           "取不到五檔就不送單(絕不用整股價頂替)。",
                  bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8), justify='left',
                  wraplength=680).grid(row=19, column=0, columnspan=6, sticky='w', pady=(0, 2))
         # 【ADR-150】回測要不要照風控跑。放 row 20:row 0~19 都已經有人用了,

@@ -9584,6 +9584,128 @@ class TestBacktestTimedEntryAndSession(unittest.TestCase):
         self.assertNotIn('零股**沒有 K 線**', txt)
 
 
+class TestTimedEntryKeepsWatching(unittest.TestCase):
+    """【ADR-154】指定時刻是「從這裡開始看」,不是「只看這一眼」。
+
+    使用者原話:「補充第一點的說明,在設定的時間之後有符合策略條件,還是要
+    下單。其它的就遵守設定的條件。」
+
+    ADR-153 把定時下單改成「用指定時刻的當下價判斷條件」,但回測那條路在條件
+    不成立時**無條件** `mark_timed_done()` —— 一次定生死,那天就再也不看了。
+    實盤那條路(`_qt_check_timed_entries`)本來就是 `continue` 重試,兩邊各走
+    各的(P-67),結果是回測會比實盤少進場,使用者拿一份偏保守的數字做決策。
+    """
+
+    def _df(self, drop_from_min=93):
+        """兩天 1 分 K。第一天全平在 100(當昨收),第二天 09:00 起 99.9
+        (-0.10%,不到門檻),`drop_from_min` 分鐘之後掉到 99.0(-1.00%)。
+
+        09:00 + 90 分 = 10:30(指定時刻),所以 drop_from_min=93 表示
+        「到點時不成立,3 分鐘後才成立」。
+        """
+        d1 = pd.date_range("2026-01-05 09:00", periods=271, freq="1min")
+        d2 = pd.date_range("2026-01-06 09:00", periods=271, freq="1min")
+        px = [100.0] * len(d1) + [(99.9 if i < drop_from_min else 99.0)
+                                  for i in range(len(d2))]
+        idx = pd.DatetimeIndex(list(d1) + list(d2))
+        return pd.DataFrame({'Open': px, 'High': px, 'Low': px, 'Close': px,
+                             'Volume': [1000] * len(px)}, index=idx)
+
+    def _s(self, **kw):
+        s = strategy_engine.new_strategy()
+        s.update({'name': 'T', 'symbol': '2330', 'trade_type': '股票', 'market': '台股',
+                  'qty': 1000, 'timeframe': '1分K', 'direction': '做多',
+                  'max_trades_per_day': 1, 'cooldown_sec': 0,
+                  'stop_loss_pct': 0.0, 'take_profit_pct': 0.0,
+                  'buy_and_hold': True, 'bnh_mode': 'accumulate', 'max_entries': 5,
+                  'session_gate': True, 'timed_entry': True,
+                  'timed_entry_time': '10:30', 'timed_entry_window_min': 10,
+                  'entry': [{'type': 'day_drop_over',
+                             'params': {'value': 0.5, 'base': '昨收'}}],
+                  'exit_signals': []})
+        s.update(kw)
+        return s
+
+    def _day2(self, r):
+        return [t for t in r['trades'] if str(t['entry_ts'])[:10] == '2026-01-06']
+
+    def test_conditions_met_after_the_specified_time_still_enters(self):
+        """使用者原話:「在設定的時間之後有符合策略條件,還是要下單。」
+
+        10:30 只跌 0.10%(不到 0.5%),10:33 才跌到 1.00% —— 這一天必須要有
+        一筆進場,而且落在 10:30 之後、窗口(10 分)之內。
+        """
+        r = backtest.run_backtest(self._s(), self._df(drop_from_min=93))
+        ts = self._day2(r)
+        self.assertTrue(ts, '條件在窗口內成立了卻整天沒進場 —— 一次定生死的舊行為')
+        hhmm = str(ts[0]['entry_ts'])[11:16]
+        self.assertGreater(hhmm, '10:30', '不該早於指定時刻')
+        self.assertLessEqual(hhmm, '10:40', '不該晚於 10 分鐘窗口')
+
+    def test_still_enters_at_the_specified_time_when_already_met(self):
+        """正向對照:到點就已經成立的,照舊在**指定時刻那一刻**進場,
+        不可以因為這次改動而延後。"""
+        r = backtest.run_backtest(self._s(), self._df(drop_from_min=0))
+        ts = self._day2(r)
+        self.assertTrue(ts)
+        self.assertEqual(str(ts[0]['entry_ts'])[11:16], '10:30')
+
+    def test_one_entry_per_day_even_though_it_keeps_watching(self):
+        """反向對照:「持續看」不可以變成「持續買」。條件從 10:30 起整段
+        窗口都成立,一天仍然只能有一筆。"""
+        r = backtest.run_backtest(self._s(), self._df(drop_from_min=0))
+        self.assertEqual(len(self._day2(r)), 1, '窗口內每一根都進場 = 重複進場')
+
+    def test_marking_done_is_what_stops_the_repeat_not_the_risk_cap(self):
+        """把「一天一次」壓在**收尾邏輯**上,而不是借風控的力。
+
+        上一個案例用的是 `max_trades_per_day=1`,所以就算送出後忘了
+        `mark_timed_done()`,重複的那幾筆也會被風控擋掉 —— 斷言看起來綠,
+        實際上沒有守住這條路(突變測試當場證明:拿掉 mark_timed_done 仍然全綠)。
+        這裡把每日上限放寬到 5,定時下單就只剩自己的收尾機制可以依靠。
+        """
+        r = backtest.run_backtest(
+            self._s(max_trades_per_day=5, max_entries=5),
+            self._df(drop_from_min=0))
+        self.assertEqual(len(self._day2(r)), 1,
+                         '送出之後沒有 mark_timed_done,窗口內每一根都又送了一次')
+
+    def test_gives_up_when_the_window_passes(self):
+        """反向對照:窗口是有邊界的。10:45 才成立(超過 10 分窗口)就是今天
+        不送 —— 否則「指定時刻」形同虛設,退化成一般 K 棒進場。"""
+        r = backtest.run_backtest(self._s(), self._df(drop_from_min=105))
+        self.assertFalse(self._day2(r), '超過窗口還進場 = 窗口沒有生效')
+
+    def test_conditions_never_met_no_entry(self):
+        """反向對照:整天都不成立就是不下單(使用者第 1 點的原意)。"""
+        r = backtest.run_backtest(self._s(), self._df(drop_from_min=10 ** 6))
+        self.assertFalse(self._day2(r))
+
+    def test_log_says_it_will_keep_watching(self):
+        """條件不成立時的訊息不可以講成「今天不送單」—— 那與實際行為矛盾,
+        使用者會以為機會已經沒了。"""
+        r = backtest.run_backtest(self._s(), self._df(drop_from_min=93))
+        txt = " ".join(str(l.get('_raw') or l.get('text', '')) for l in r['log'])
+        self.assertIn('窗口內下一根再看', txt)
+
+    def test_should_fire_timed_stays_true_until_marked(self):
+        """單元層級:沒有 mark_timed_done 之前,窗口內每一次問都要回 True。
+
+        這是上面那些回測行為的支點 —— 呼叫端只有在**真的送出去**或
+        **窗口過了**才可以收尾。
+        """
+        s = self._s()
+        rt = strategy_engine.new_runtime()
+        for mm in (30, 33, 36, 39):
+            ok, why = strategy_engine.should_fire_timed(
+                s, rt, datetime.datetime(2026, 1, 6, 10, mm, 0))
+            self.assertTrue(ok, f"10:{mm} 應該還要再問一次,卻回 {why}")
+        strategy_engine.mark_timed_done(rt, datetime.datetime(2026, 1, 6, 10, 39, 0))
+        ok, _ = strategy_engine.should_fire_timed(
+            s, rt, datetime.datetime(2026, 1, 6, 10, 40, 0))
+        self.assertFalse(ok, '送出去之後同一天不可以再送')
+
+
 class TestChukuangrenDailyStatus(unittest.TestCase):
     """【ADR-152】終極波段的每日晨間狀態報告。
 

@@ -286,13 +286,23 @@ def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
             _fire, _why_t = strategy_engine.should_fire_timed(s, rt, ts)
             if _fire:
                 _timed_it = strategy_engine.check_timed_entry(s, rt, eval_window)
-                strategy_engine.mark_timed_done(rt, ts)
                 if _timed_it is not None:
+                    # 送出去才算今天處理完
+                    strategy_engine.mark_timed_done(rt, ts)
                     intents = intents + [_timed_it]
                 else:
+                    # 【ADR-154】條件不成立**不收尾** —— 使用者原話:「在設定的
+                    # 時間之後有符合策略條件,還是要下單。」指定時刻是「從這裡
+                    # 開始看」,不是「只看這一眼」。窗口內的每一根 K 棒都要再問
+                    # 一次,窗口過了才由下面的 timed_window_expired 收尾。
+                    #
+                    # 原本這裡無條件 mark_timed_done,等於一次定生死;而實盤那條
+                    # 路(_qt_check_timed_entries)本來就是 continue 重試 ——
+                    # 同一份規則兩份實作各走各的(P-67),回測會比實盤少進場。
                     _log(ts, '未進場',
-                         f"到達指定時刻 {strategy_engine.timed_entry_time_of(s)},"
-                         f"但進場條件不成立 (或已達可分批進場次數上限)", collapse=True)
+                         f"{strategy_engine.timed_entry_time_of(s)} 起算的窗口內,"
+                         f"此刻進場條件不成立 (或已達可分批進場次數上限),"
+                         f"窗口內下一根再看", collapse=True)
             elif strategy_engine.timed_window_expired(s, rt, ts):
                 strategy_engine.mark_timed_done(rt, ts)
                 _log(ts, '未進場',
