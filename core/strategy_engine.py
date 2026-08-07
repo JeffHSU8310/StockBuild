@@ -1495,6 +1495,11 @@ def should_fire_timed(strategy, runtime, now_dt):
     `runtime['timed_done_day']` 記「今天這檔已經處理完了」—— 送出去算處理完,
     過了窗口沒送到也算處理完。兩者都要記,否則過期之後每一個 tick 都會再算
     一次、再記一次日誌,一天洗幾千行。
+
+    【ADR-154】**「條件不成立」不算處理完**。指定時刻的語意是「從這裡開始看」
+    不是「只看這一眼」——使用者原話:「在設定的時間之後有符合策略條件,
+    還是要下單。」所以窗口內每一個 tick(回測是每一根 K 棒)都會再回來問一次,
+    呼叫端只有在**真的送出去**或**窗口過了**才可以 `mark_timed_done()`。
     """
     if not timed_entry_enabled(strategy):
         return False, "沒有啟用定時下單"
@@ -1537,7 +1542,8 @@ def mark_timed_done(runtime, now_dt):
 def check_timed_entry(strategy, runtime, df_closed=None, live_price=None):
     """定時單要送什麼。回傳 OPEN intent 或 None。
 
-    **進場條件仍然要成立**,只是判斷的時機從「K 棒收盤」換成「指定時刻」:
+    **進場條件仍然要成立**,只是判斷的時機從「K 棒收盤」換成「指定時刻起的
+    每一次重問」(ADR-154:到點不成立不等於今天放棄,窗口內會一直回來問):
     條件用最近的已收盤 K 棒評估(df_closed 由呼叫端提供,與即時進場共用同一份
     快取,不另外抓 K 線,P-90)。沒有設進場條件的策略就是「到點必送」——
     那正是「12:01 幫我買一張」最單純的用法。

@@ -8144,6 +8144,150 @@ run_case("ADR-153: 定時下單看『當下』不看『曾經』+ 成交價用�
          _timed_entry_now_and_fill_153)
 
 
+def _timed_entry_keeps_watching_154():
+    """【ADR-154】指定時刻是「從這裡開始看」,不是「只看這一眼」。
+
+    使用者原話:「補充第一點的說明,在設定的時間之後有符合策略條件,還是要
+    下單。其它的就遵守設定的條件。」
+
+    回測那一半的規則已在 tests/test_core.py 釘死。這裡守實盤那一半:
+    到點不成立時**不可以** mark_timed_done,窗口內下一個 tick 還要再看;
+    窗口過了才收尾。訊息也不可以講成「今天不送單」——那與行為矛盾。
+    """
+    import pandas as _pd54
+    from core import strategy_engine as _se54
+    from core import quote_book as _qb54
+
+    class FakeContract:
+        def __init__(self, code='0050'):
+            self.code = code
+            self.symbol = code
+
+    _book = _qb54.make([102.9, 102.85], [7261, 16519],
+                       [102.95, 103.0], [13542, 14338],
+                       ts=time.time(), symbol='0050', odd=True)
+    # A 昨收 100;最後一根已收盤 K 棒收在 99.95(-0.05%,不到 0.2% 門檻)
+    _a_df = _pd54.DataFrame(
+        {'Open': [100.0, 99.96], 'High': [100.0, 100.0],
+         'Low': [100.0, 99.9], 'Close': [100.0, 99.95]},
+        index=_pd54.to_datetime(['2026-08-05 13:30', '2026-08-06 10:29']))
+
+    orders, logs = [], []
+    orig_log = app.log_message
+    orig_resolve = app._qt_resolve
+    orig_place = app._place_strategy_order
+    orig_running, orig_login, orig_api = app._qt_running, app.api_logged_in, app.sj_api
+    orig_strats, orig_rts = app.strategies, app.strategy_runtimes
+    orig_books = dict(getattr(app, '_qt_books', {}) or {})
+    orig_paper, orig_save = app._qt_save_paper, app._qt_save_state
+
+    def _mk():
+        st = _se54.new_strategy()
+        st.update({'name': '診斷ADR154', 'symbol': '0050', 'trade_type': '零股',
+                   'market': '台股', 'qty': 501, 'direction': '做多', 'mode': '模擬',
+                   'enabled': True, 'timeframe': '1分K', 'session_gate': False,
+                   'stop_loss_pct': 0.0, 'take_profit_pct': 0.0,
+                   'cooldown_sec': 0, 'max_trades_per_day': 99, 'slippage_ticks': 0,
+                   'timed_entry': True, 'timed_entry_time': '10:30',
+                   'timed_entry_window_min': 10, 'timed_book_level': 1,
+                   'entry': [{'type': 'day_drop_over',
+                              'params': {'value': 0.2, 'base': '昨收',
+                                         'use': '盤中觸價'}}],
+                   'exit_signals': []})
+        return st
+
+    def _tick(rt, a_price, hh, mm):
+        """跑一次 runner 節拍。a_price=None 代表當下拿不到即時價。"""
+        rt['_live_a_df'] = _a_df
+        if a_price is None:
+            rt.pop('_live_a_price', None)
+        else:
+            rt['_live_a_price'] = a_price
+        with app.quote_lock:
+            app._qt_books[('0050', True)] = dict(_book, ts=time.time())
+        app._qt_check_timed_entries(now_dt=stock_app_pro.datetime(2026, 8, 6, hh, mm, 0))
+        app.flush_after()
+
+    try:
+        app.log_message = lambda m: (logs.append(str(m)), orig_log(m))[0]
+        app._qt_resolve = lambda _s: (FakeContract(), 'stock')
+        app._place_strategy_order = lambda st, it, c, k, exec_price=None, **kw: (
+            orders.append((it['action'], it['qty'], exec_price)), (True, 'OK'))[1]
+        app._qt_save_paper = lambda *a, **k: None
+        app._qt_save_state = lambda *a, **k: None
+        app.sj_api = object(); app.api_logged_in = True; app._qt_running = True
+        if not hasattr(app, '_qt_books'):
+            app._qt_books = {}
+
+        # ---- 1. 10:30 條件不成立 → 不下單,而且**不可以收尾** ----
+        st = _mk(); rt = _se54.new_runtime()
+        app.strategies = [st]; app.strategy_runtimes = {st['id']: rt}
+        orders.clear(); logs.clear()
+        _tick(rt, 99.95, 10, 30)
+        assert rt['state'] == 'FLAT' and not orders, \
+            f"當下只跌 0.05%,不該下單 (state={rt['state']}, orders={orders})"
+        assert not rt.get('timed_done_day'), \
+            ("條件不成立就 mark_timed_done = 一次定生死,今天再也不看了。"
+             "使用者要的是「在設定的時間之後有符合,還是要下單」")
+        _no = [m for m in logs if '不成立' in m]
+        assert _no, f"不下單要講得出原因:{logs[:3]}"
+        assert '今天不送單' not in _no[0], \
+            f"訊息不可以講成「今天不送單」—— 與實際行為(還會再看)矛盾:{_no[0]}"
+        assert '會繼續看' in _no[0], \
+            f"訊息要讓使用者知道機會還在:{_no[0]}"
+
+        # ---- 2. 10:33 條件成立 → 照樣要送出去 (這是這一筆的主訴求) ----
+        orders.clear(); logs.clear()
+        _tick(rt, 99.5, 10, 33)
+        assert rt['state'] == 'LONG', \
+            (f"指定時刻之後才符合條件,仍然要下單 (state={rt['state']}) —— "
+             f"使用者原話:「在設定的時間之後有符合策略條件,還是要下單」")
+        assert rt.get('timed_done_day') == '2026-08-06', \
+            "送出去之後要收尾,否則窗口內每 2 秒會再送一次"
+
+        # ---- 3. 反向對照:送出去之後,窗口內下一個 tick 不可以再送 ----
+        _n_before = len(orders)
+        _tick(rt, 99.5, 10, 36)
+        assert len(orders) == _n_before, \
+            f"送過了還在送 = 重複進場 (orders={orders})"
+
+        # ---- 4. 反向對照:整段窗口都不成立 → 窗口過了就收尾並講一次 ----
+        st4 = _mk(); rt4 = _se54.new_runtime()
+        app.strategies = [st4]; app.strategy_runtimes = {st4['id']: rt4}
+        orders.clear(); logs.clear()
+        for _mm in (30, 33, 36, 39):
+            _tick(rt4, 99.95, 10, _mm)
+        assert not orders and not rt4.get('timed_done_day'), \
+            "窗口內都不成立,不該下單也不該提早收尾"
+        _tick(rt4, 99.95, 10, 41)        # 10:30 + 10 分 = 10:40,已經過了
+        assert rt4.get('timed_done_day') == '2026-08-06', \
+            "窗口過了要收尾,否則每 2 秒重算一次、日誌一天洗幾千行"
+        assert any('已超過' in m and '分鐘窗口' in m for m in logs), \
+            f"窗口過了要講一次「今天沒送成」:{logs[-3:]}"
+        assert not orders, "窗口過了還下單 = 指定時刻形同虛設"
+    finally:
+        app.log_message = orig_log
+        app._qt_resolve = orig_resolve
+        app._place_strategy_order = orig_place
+        app._qt_save_paper, app._qt_save_state = orig_paper, orig_save
+        app._qt_running, app.api_logged_in, app.sj_api = orig_running, orig_login, orig_api
+        app.strategies, app.strategy_runtimes = orig_strats, orig_rts
+        with app.quote_lock:
+            app._qt_books = orig_books
+
+    # ---- 5. 回測那一半要用同一份語意 (P-67:兩份實作遲早分歧) ----
+    _srcbt = open('core/backtest.py', encoding='utf-8').read()
+    _i = _srcbt.index('check_timed_entry(s, rt, eval_window)')
+    _seg = _srcbt[_i:_i + 400]
+    assert _seg.index('if _timed_it is not None:') < _seg.index('mark_timed_done'), \
+        ("回測在條件不成立時就 mark_timed_done —— 一次定生死。"
+         "實盤那條路是重試的,兩邊行為不一致,回測會比實盤少進場")
+
+
+run_case("ADR-154: 指定時刻之後才符合條件,仍然要下單 (窗口內持續看,不是只看一眼)",
+         _timed_entry_keeps_watching_154)
+
+
 def _diag_self_check_no_raw_eval_pass():
     """【P-127】診斷檔自己的自我檢查:不可以有人再直接呼叫 `_quant_eval_pass()`。
 
