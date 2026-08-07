@@ -291,23 +291,24 @@ def run_backtest(strategy, df, fee_rate=0.0, slippage_ticks=0, tick_size=None,
                     strategy_engine.mark_timed_done(rt, ts)
                     intents = intents + [_timed_it]
                 else:
-                    # 【ADR-154】條件不成立**不收尾** —— 使用者原話:「在設定的
-                    # 時間之後有符合策略條件,還是要下單。」指定時刻是「從這裡
-                    # 開始看」,不是「只看這一眼」。窗口內的每一根 K 棒都要再問
-                    # 一次,窗口過了才由下面的 timed_window_expired 收尾。
+                    # 【ADR-154/155】條件不成立**不收尾** —— 使用者原話:
+                    # 「到達指定時刻,但當下進場條件不成立,不會下單。但是,
+                    #   只要在今天收盤前,符合條件,就會下單。」
+                    # 指定時刻是**起點**,截止點是**今天收盤**。收盤之前的每一根
+                    # K 棒都要再問一次,收盤了才由下面的 timed_day_over 收尾。
                     #
                     # 原本這裡無條件 mark_timed_done,等於一次定生死;而實盤那條
                     # 路(_qt_check_timed_entries)本來就是 continue 重試 ——
                     # 同一份規則兩份實作各走各的(P-67),回測會比實盤少進場。
                     _log(ts, '未進場',
-                         f"{strategy_engine.timed_entry_time_of(s)} 起算的窗口內,"
-                         f"此刻進場條件不成立 (或已達可分批進場次數上限),"
-                         f"窗口內下一根再看", collapse=True)
-            elif strategy_engine.timed_window_expired(s, rt, ts):
+                         f"{strategy_engine.timed_entry_time_of(s)} 起,此刻進場條件"
+                         f"不成立 (或已達可分批進場次數上限),今天收盤前會繼續看",
+                         collapse=True)
+            elif strategy_engine.timed_day_over(s, rt, ts):
                 strategy_engine.mark_timed_done(rt, ts)
                 _log(ts, '未進場',
-                     f"定時下單:{strategy_engine.timed_entry_time_of(s)} 起算的窗口已過,"
-                     f"今天不再送", collapse=True)
+                     f"定時下單:{strategy_engine.timed_entry_time_of(s)} 起到今天收盤,"
+                     f"進場條件都沒有成立", collapse=True)
 
         # 【ADR-151】休市時段一律不成交 —— 進場、出場都是。與實盤一致:
         # session_gate 打開時,非交易時間整檔策略不評估。

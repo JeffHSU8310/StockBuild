@@ -7129,7 +7129,7 @@ def _timed_entry_odd_lot_147():
                    'cooldown_sec': 0, 'max_trades_per_day': 99,
                    'slippage_ticks': 0, 'entry': [], 'exit_signals': [],
                    'timed_entry': True, 'timed_entry_time': '12:01',
-                   'timed_entry_window_min': 5, 'timed_book_level': 1})
+                   'timed_book_level': 1})
         st.update(over)
         return st
 
@@ -7236,12 +7236,18 @@ def _timed_entry_odd_lot_147():
         app._qt_check_timed_entries(_at(12, 1, 2)); app.flush_after()
         assert not orders, f"五檔已經 999 秒沒更新,不可以拿來下單,實際 {orders}"
 
-        # ---- 10. 窗口過了要收尾並講一次話 ----
+        # ---- 10. 【ADR-155】收盤了才收尾並講一次話 ----
+        # 原本這裡驗的是「5 分鐘窗口過了」(12:09)。ADR-155 把截止點改成
+        # **今天收盤**,所以 12:09 還在看 —— 要到 13:30 之後才收尾。
         orders.clear(); logs.clear()
         app._qt_check_timed_entries(_at(12, 9, 0)); app.flush_after()
+        assert not rt5.get('timed_done_day'), \
+            "12:09 還沒收盤,不可以收尾 (使用者:「只要在今天收盤前,符合條件,就會下單」)"
+        orders.clear(); logs.clear()
+        app._qt_check_timed_entries(_at(13, 31, 0)); app.flush_after()
         assert not orders
-        assert rt5.get('timed_done_day') == '2026-08-06', "窗口過了要標成今天處理完"
-        assert any('窗口' in m for m in logs), f"窗口過期要講一次:{logs[-3:]}"
+        assert rt5.get('timed_done_day') == '2026-08-06', "收盤了要標成今天處理完"
+        assert any('收盤' in m for m in logs), f"收盤了要講一次:{logs[-3:]}"
 
         # ---- 11. 反向對照:沒開定時下單的策略完全不受影響 ----
         _push()
@@ -8046,7 +8052,7 @@ def _timed_entry_now_and_fill_153():
                    'stop_loss_pct': 0.0, 'take_profit_pct': 0.0,
                    'cooldown_sec': 0, 'max_trades_per_day': 99, 'slippage_ticks': 0,
                    'timed_entry': True, 'timed_entry_time': '10:30',
-                   'timed_entry_window_min': 10, 'timed_book_level': 3,
+                   'timed_book_level': 3,
                    'entry': [{'type': 'day_drop_over',
                               'params': {'value': 0.2, 'base': '昨收', 'use': '盤中觸價'}}],
                    'exit_signals': []})
@@ -8151,8 +8157,9 @@ def _timed_entry_keeps_watching_154():
     下單。其它的就遵守設定的條件。」
 
     回測那一半的規則已在 tests/test_core.py 釘死。這裡守實盤那一半:
-    到點不成立時**不可以** mark_timed_done,窗口內下一個 tick 還要再看;
-    窗口過了才收尾。訊息也不可以講成「今天不送單」——那與行為矛盾。
+    到點不成立時**不可以** mark_timed_done,收盤前每一個 tick 還要再看;
+    **收盤了**才收尾(ADR-155:截止點是今天收盤,不是自訂的分鐘數窗口)。
+    訊息也不可以講成「今天不送單」——那與行為矛盾。
     """
     import pandas as _pd54
     from core import strategy_engine as _se54
@@ -8189,7 +8196,7 @@ def _timed_entry_keeps_watching_154():
                    'stop_loss_pct': 0.0, 'take_profit_pct': 0.0,
                    'cooldown_sec': 0, 'max_trades_per_day': 99, 'slippage_ticks': 0,
                    'timed_entry': True, 'timed_entry_time': '10:30',
-                   'timed_entry_window_min': 10, 'timed_book_level': 1,
+                   'timed_book_level': 1,
                    'entry': [{'type': 'day_drop_over',
                               'params': {'value': 0.2, 'base': '昨收',
                                          'use': '盤中觸價'}}],
@@ -8243,28 +8250,50 @@ def _timed_entry_keeps_watching_154():
             (f"指定時刻之後才符合條件,仍然要下單 (state={rt['state']}) —— "
              f"使用者原話:「在設定的時間之後有符合策略條件,還是要下單」")
         assert rt.get('timed_done_day') == '2026-08-06', \
-            "送出去之後要收尾,否則窗口內每 2 秒會再送一次"
+            "送出去之後要收尾,否則收盤前每 2 秒會再送一次"
 
-        # ---- 3. 反向對照:送出去之後,窗口內下一個 tick 不可以再送 ----
+        # ---- 3. 反向對照:送出去之後,收盤前下一個 tick 不可以再送 ----
         _n_before = len(orders)
         _tick(rt, 99.5, 10, 36)
         assert len(orders) == _n_before, \
             f"送過了還在送 = 重複進場 (orders={orders})"
 
-        # ---- 4. 反向對照:整段窗口都不成立 → 窗口過了就收尾並講一次 ----
+        # ---- 4. 【ADR-155】整天都不成立 → 一路看到收盤,收盤了才收尾 ----
         st4 = _mk(); rt4 = _se54.new_runtime()
         app.strategies = [st4]; app.strategy_runtimes = {st4['id']: rt4}
         orders.clear(); logs.clear()
-        for _mm in (30, 33, 36, 39):
-            _tick(rt4, 99.95, 10, _mm)
-        assert not orders and not rt4.get('timed_done_day'), \
-            "窗口內都不成立,不該下單也不該提早收尾"
-        _tick(rt4, 99.95, 10, 41)        # 10:30 + 10 分 = 10:40,已經過了
+        for _hh, _mm in ((10, 30), (10, 41), (11, 30), (13, 29)):
+            _tick(rt4, 99.95, _hh, _mm)
+            assert not orders and not rt4.get('timed_done_day'), \
+                (f"{_hh}:{_mm:02d} 還沒收盤,不該下單也不該提早收尾 —— "
+                 f"使用者要的是「只要在今天收盤前,符合條件,就會下單」")
+        _tick(rt4, 99.95, 13, 31)        # 零股 13:30 收盤
         assert rt4.get('timed_done_day') == '2026-08-06', \
-            "窗口過了要收尾,否則每 2 秒重算一次、日誌一天洗幾千行"
-        assert any('已超過' in m and '分鐘窗口' in m for m in logs), \
-            f"窗口過了要講一次「今天沒送成」:{logs[-3:]}"
-        assert not orders, "窗口過了還下單 = 指定時刻形同虛設"
+            "收盤了要收尾,否則每 2 秒重算一次、日誌一天洗幾千行"
+        assert any('今天沒送成' in m and '收盤' in m for m in logs), \
+            f"收盤了要講一次「今天沒送成」:{logs[-3:]}"
+        assert not orders, "收盤了還下單 = 指定時刻與交易時段都形同虛設"
+
+        # ---- 5. 收盤前條件成立(即使離指定時刻很久)照樣要送 ----
+        st5 = _mk(); rt5 = _se54.new_runtime()
+        app.strategies = [st5]; app.strategy_runtimes = {st5['id']: rt5}
+        orders.clear(); logs.clear()
+        _tick(rt5, 99.95, 10, 30)        # 到點不成立
+        _tick(rt5, 99.5, 13, 25)         # 收盤前 5 分鐘才成立
+        assert rt5['state'] == 'LONG', \
+            (f"收盤前才成立就不送 = 截止點抓錯 (state={rt5['state']}) —— "
+             f"使用者原話:「只要在今天收盤前,符合條件,就會下單」")
+
+        # ---- 6. 日誌去重要用穩定的原因鍵,不可以拿含現價的整句去比 ----
+        st6 = _mk(); rt6 = _se54.new_runtime()
+        app.strategies = [st6]; app.strategy_runtimes = {st6['id']: rt6}
+        orders.clear(); logs.clear()
+        for _i6, _px6 in enumerate((99.95, 99.94, 99.96, 99.93, 99.97)):
+            _tick(rt6, _px6, 10, 30 + _i6)
+        _cond_logs = [m for m in logs if '不成立' in m]
+        assert len(_cond_logs) == 1, \
+            (f"同一個原因講了 {len(_cond_logs)} 次 —— 訊息裡的「A 現價」每 2 秒都在變,"
+             f"拿整句去比等於沒有去重。指定時刻到收盤是 3 小時,會洗出幾千行")
     finally:
         app.log_message = orig_log
         app._qt_resolve = orig_resolve
@@ -8275,7 +8304,18 @@ def _timed_entry_keeps_watching_154():
         with app.quote_lock:
             app._qt_books = orig_books
 
-    # ---- 5. 回測那一半要用同一份語意 (P-67:兩份實作遲早分歧) ----
+    # ---- 7. 【ADR-155】「有效窗口(分)」要真的從 UI 與策略檔消失 ----
+    _srcapp = open('stock_app_pro.py', encoding='utf-8').read()
+    _leftover = [ln for ln in _srcapp.splitlines()
+                 if 'timed_entry_window_min' in ln
+                 and '.pop(' not in ln and not ln.lstrip().startswith('#')]
+    assert not _leftover, \
+        (f"UI 還在讀寫已移除的「有效窗口」欄位:{_leftover[:2]} —— "
+         f"留著一個沒有作用的輸入框比刪掉更糟,下一個人會以為它還管用")
+    assert 'timed_window_min_of' not in _srcapp and 'timed_window_expired' not in _srcapp, \
+        "還有人在呼叫已移除的窗口函式"
+
+    # ---- 8. 回測那一半要用同一份語意 (P-67:兩份實作遲早分歧) ----
     _srcbt = open('core/backtest.py', encoding='utf-8').read()
     _i = _srcbt.index('check_timed_entry(s, rt, eval_window)')
     _seg = _srcbt[_i:_i + 400]
@@ -8284,7 +8324,7 @@ def _timed_entry_keeps_watching_154():
          "實盤那條路是重試的,兩邊行為不一致,回測會比實盤少進場")
 
 
-run_case("ADR-154: 指定時刻之後才符合條件,仍然要下單 (窗口內持續看,不是只看一眼)",
+run_case("ADR-154/155: 指定時刻起到今天收盤前,條件一成立就下單 (移除有效窗口設定)",
          _timed_entry_keeps_watching_154)
 
 

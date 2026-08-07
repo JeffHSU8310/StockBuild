@@ -31,6 +31,8 @@ from core import order_rules as _order_rules
 from core import futures_session as _fs
 # 【ADR-147】定時下單的「五檔第幾檔」界線與手動取價共用同一份定義。
 from core import quote_book as _qb
+# 【ADR-155】定時下單的「今天收盤前」要用同一份收盤時刻常數 (不可以另寫一份)
+from core import market_session as _msess
 
 
 class TransientEnvError(Exception):
@@ -833,7 +835,6 @@ def new_strategy():
         # 同樣**預設關閉** —— 會下單的功能不可以預設打開。
         'timed_entry': False,
         'timed_entry_time': '',       # 'HH:MM' 或 'HH:MM:SS'
-        'timed_entry_window_min': TIMED_ENTRY_DEFAULT_WINDOW_MIN,
         'timed_book_level': 1,        # 用五檔的第幾檔當基準價 (1=最佳檔)
         'max_trades_per_day': 3,      # 每日最多進場次數
         # 【ADR-150】回測要不要照上面這幾項風控跑 (每日進場上限/冷卻/熔斷)。
@@ -1147,13 +1148,6 @@ def validate_strategy(s):
             return False, "五檔基準檔數必須是 1~5 的整數"
         if not (1 <= _lv <= _qb.MAX_LEVELS):
             return False, f"五檔基準檔數只能是 1~{_qb.MAX_LEVELS} (目前 {_lv})"
-        try:
-            _wm = int(s.get('timed_entry_window_min', TIMED_ENTRY_DEFAULT_WINDOW_MIN))
-        except (TypeError, ValueError):
-            return False, "有效窗口必須是正整數 (分鐘)"
-        if not (1 <= _wm <= TIMED_ENTRY_MAX_WINDOW_MIN):
-            return False, (f"有效窗口只能是 1~{TIMED_ENTRY_MAX_WINDOW_MIN} 分鐘 "
-                           f"(目前 {_wm})")
     for c in list(s.get('entry', [])) + list(s.get('exit_signals', [])):
         if c.get('type') not in CONDITIONS:
             return False, f"未知的條件類型: {c.get('type')}"
@@ -1450,8 +1444,19 @@ def check_realtime_entry(strategy, runtime, df_closed, live_price, now_hhmmss=No
 # 定時下單改成掛在即時通道上,用**時鐘**而不是 K 棒時間戳判斷,所以任何
 # 分鐘數都成立,也不需要把週期改成 1分K 去遷就它。
 
-TIMED_ENTRY_DEFAULT_WINDOW_MIN = 5
-TIMED_ENTRY_MAX_WINDOW_MIN = 60
+# 【ADR-155】原本有一個「有效窗口(分)」設定,已經**移除**。
+#
+# 它當初的設計動機是「時間到了但那一秒沒抓到報價怎麼辦」—— 一個**取價**的
+# 寬限期。ADR-154 為了讓「指定時刻之後才成立也要下單」而沿用同一個數字去限制
+# 「等條件等多久」,等於讓一個設定同時管兩件不相干的事。使用者當場指出這個
+# 混淆並要求砍掉:
+#
+#   「我認為的 5 分鐘,是抓報價如果有問題,5 分鐘內沒有正常就不下單。
+#     但是,如果是照你描述的,這個 5 分鐘內是策略條件沒有成立,今天就不下單。
+#     如果是這樣,就不需要這個 5 分鐘設定,就移除掉。」
+#
+# 現在的語意只有一句話:**指定時刻起,到今天收盤前,條件一成立就下單**
+# (一天最多一次)。取價失敗也一樣 —— 繼續看到收盤,不必另外設寬限期。
 
 
 def timed_entry_enabled(strategy):
@@ -1464,20 +1469,24 @@ def timed_entry_time_of(strategy):
     return _normalize_time((strategy or {}).get('timed_entry_time', ''))
 
 
-def timed_window_min_of(strategy):
-    """有效窗口幾分鐘。收進 1~60。
+def timed_deadline_minute_of(strategy):
+    """定時下單「今天」的截止分鐘數(當日 00:00 起算)。
 
-    為什麼一定要有窗口:即時通道的節拍是秒級以上(鐵則 5 的節流),不可能
-    剛好命中 12:01:00 那一秒,所以觸發條件必須是「已經到了而且還沒過太久」。
-    沒有上界的話,中午 12:40 才把 App 打開會立刻補送一張 12:01 的單 ——
-    那個決策的價格前提早就不存在了。
+    【ADR-155】使用者:「只要在今天收盤前,符合條件,就會下單。」
+    所以截止點是**這個交易種類的收盤時刻**,不是一個自訂的分鐘數。
+    時刻常數一律來自 `core/market_session`(那是單一真相來源,鐵則見 P-xx
+    與 ARCHITECTURE),這裡不可以另寫一份。
+
+    期貨開夜盤時,夜盤跨過午夜 —— 而定時下單的「今天」從 ADR-147 起就是
+    **日曆日**(`timed_done_day` 存的是 'YYYY-MM-DD')。與其在這裡發明一套
+    跨日規則跟它打架,不如誠實地讓截止點等於自然日結束,並在這裡寫明。
     """
-    try:
-        n = int((strategy or {}).get('timed_entry_window_min',
-                                     TIMED_ENTRY_DEFAULT_WINDOW_MIN))
-    except (TypeError, ValueError):
-        return TIMED_ENTRY_DEFAULT_WINDOW_MIN
-    return max(1, min(TIMED_ENTRY_MAX_WINDOW_MIN, n))
+    tt = trade_type_of(strategy)
+    if tt == '期貨':
+        if include_night_of(strategy):
+            return 24 * 60 - 1
+        return _msess.FUT_DAY_CLOSE_MIN
+    return _msess.STOCK_CLOSE_MIN
 
 
 def timed_book_level_of(strategy):
@@ -1493,13 +1502,17 @@ def should_fire_timed(strategy, runtime, now_dt):
     要送也要能寫進日誌。
 
     `runtime['timed_done_day']` 記「今天這檔已經處理完了」—— 送出去算處理完,
-    過了窗口沒送到也算處理完。兩者都要記,否則過期之後每一個 tick 都會再算
+    收盤了還沒送到也算處理完。兩者都要記,否則收盤之後每一個 tick 都會再算
     一次、再記一次日誌,一天洗幾千行。
 
-    【ADR-154】**「條件不成立」不算處理完**。指定時刻的語意是「從這裡開始看」
-    不是「只看這一眼」——使用者原話:「在設定的時間之後有符合策略條件,
-    還是要下單。」所以窗口內每一個 tick(回測是每一根 K 棒)都會再回來問一次,
-    呼叫端只有在**真的送出去**或**窗口過了**才可以 `mark_timed_done()`。
+    【ADR-154/155】**「條件不成立」不算處理完**。使用者原話:
+
+        「到達指定時刻,但當下進場條件不成立,不會下單。但是,只要在今天
+          收盤前,符合條件,就會下單。我要的就這麼簡單。」
+
+    所以指定時刻是**起點**,截止點是**今天收盤**(`timed_deadline_minute_of()`)。
+    起點與收盤之間的每一個 tick(回測是每一根 K 棒)都會再回來問一次,
+    呼叫端只有在**真的送出去**或**收盤了**才可以 `mark_timed_done()`。
     """
     if not timed_entry_enabled(strategy):
         return False, "沒有啟用定時下單"
@@ -1514,15 +1527,22 @@ def should_fire_timed(strategy, runtime, now_dt):
     elapsed = (now_dt - target).total_seconds()
     if elapsed < 0:
         return False, f"還沒到指定時刻 {t} (還有 {-elapsed:.0f} 秒)"
-    win = timed_window_min_of(strategy) * 60
-    if elapsed > win:
-        return False, (f"已經超過 {t} 起算的 {timed_window_min_of(strategy)} 分鐘窗口 "
-                       f"({elapsed / 60:.1f} 分),今天不再送")
-    return True, f"到達指定時刻 {t}"
+    if _minute_of_day(now_dt) > timed_deadline_minute_of(strategy):
+        return False, f"今天已經收盤 ({t} 起到收盤,進場條件都沒有成立)"
+    return True, f"{t} 起、今天收盤前"
 
 
-def timed_window_expired(strategy, runtime, now_dt):
-    """窗口過了但今天還沒處理過 → True。呼叫端據此記一次日誌並收尾。"""
+def _minute_of_day(dt):
+    return dt.hour * 60 + dt.minute
+
+
+def timed_day_over(strategy, runtime, now_dt):
+    """今天已經收盤、但這檔的定時單還沒處理過 → True。
+    呼叫端據此記一次日誌並收尾。
+
+    【ADR-155】取代原本的 `timed_window_expired()`(自訂分鐘數的窗口)。
+    「還沒到指定時刻」不算 —— 早上 09:00 就宣告「今天沒送成」顯然是錯的。
+    """
     if not timed_entry_enabled(strategy) or not timed_entry_time_of(strategy):
         return False
     if str((runtime or {}).get('timed_done_day', '')) == now_dt.strftime('%Y-%m-%d'):
@@ -1530,11 +1550,13 @@ def timed_window_expired(strategy, runtime, now_dt):
     t = timed_entry_time_of(strategy)
     hh, mm, ss = (int(x) for x in t.split(':'))
     target = now_dt.replace(hour=hh, minute=mm, second=ss, microsecond=0)
-    return (now_dt - target).total_seconds() > timed_window_min_of(strategy) * 60
+    if (now_dt - target).total_seconds() < 0:
+        return False
+    return _minute_of_day(now_dt) > timed_deadline_minute_of(strategy)
 
 
 def mark_timed_done(runtime, now_dt):
-    """把今天標成處理完 (送出去了,或窗口過了)。"""
+    """把今天標成處理完 (送出去了,或收盤了)。"""
     if runtime is not None:
         runtime['timed_done_day'] = now_dt.strftime('%Y-%m-%d')
 
