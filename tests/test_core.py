@@ -8970,16 +8970,67 @@ class TestTimedEntryADR147(unittest.TestCase):
         self.assertTrue(strategy_engine.should_fire_timed(s, rt, self._at(12, 1, 0))[0])
         self.assertTrue(strategy_engine.should_fire_timed(s, rt, self._at(12, 3, 30))[0])
 
-    def test_window_expires(self):
-        """窗口是刻意的:中午 12:40 才開 App 不可以立刻補送一張 12:01 的單,
-        那個決策的價格前提早就不存在了。"""
-        s, rt = self._mk(timed_entry_window_min=5), strategy_engine.new_runtime()
-        self.assertTrue(strategy_engine.should_fire_timed(s, rt, self._at(12, 5, 59))[0])
-        ok, why = strategy_engine.should_fire_timed(s, rt, self._at(12, 6, 1))
+    def test_watches_until_the_close_not_a_fixed_window(self):
+        """【ADR-155】截止點是**今天收盤**,不是一個自訂的分鐘數。
+
+        使用者原話:「只要在今天收盤前,符合條件,就會下單。我要的就這麼簡單。」
+        原本的「有效窗口(分)」已經移除 —— 它當初管的是「抓不到報價的寬限期」,
+        被 ADR-154 拿去管「等條件等多久」,一個設定管兩件不相干的事。
+        """
+        s, rt = self._mk(), strategy_engine.new_runtime()
+        # 12:01 起,一路到 13:30 收盤都還要繼續問
+        for hh, mm in ((12, 6), (12, 40), (13, 0), (13, 30)):
+            self.assertTrue(strategy_engine.should_fire_timed(s, rt, self._at(hh, mm))[0],
+                            f"{hh}:{mm:02d} 還沒收盤,應該繼續看")
+            self.assertFalse(strategy_engine.timed_day_over(s, rt, self._at(hh, mm)))
+        # 13:30 之後收盤了 → 不再送,而且要收得了尾
+        ok, why = strategy_engine.should_fire_timed(s, rt, self._at(13, 31))
         self.assertFalse(ok)
-        self.assertIn('窗口', why)
-        self.assertTrue(strategy_engine.timed_window_expired(s, rt, self._at(12, 6, 1)))
-        self.assertFalse(strategy_engine.timed_window_expired(s, rt, self._at(12, 3, 0)))
+        self.assertIn('收盤', why)
+        self.assertTrue(strategy_engine.timed_day_over(s, rt, self._at(13, 31)))
+
+    def test_day_over_never_fires_before_the_specified_time(self):
+        """反向對照:還沒到指定時刻就宣告「今天沒送成」是錯的。
+
+        要真的走到這道防線,指定時刻本身必須落在收盤**之後**(使用者把
+        零股設成 15:00 這種設定錯誤)—— 否則「現在已經過收盤」與「現在已經
+        過指定時刻」兩個條件同時成立,防線形同虛設。第一版的案例用 09:00,
+        分鐘數根本沒超過收盤,突變測試當場證明那條斷言什麼都沒守到。
+        """
+        s = self._mk(timed_entry_time='15:00')       # 零股 13:30 就收盤了
+        rt = strategy_engine.new_runtime()
+        self.assertFalse(strategy_engine.timed_day_over(s, rt, self._at(14, 0)),
+                         '還沒到 15:00,不可以宣告「今天沒送成」')
+        self.assertTrue(strategy_engine.timed_day_over(s, rt, self._at(15, 1)),
+                        '過了指定時刻又已經收盤 → 這一天確實沒機會了,要收尾')
+        # 一般設定 (指定時刻在盤中) 也不可以提早宣告
+        s2 = self._mk()
+        self.assertFalse(strategy_engine.timed_day_over(
+            s2, strategy_engine.new_runtime(), self._at(9, 0)))
+
+    def test_deadline_follows_the_trade_type(self):
+        """收盤時刻要跟著交易種類走,而且用 market_session 的常數 (單一出處)。"""
+        self.assertEqual(strategy_engine.timed_deadline_minute_of(self._mk()),
+                         market_session.STOCK_CLOSE_MIN)
+        self.assertEqual(
+            strategy_engine.timed_deadline_minute_of(self._mk(trade_type='股票')),
+            market_session.STOCK_CLOSE_MIN)
+        self.assertEqual(
+            strategy_engine.timed_deadline_minute_of(
+                self._mk(trade_type='期貨', futures_session='day')),
+            market_session.FUT_DAY_CLOSE_MIN)
+        # 期貨開夜盤跨午夜,而「今天」是日曆日 —— 以自然日結束為界
+        self.assertGreater(
+            strategy_engine.timed_deadline_minute_of(
+                self._mk(trade_type='期貨', futures_session='all')),
+            market_session.FUT_DAY_CLOSE_MIN)
+
+    def test_futures_day_session_stops_at_1345(self):
+        """期貨(不含夜盤)13:45 收盤 —— 不可以沿用股票的 13:30。"""
+        s = self._mk(trade_type='期貨', futures_session='day', timed_entry_time='12:01')
+        rt = strategy_engine.new_runtime()
+        self.assertTrue(strategy_engine.should_fire_timed(s, rt, self._at(13, 40))[0])
+        self.assertFalse(strategy_engine.should_fire_timed(s, rt, self._at(13, 46))[0])
 
     def test_only_once_per_day(self):
         s, rt = self._mk(), strategy_engine.new_runtime()
@@ -8989,10 +9040,10 @@ class TestTimedEntryADR147(unittest.TestCase):
         # 隔天要重新來過 (反向對照:不可以一次就永遠關掉)
         nxt = datetime.datetime(2026, 8, 7, 12, 1, 5)
         self.assertTrue(strategy_engine.should_fire_timed(s, rt, nxt)[0])
-        # 過期也算處理完 —— 否則過期後每個 tick 都會重算並重記一次日誌
+        # 收盤了也算處理完 —— 否則收盤後每個 tick 都會重算並重記一次日誌
         rt2 = strategy_engine.new_runtime()
-        strategy_engine.mark_timed_done(rt2, self._at(12, 9, 0))
-        self.assertFalse(strategy_engine.timed_window_expired(s, rt2, self._at(12, 9, 1)))
+        strategy_engine.mark_timed_done(rt2, self._at(13, 31))
+        self.assertFalse(strategy_engine.timed_day_over(s, rt2, self._at(13, 31)))
 
     def test_disabled_by_default(self):
         """會下單的功能不可以預設打開。"""
@@ -9048,22 +9099,30 @@ class TestTimedEntryADR147(unittest.TestCase):
         for kw, frag in ((dict(timed_entry_time=''), '指定時刻'),
                          (dict(timed_book_level=0), '1~5'),
                          (dict(timed_book_level=6), '1~5'),
-                         (dict(timed_entry_window_min=0), '窗口'),
-                         (dict(timed_entry_window_min=999), '窗口')):
+                         (dict(timed_book_level='abc'), '整數')):
             ok, why = strategy_engine.validate_strategy(self._mk(**kw))
             self.assertFalse(ok, f"{kw} 應該被擋下")
             self.assertIn(frag, why)
 
-    def test_level_and_window_are_clamped_at_read_time(self):
+    def test_level_is_clamped_at_read_time(self):
         """舊策略檔沒有這些欄位、或被手動改壞,讀的時候要收斂而不是炸掉。"""
         self.assertEqual(strategy_engine.timed_book_level_of({}), 1)
         self.assertEqual(strategy_engine.timed_book_level_of({'timed_book_level': 99}),
                          quote_book.MAX_LEVELS)
-        self.assertEqual(strategy_engine.timed_window_min_of({}),
-                         strategy_engine.TIMED_ENTRY_DEFAULT_WINDOW_MIN)
-        self.assertEqual(strategy_engine.timed_window_min_of({'timed_entry_window_min': 0}), 1)
-        self.assertEqual(strategy_engine.timed_window_min_of({'timed_entry_window_min': 9999}),
-                         strategy_engine.TIMED_ENTRY_MAX_WINDOW_MIN)
+
+    def test_window_setting_is_gone(self):
+        """【ADR-155】使用者要求移除「有效窗口(分)」。留著一個沒有作用的欄位
+        比刪掉更糟 —— 下一個人會以為它還管用,而且它正是這次混淆的來源。"""
+        self.assertNotIn('timed_entry_window_min', strategy_engine.new_strategy())
+        for gone in ('timed_window_min_of', 'timed_window_expired',
+                     'TIMED_ENTRY_DEFAULT_WINDOW_MIN', 'TIMED_ENTRY_MAX_WINDOW_MIN'):
+            self.assertFalse(hasattr(strategy_engine, gone),
+                             f"{gone} 應該已經移除")
+        # 舊策略檔留著這個 key 也不可以影響行為
+        s = self._mk(timed_entry_window_min=1)
+        rt = strategy_engine.new_runtime()
+        self.assertTrue(strategy_engine.should_fire_timed(s, rt, self._at(13, 0))[0],
+                        '舊欄位不可以再限制什麼時候停止看')
 
     def test_scale_in_limit_still_applies(self):
         """分批上限 (ADR-144) 對定時下單一樣有效 —— 不可以因為換一條路進場
@@ -9262,7 +9321,7 @@ class TestEntryTimeGate(unittest.TestCase):
         """反向對照:ADR-147 的「定時下單」有自己的時刻邏輯,
         不可以被這道閘門連坐擋掉(它用的是 timed_entry_time,不是 entry_* 欄位)。"""
         s = self._s(timed_entry=True, timed_entry_time='12:01',
-                    timed_entry_window_min=5)
+)
         ok, _ = strategy_engine.entry_time_gate(s, '13:00:00')
         self.assertTrue(ok, '只設定時下單時,進場時間閘門不該擋任何東西')
 
@@ -9495,8 +9554,7 @@ class TestBacktestTimedEntryAndSession(unittest.TestCase):
     def test_entries_land_on_the_specified_time(self):
         """使用者原話:「進場時間跟我設定的不一樣」。設 10:30 就要在 10:30。"""
         r = backtest.run_backtest(
-            self._s(timed_entry=True, timed_entry_time='10:30',
-                    timed_entry_window_min=10), self._df())
+            self._s(timed_entry=True, timed_entry_time='10:30'), self._df())
         self.assertTrue(r['trades'])
         for t in r['trades']:
             self.assertEqual(str(t['entry_ts'])[11:16], '10:30',
@@ -9505,8 +9563,7 @@ class TestBacktestTimedEntryAndSession(unittest.TestCase):
     def test_one_timed_entry_per_day(self):
         days = 3
         r = backtest.run_backtest(
-            self._s(timed_entry=True, timed_entry_time='10:30',
-                    timed_entry_window_min=10), self._df(days=days))
+            self._s(timed_entry=True, timed_entry_time='10:30'), self._df(days=days))
         self.assertEqual(len(r['trades']), days, '每天一筆定時單')
 
     def test_timed_entry_is_the_only_entry_trigger(self):
@@ -9515,8 +9572,7 @@ class TestBacktestTimedEntryAndSession(unittest.TestCase):
         舊行為是「多一個觸發時機」,配上每日上限 1 的結果是:條件 09:03 成立
         → K 棒路徑先進場 → 額度用完 → 10:30 的定時單永遠送不出去,
         **定時下單實質失效**。"""
-        s = self._s(timed_entry=True, timed_entry_time='10:30',
-                    timed_entry_window_min=10)
+        s = self._s(timed_entry=True, timed_entry_time='10:30')
         rt = strategy_engine.new_runtime()
         df = self._df(days=1)
         intents = strategy_engine.evaluate_strategy(
@@ -9619,7 +9675,7 @@ class TestTimedEntryKeepsWatching(unittest.TestCase):
                   'stop_loss_pct': 0.0, 'take_profit_pct': 0.0,
                   'buy_and_hold': True, 'bnh_mode': 'accumulate', 'max_entries': 5,
                   'session_gate': True, 'timed_entry': True,
-                  'timed_entry_time': '10:30', 'timed_entry_window_min': 10,
+                  'timed_entry_time': '10:30',
                   'entry': [{'type': 'day_drop_over',
                              'params': {'value': 0.5, 'base': '昨收'}}],
                   'exit_signals': []})
@@ -9640,7 +9696,7 @@ class TestTimedEntryKeepsWatching(unittest.TestCase):
         self.assertTrue(ts, '條件在窗口內成立了卻整天沒進場 —— 一次定生死的舊行為')
         hhmm = str(ts[0]['entry_ts'])[11:16]
         self.assertGreater(hhmm, '10:30', '不該早於指定時刻')
-        self.assertLessEqual(hhmm, '10:40', '不該晚於 10 分鐘窗口')
+        self.assertLessEqual(hhmm, '13:30', '不該晚於今天收盤')
 
     def test_still_enters_at_the_specified_time_when_already_met(self):
         """正向對照:到點就已經成立的,照舊在**指定時刻那一刻**進場,
@@ -9670,11 +9726,31 @@ class TestTimedEntryKeepsWatching(unittest.TestCase):
         self.assertEqual(len(self._day2(r)), 1,
                          '送出之後沒有 mark_timed_done,窗口內每一根都又送了一次')
 
-    def test_gives_up_when_the_window_passes(self):
-        """反向對照:窗口是有邊界的。10:45 才成立(超過 10 分窗口)就是今天
-        不送 —— 否則「指定時刻」形同虛設,退化成一般 K 棒進場。"""
+    def test_enters_even_much_later_in_the_day(self):
+        """【ADR-155】截止點是**今天收盤**,不是一個自訂的分鐘數。
+
+        使用者原話:「只要在今天收盤前,符合條件,就會下單。我要的就這麼簡單。」
+        10:45 才成立(離 10:30 有 15 分鐘)照樣要送。
+        """
         r = backtest.run_backtest(self._s(), self._df(drop_from_min=105))
-        self.assertFalse(self._day2(r), '超過窗口還進場 = 窗口沒有生效')
+        ts = self._day2(r)
+        self.assertTrue(ts, '10:45 才成立就不送 = 又退回「只看一小段」')
+        self.assertGreater(str(ts[0]['entry_ts'])[11:16], '10:30')
+
+    def test_enters_right_up_to_the_close(self):
+        """邊界:13:29 才成立(收盤前一分鐘)仍然要送。"""
+        r = backtest.run_backtest(self._s(), self._df(drop_from_min=269))
+        self.assertTrue(self._day2(r), '收盤前才成立就不送 = 截止點抓錯')
+
+    def test_does_not_enter_before_the_specified_time(self):
+        """反向對照:指定時刻**之前**成立不算 —— 那才是「指定時刻」的意義。
+
+        條件從 09:00 就成立,但第一筆進場不可以早於 10:30。
+        """
+        r = backtest.run_backtest(self._s(), self._df(drop_from_min=0))
+        ts = self._day2(r)
+        self.assertTrue(ts)
+        self.assertEqual(str(ts[0]['entry_ts'])[11:16], '10:30')
 
     def test_conditions_never_met_no_entry(self):
         """反向對照:整天都不成立就是不下單(使用者第 1 點的原意)。"""
@@ -9686,7 +9762,7 @@ class TestTimedEntryKeepsWatching(unittest.TestCase):
         使用者會以為機會已經沒了。"""
         r = backtest.run_backtest(self._s(), self._df(drop_from_min=93))
         txt = " ".join(str(l.get('_raw') or l.get('text', '')) for l in r['log'])
-        self.assertIn('窗口內下一根再看', txt)
+        self.assertIn('今天收盤前會繼續看', txt)
 
     def test_should_fire_timed_stays_true_until_marked(self):
         """單元層級:沒有 mark_timed_done 之前,窗口內每一次問都要回 True。
@@ -9696,10 +9772,10 @@ class TestTimedEntryKeepsWatching(unittest.TestCase):
         """
         s = self._s()
         rt = strategy_engine.new_runtime()
-        for mm in (30, 33, 36, 39):
+        for hh, mm in ((10, 30), (10, 33), (11, 0), (13, 29)):
             ok, why = strategy_engine.should_fire_timed(
-                s, rt, datetime.datetime(2026, 1, 6, 10, mm, 0))
-            self.assertTrue(ok, f"10:{mm} 應該還要再問一次,卻回 {why}")
+                s, rt, datetime.datetime(2026, 1, 6, hh, mm, 0))
+            self.assertTrue(ok, f"{hh}:{mm:02d} 應該還要再問一次,卻回 {why}")
         strategy_engine.mark_timed_done(rt, datetime.datetime(2026, 1, 6, 10, 39, 0))
         ok, _ = strategy_engine.should_fire_timed(
             s, rt, datetime.datetime(2026, 1, 6, 10, 40, 0))
@@ -9955,7 +10031,7 @@ class TestWalkFillAndTimedNow(unittest.TestCase):
         s = strategy_engine.new_strategy()
         s.update({'name': 'T', 'symbol': '0050', 'trade_type': '零股', 'qty': 501,
                   'timed_entry': True, 'timed_entry_time': '10:30',
-                  'timed_entry_window_min': 10, 'timed_book_level': 3,
+                  'timed_book_level': 3,
                   'entry': [{'type': 'day_drop_over',
                              'params': {'value': 0.2, 'base': '昨收', 'use': '盤中觸價'}}]})
         s.update(kw)

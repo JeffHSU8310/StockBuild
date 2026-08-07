@@ -9503,7 +9503,7 @@ class StockTradingAppPro(tk.Tk):
                     # 進場,ADR-147 的「定時下單」才是對的工具 —— 直接指路,
                     # 不要讓使用者以為是 bug。
                     _hint = (" —— 即時進場的節拍是秒級,無法保證命中某一秒;"
-                             "要在指定時刻進場請改用「定時下單」(有明確的窗口設定)。")
+                             "要在指定時刻進場請改用「定時下單」(指定時刻起到收盤前持續判斷)。")
                 self._qt_odd_log_once(
                     s, 'live_time_gate',
                     f"【即時進場-時間窗】策略「{s.get('name')}」{why_time}{_hint}"
@@ -9813,16 +9813,17 @@ class StockTradingAppPro(tk.Tk):
             if not s.get('enabled') or not strategy_engine.timed_entry_enabled(s):
                 continue
             rt = self._qt_runtime(s['id'])
+            _day = now_dt.strftime('%Y-%m-%d')     # 日誌去重綁日期 (ADR-155)
             try:
-                # 窗口過了還沒送到 → 講一次話再收尾,不要每個 tick 都算一次
-                if strategy_engine.timed_window_expired(s, rt, now_dt):
+                # 收盤了還沒送到 → 講一次話再收尾,不要每個 tick 都算一次
+                if strategy_engine.timed_day_over(s, rt, now_dt):
                     strategy_engine.mark_timed_done(rt, now_dt)
                     self.safe_after(0, self.log_message,
                                     f"【定時下單】策略「{s.get('name')}」"
                                     f"{strategy_engine.timed_entry_time_of(s)} 的單今天沒送成 —— "
-                                    f"已超過 {strategy_engine.timed_window_min_of(s)} 分鐘窗口。"
-                                    "常見原因:整段窗口內進場條件都沒成立,"
-                                    "或取不到五檔 (非交易時段/沒掛單/訂閱失敗)。")
+                                    "今天已經收盤。常見原因:指定時刻起到收盤,"
+                                    "進場條件都沒有成立,或一直取不到五檔 "
+                                    "(非交易時段/沒掛單/訂閱失敗)。")
                     self._qt_save_state()
                     continue
                 ok_fire, why_fire = strategy_engine.should_fire_timed(s, rt, now_dt)
@@ -9850,17 +9851,17 @@ class StockTradingAppPro(tk.Tk):
                     # 到點了但條件不成立 —— 使用者要的正是「不符合就不下單」,
                     # 但**不可以靜默**:一天一次的機會沒動作,要講得出原因。
                     #
-                    # 【ADR-154】這裡刻意**不** mark_timed_done:指定時刻是
-                    # 「從這裡開始看」不是「只看這一眼」,使用者原話「在設定的
-                    # 時間之後有符合策略條件,還是要下單」。窗口內每 2 秒再問
-                    # 一次,窗口過了才由上面的 timed_window_expired 收尾。
+                    # 【ADR-154/155】這裡刻意**不** mark_timed_done:指定時刻是
+                    # **起點**、截止點是**今天收盤**,使用者原話「只要在今天
+                    # 收盤前,符合條件,就會下單」。收盤前每 2 秒再問一次,
+                    # 收盤了才由上面的 timed_day_over 收尾。
                     self._qt_timed_log_once(
                         s, rt,
                         f"**當下**進場條件不成立 (A 現價 "
                         f"{'--' if _a_now is None else f'{_a_now:g}'}) —— "
-                        f"{strategy_engine.timed_entry_time_of(s)} 起算的 "
-                        f"{strategy_engine.timed_window_min_of(s)} 分鐘內會繼續看,"
-                        f"條件一成立就送")
+                        f"{strategy_engine.timed_entry_time_of(s)} 起到"
+                        f"**今天收盤前**會繼續看,條件一成立就送",
+                        key='cond', day=_day)
                     continue
 
                 sym = str(s.get('symbol', '')).upper()
@@ -9868,17 +9869,19 @@ class StockTradingAppPro(tk.Tk):
                 book = self._qt_get_book(sym, odd)
                 fresh, why_fresh = quote_book.is_fresh(book, time.time())
                 if not fresh:
-                    # **不** mark_timed_done:窗口內下一個 tick 還要再試。
+                    # **不** mark_timed_done:收盤前下一個 tick 還要再試。
                     # 這裡刻意不退回 K 棒收盤價 —— 零股的 K 棒是整股的價
                     # (ADR-146 記過的既有近似),拿它去下零股限價單就是錯價,
                     # 而定時下單只有一次機會,沒有下一根 K 棒可以修正。
-                    self._qt_timed_log_once(s, rt, f"取不到可用的五檔:{why_fresh}")
+                    self._qt_timed_log_once(s, rt, f"取不到可用的五檔:{why_fresh}",
+                                            key='no_book', day=_day)
                     continue
                 level = strategy_engine.timed_book_level_of(s)
                 px, why_px = quote_book.pick_price(book, intent['action'], level)
                 if px is None:
                     self._qt_timed_log_once(s, rt, f"五檔取價失敗:{why_px} | "
-                                                   f"{quote_book.describe(book)}")
+                                                   f"{quote_book.describe(book)}",
+                                            key='no_price', day=_day)
                     continue
 
                 ok_risk, why_risk = strategy_engine.risk_check(s, rt, intent, time.time())
@@ -9891,7 +9894,8 @@ class StockTradingAppPro(tk.Tk):
 
                 contract, asset_type = self._qt_resolve(s)
                 if contract is None:
-                    self._qt_timed_log_once(s, rt, "合約解析失敗")
+                    self._qt_timed_log_once(s, rt, "合約解析失敗",
+                                            key='no_contract', day=_day)
                     continue
                 # 【ADR-153】掛價 ≠ 成交價。「賣3檔」的意思是「我願意付到賣三」,
                 # 送出去之後是從賣一往上吃 —— 使用者實測:掛 103.05,但賣一
@@ -9912,8 +9916,9 @@ class StockTradingAppPro(tk.Tk):
                     sent, msg = self._place_strategy_order(s, intent, contract, asset_type,
                                                            exec_price=px)
                     if not sent:
-                        # 送單失敗不收尾:窗口內還可以再試 (與即時進場同樣的取捨)
-                        self._qt_timed_log_once(s, rt, f"送單失敗:{msg}")
+                        # 送單失敗不收尾:收盤前還可以再試 (與即時進場同樣的取捨)
+                        self._qt_timed_log_once(s, rt, f"送單失敗:{msg}",
+                                                key='send_fail', day=_day)
                         continue
                     # 【ADR-153】送給券商的**限價**仍是掛價 px (那是「我最多願意
                     # 付到這裡」),但**記帳**要用預估成交均價 exec_px ——
@@ -9943,18 +9948,27 @@ class StockTradingAppPro(tk.Tk):
                 self.safe_after(0, self.log_message,
                                 f"【自動交易-定時下單異常】策略「{s.get('name')}」: {type(e).__name__}: {e}")
 
-    def _qt_timed_log_once(self, s, rt, msg):
-        """同一個原因在同一個窗口內只講一次。
+    def _qt_timed_log_once(self, s, rt, msg, key=None, day=None):
+        """同一個原因在同一天內只講一次。
 
-        這條路每 2 秒重試一次,照實記的話「取不到五檔」會在 5 分鐘內洗出
-        150 行,把真正重要的訊息沖走 —— 但完全不講又會變成靜默失效
-        (使用者以為 12:01 買到了,其實從頭到尾沒送)。所以「換了原因才再講」。
+        這條路每 2 秒重試一次,照實記的話「取不到五檔」會把真正重要的訊息
+        沖走 —— 但完全不講又會變成靜默失效(使用者以為 12:01 買到了,
+        其實從頭到尾沒送)。所以「換了原因才再講」。
+
+        【ADR-155】去重要用 `key`(穩定的**原因**)而不是整句訊息。訊息裡
+        含「A 現價 99.95」這種**每 2 秒都在變**的數字,拿整句去比等於沒有去重。
+        窗口還是 5 分鐘時上限 150 行,勉強看得下去;改成「指定時刻到收盤」
+        之後就是 3 小時、幾千行 —— 同一個洞,放大了 60 倍才會痛。
+
+        去重狀態綁**日期**:換日要重新講一次,否則昨天講過的原因今天就靜音了。
         """
-        if rt.get('_timed_last_msg') == msg:
+        d = day or datetime.now().strftime('%Y-%m-%d')
+        k = f"{d}|{key if key is not None else msg}"
+        if rt.get('_timed_last_key') == k:
             return
-        rt['_timed_last_msg'] = msg
+        rt['_timed_last_key'] = k
         self.safe_after(0, self.log_message,
-                        f"【定時下單】策略「{s.get('name')}」還沒送出 — {msg} (窗口內會再試)")
+                        f"【定時下單】策略「{s.get('name')}」還沒送出 — {msg} (今天收盤前會再試)")
 
     def _qt_check_realtime_futures_stops(self, live_price_by_symbol):
         """【新ADR】期貨標的用內建停損%/停利%/停損點數(元)/停利點數(元) 時,
@@ -11659,19 +11673,18 @@ class StockTradingAppPro(tk.Tk):
         _lbl(top, "指定時刻").grid(row=18, column=0, sticky='w', pady=(2, 0))
         e_timed_t = _ent(top, s.get('timed_entry_time', ''), 8)
         e_timed_t.grid(row=18, column=1, padx=4, pady=(2, 0))
-        _lbl(top, "持續看(分)").grid(row=18, column=2, sticky='w', padx=(10, 0), pady=(2, 0))
-        e_timed_w = _ent(top, s.get('timed_entry_window_min',
-                                    strategy_engine.TIMED_ENTRY_DEFAULT_WINDOW_MIN), 5)
-        e_timed_w.grid(row=18, column=3, padx=4, pady=(2, 0))
-        _lbl(top, "五檔基準").grid(row=18, column=4, sticky='w', padx=(10, 0), pady=(2, 0))
+        # 【ADR-155】原本 column 2/3 是「有效窗口(分)」,已移除 —— 那個數字
+        # 當初管的是「抓不到報價的寬限期」,被 ADR-154 拿去管「等條件等多久」,
+        # 一個設定管兩件事。現在的規則不需要任何數字:指定時刻起到今天收盤。
+        _lbl(top, "五檔基準").grid(row=18, column=2, sticky='w', padx=(10, 0), pady=(2, 0))
         cb_timed_lv = ttk.Combobox(top, values=[str(i) for i in range(1, quote_book.MAX_LEVELS + 1)],
                                    width=4, state='readonly', style="BlackText.TCombobox")
         cb_timed_lv.set(str(strategy_engine.timed_book_level_of(s)))
-        cb_timed_lv.grid(row=18, column=5, padx=4, pady=(2, 0))
-        tk.Label(top, text="格式 HH:MM(例 12:01)。指定時刻是「從這裡開始看」:到點時條件不成立不會放棄,"
-                           "在「持續看」的分鐘數內每 2 秒再看一次,條件一成立就送(每天最多送一次)。"
+        cb_timed_lv.grid(row=18, column=3, padx=4, pady=(2, 0))
+        tk.Label(top, text="格式 HH:MM(例 12:01)。指定時刻是**起點**:到點時條件不成立不會放棄,"
+                           "之後每 2 秒再看一次,**今天收盤前**條件一成立就送(每天最多送一次)。"
                            "五檔基準=買進吃「賣N」、賣出吃「買N」,數字越大越積極;再往上疊「讓價檔數」。"
-                           "取不到五檔就不送單(絕不用整股價頂替)。",
+                           "取不到五檔就不送單(絕不用整股價頂替),收盤前會一直重試。",
                  bg="#1A2026", fg="#8A99AD", font=('微軟正黑體', 8), justify='left',
                  wraplength=680).grid(row=19, column=0, columnspan=6, sticky='w', pady=(0, 2))
         # 【ADR-150】回測要不要照風控跑。放 row 20:row 0~19 都已經有人用了,
@@ -11952,9 +11965,9 @@ class StockTradingAppPro(tk.Tk):
             # 12:01 那一刻才變成「什麼都沒發生」。
             s['timed_entry'] = bool(var_timed.get())
             s['timed_entry_time'] = e_timed_t.get().strip()
-            try: s['timed_entry_window_min'] = int(e_timed_w.get().strip())
-            except (TypeError, ValueError):
-                s['timed_entry_window_min'] = strategy_engine.TIMED_ENTRY_DEFAULT_WINDOW_MIN
+            # 【ADR-155】舊策略檔可能留著 timed_entry_window_min,直接丟掉 ——
+            # 留著會讓下一個人以為它還有作用。
+            s.pop('timed_entry_window_min', None)
             try: s['timed_book_level'] = int(cb_timed_lv.get().strip())
             except (TypeError, ValueError): s['timed_book_level'] = 1
             try: s['max_trades_per_day'] = int(e_maxd.get().strip())
