@@ -221,6 +221,9 @@ class StockTradingAppPro(tk.Tk):
         # 完全分開 (P-04:共用暫存會互相污染)。key = (代碼, 是不是零股)。
         self._qt_books = {}
         self._qt_book_subs = {}   # 目前常駐訂閱了哪些標的:{代碼: 是不是零股}
+        # 【ADR-153】定時下單策略的 A 代碼 {策略id: A代碼} —— 用來把 A 的
+        # 即時價餵給定時下單,讓它以「觸發當下」判斷條件而不是「今天曾經」。
+        self._qt_timed_a_sym = {}
         self.current_tick_normal = None    
         self.current_tick_odd = None       
         self.is_odd_lot = False
@@ -9241,7 +9244,11 @@ class StockTradingAppPro(tk.Tk):
                     # 即時那條路**絕不可以自己抓 K 線** —— 它跟即時停損共用同一個
                     # tick,阻塞會拖住停損 (P-90)。這裡順手存下來,即時路徑只做
                     # 「快取的 df + 現在的價」的純計算。
-                    if strategy_engine.realtime_entry_enabled(s):
+                    # 【ADR-153】定時下單也要這份快取。原本只有即時進場才存,
+                    # 使用者關掉即時進場時,定時下單的 df_closed 是 None →
+                    # check_timed_entry 直接回 None → **靜默不下單**。
+                    if (strategy_engine.realtime_entry_enabled(s)
+                            or strategy_engine.timed_entry_enabled(s)):
                         rt['_live_a_df'] = df
                         rt['_live_b_df'] = b_df if strategy_engine.watch_enabled(s) else df
                     if s.get('kind') == 'custom':
@@ -9372,12 +9379,19 @@ class StockTradingAppPro(tk.Tk):
                     c, _ = self._qt_resolve(s)
                     if c:
                         needed[s.get('symbol')] = c
-                if strategy_engine.realtime_entry_enabled(s):
+                # 【ADR-153】定時下單也要 A 的**當下價** —— 使用者要的是
+                # 「在指定時刻看一眼 A 符不符合」,不是「今天曾經符合過」。
+                # 這一批 snapshots 本來就要打,多帶一個代碼幾乎零成本 (鐵則5)。
+                if (strategy_engine.realtime_entry_enabled(s)
+                        or strategy_engine.timed_entry_enabled(s)):
                     try:
                         w_c, _w_a, w_sym, _w_m = self._qt_resolve_watch(s)
                         if w_c is not None and w_sym:
                             needed[w_sym] = w_c
-                            live_entry_syms[s['id']] = w_sym
+                            if strategy_engine.realtime_entry_enabled(s):
+                                live_entry_syms[s['id']] = w_sym
+                            if strategy_engine.timed_entry_enabled(s):
+                                self._qt_timed_a_sym[s['id']] = w_sym
                     except Exception:
                         pass
             
@@ -9420,6 +9434,12 @@ class StockTradingAppPro(tk.Tk):
                 # 不額外呼叫 API (鐵則5)。順序刻意在停損之後:要走的先走完,
                 # 再看要不要進場,同一個 tick 不會又出又進。
                 self._qt_check_realtime_entries(live_price_by_symbol, live_entry_syms)
+                # 【ADR-153】把定時下單策略的 A 即時價存進 runtime,
+                # 讓 _qt_check_timed_entries 用「觸發當下的價」評估條件。
+                for _sid, _asym in dict(getattr(self, '_qt_timed_a_sym', {}) or {}).items():
+                    _ap = live_price_by_symbol.get(_asym)
+                    if _ap is not None:
+                        self._qt_runtime(_sid)['_live_a_price'] = float(_ap)
                 return True
         except Exception:
             pass
@@ -9812,8 +9832,26 @@ class StockTradingAppPro(tk.Tk):
                 if s.get('session_gate', True) and not market_session.is_market_open(
                         tt, include_night=strategy_engine.include_night_of(s)):
                     continue
-                intent = strategy_engine.check_timed_entry(s, rt, rt.get('_live_a_df'))
+                # 【ADR-153】用**觸發當下**的 A 價評估條件。拿不到即時價時退回
+                # 最近一根已收盤 K 棒的收盤價 (1分K 的話落後不到一分鐘),
+                # 兩者都拿不到就讓 check_timed_entry 走既有的 K 棒判斷。
+                _a_now = rt.get('_live_a_price')
+                if _a_now is None:
+                    try:
+                        _adf = rt.get('_live_a_df')
+                        if _adf is not None and len(_adf):
+                            _a_now = float(_adf['Close'].iloc[-1])
+                    except Exception:
+                        _a_now = None
+                intent = strategy_engine.check_timed_entry(
+                    s, rt, rt.get('_live_a_df'), live_price=_a_now)
                 if intent is None:
+                    # 到點了但條件不成立 —— 使用者要的正是「不符合就不下單」,
+                    # 但**不可以靜默**:一天一次的機會沒動作,要講得出原因。
+                    self._qt_timed_log_once(
+                        s, rt,
+                        f"到達指定時刻,但**當下**進場條件不成立 (A 現價 "
+                        f"{'--' if _a_now is None else f'{_a_now:g}'}),今天不送單")
                     continue
 
                 sym = str(s.get('symbol', '')).upper()
@@ -9846,10 +9884,21 @@ class StockTradingAppPro(tk.Tk):
                 if contract is None:
                     self._qt_timed_log_once(s, rt, "合約解析失敗")
                     continue
+                # 【ADR-153】掛價 ≠ 成交價。「賣3檔」的意思是「我願意付到賣三」,
+                # 送出去之後是從賣一往上吃 —— 使用者實測:掛 103.05,但賣一
+                # 102.95 就有 13,542 股,買 501 股根本吃不到賣二。
+                # 記進帳的必須是**預估成交均價**,因為系統採樂觀成交模型
+                # (ADR-035):這個價是後續所有損益與停損停利的基準。
+                fill = quote_book.walk_fill(book, intent['action'], intent['qty'], level)
+                exec_px = float(fill['avg_price']) if fill else float(px)
+                _fill_txt = quote_book.describe_fill(fill) if fill else '(估不出成交價)'
+                _live_note = ("｜實單的**實際成交價以券商回報為準**"
+                              if s.get('mode') == '實單' else "")
                 label = (f"策略「{s.get('name')}」{intent['action']} {intent['qty']} {sym} "
-                         f"@ {px:g} [定時下單 {strategy_engine.timed_entry_time_of(s)},"
-                         f"{'賣' if intent['action'] == '買進' else '買'}{level}檔 | "
-                         f"{quote_book.describe(book)}]")
+                         f"@ {exec_px:g} [定時下單 {strategy_engine.timed_entry_time_of(s)}"
+                         f"｜掛價 {px:g} ({'賣' if intent['action'] == '買進' else '買'}{level}檔)"
+                         f"｜{_fill_txt}{_live_note}"
+                         f"｜{quote_book.describe(book)}]")
                 if s.get('mode') == '實單' and self._qt_running:
                     sent, msg = self._place_strategy_order(s, intent, contract, asset_type,
                                                            exec_price=px)
@@ -9857,19 +9906,23 @@ class StockTradingAppPro(tk.Tk):
                         # 送單失敗不收尾:窗口內還可以再試 (與即時進場同樣的取捨)
                         self._qt_timed_log_once(s, rt, f"送單失敗:{msg}")
                         continue
-                    strategy_engine.apply_fill(s, rt, intent, time.time(), exec_price=px)
+                    # 【ADR-153】送給券商的**限價**仍是掛價 px (那是「我最多願意
+                    # 付到這裡」),但**記帳**要用預估成交均價 exec_px ——
+                    # 樂觀成交模型下,這個價是後續所有損益與停損停利的基準,
+                    # 用掛價記帳等於一開始就把成本記高。
+                    strategy_engine.apply_fill(s, rt, intent, time.time(), exec_price=exec_px)
                     strategy_engine.mark_timed_done(rt, now_dt)
                     self.safe_after(0, self.log_message,
                                     f"【自動交易-實單】🔥 {label} | {intent['reason']} | {msg}")
                 else:
-                    strategy_engine.apply_fill(s, rt, intent, time.time(), exec_price=px)
+                    strategy_engine.apply_fill(s, rt, intent, time.time(), exec_price=exec_px)
                     strategy_engine.mark_timed_done(rt, now_dt)
                     acct = self._qt_paper_acct_for(s)
                     paper_account.apply_fill(
                         acct, now_dt.strftime('%Y-%m-%d %H:%M:%S'),
                         s.get('market', '台股'), sym, intent['action'], intent['kind'],
-                        intent['qty'], px, trade_type=tt)
-                    paper_account.mark_price(acct, sym, px)
+                        intent['qty'], exec_px, trade_type=tt)
+                    paper_account.mark_price(acct, sym, exec_px)
                     self._qt_save_paper()
                     self.safe_after(0, self.log_message,
                                     f"【自動交易-模擬】🧪 {label} | {intent['reason']} → 已記入模擬帳戶")

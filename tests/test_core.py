@@ -9754,6 +9754,131 @@ class TestChukuangrenDailyStatus(unittest.TestCase):
             self.assertTrue(telegram_notify.should_send(txt, 1000.0, st)[0])
 
 
+class TestWalkFillAndTimedNow(unittest.TestCase):
+    """【ADR-153】掛價 ≠ 成交價;定時下單要看「觸發當下」而不是「今天曾經」。
+
+    使用者實測(截圖原文):掛 103.05(賣三檔),但賣一 102.95 就有 13,542 股,
+    買 501 股根本吃不到賣二 —— 真實成交價是 102.95。使用者當天看到的實際
+    成交也在 102.9 附近。
+    """
+
+    def _book(self):
+        """使用者截圖裡的那一份真實五檔。"""
+        return quote_book.make(
+            [102.9, 102.85, 102.8, 102.75, 102.7], [7261, 16519, 20027, 7813, 28368],
+            [102.95, 103.0, 103.05, 103.1, 103.15], [13542, 14338, 10165, 4095, 1731],
+            ts=1000.0, symbol='0050', odd=True)
+
+    # ---------- 掛價 vs 成交價 ----------
+
+    def test_limit_price_is_not_the_fill_price(self):
+        """這是整筆的核心:賣三檔是「我願意付到這裡」,不是「我會成交在這裡」。"""
+        b = self._book()
+        limit, _ = quote_book.pick_price(b, '買進', 3)
+        fill = quote_book.walk_fill(b, '買進', 501, 3)
+        self.assertEqual(limit, 103.05)
+        self.assertEqual(fill['avg_price'], 102.95)
+        self.assertNotEqual(fill['avg_price'], limit)
+
+    def test_fill_walks_the_book_from_the_best_level(self):
+        """量吃不完就往上一檔,均價要照量加權。"""
+        b = self._book()
+        fill = quote_book.walk_fill(b, '買進', 20000, 3)
+        self.assertEqual([p for p, _ in fill['levels']], [102.95, 103.0])
+        self.assertEqual(fill['filled_qty'], 20000)
+        expect = (102.95 * 13542 + 103.0 * (20000 - 13542)) / 20000
+        self.assertAlmostEqual(fill['avg_price'], expect, places=6)
+
+    def test_sell_walks_the_bid_side(self):
+        """反向對照:賣出吃買方掛單,方向不可以接反。"""
+        fill = quote_book.walk_fill(self._book(), '賣出', 501, 3)
+        self.assertEqual(fill['avg_price'], 102.9)
+
+    def test_partial_fill_is_reported_not_hidden(self):
+        """五檔量不夠吃滿時要講明,不可以假裝全部成交。"""
+        fill = quote_book.walk_fill(self._book(), '買進', 99999, 3)
+        self.assertFalse(fill['fully_filled'])
+        self.assertLess(fill['filled_qty'], 99999)
+        self.assertIn('只夠成交', quote_book.describe_fill(fill))
+
+    def test_never_walks_past_the_chosen_level(self):
+        """使用者選第 2 檔就只吃到賣二 —— 不可以偷偷吃更貴的。"""
+        fill = quote_book.walk_fill(self._book(), '買進', 99999, 2)
+        self.assertEqual([p for p, _ in fill['levels']], [102.95, 103.0])
+
+    def test_describe_fill_shows_how_it_was_computed(self):
+        txt = quote_book.describe_fill(quote_book.walk_fill(self._book(), '買進', 501, 3))
+        self.assertIn('102.95', txt)
+        self.assertIn('501', txt)
+
+    def test_empty_book_returns_none(self):
+        self.assertIsNone(quote_book.walk_fill(None, '買進', 1, 1))
+        self.assertIsNone(quote_book.walk_fill(
+            quote_book.make([], [], [], [], ts=1.0), '買進', 1, 1))
+        self.assertIsNone(quote_book.walk_fill(self._book(), '買進', 0, 1))
+
+    # ---------- 定時下單:當下 vs 曾經 ----------
+
+    def _df(self):
+        """昨收 100;今天已收盤的 K 棒最低到 99.5 (曾經跌 0.5%),
+        但最後一根收在 99.95 (當下只跌 0.05%)。"""
+        idx = pd.to_datetime(['2026-08-05 13:30', '2026-08-06 09:05',
+                              '2026-08-06 09:10', '2026-08-06 09:15'])
+        return pd.DataFrame({'Open': [100.0, 100.0, 99.6, 99.6],
+                             'High': [100.0, 100.0, 99.9, 100.0],
+                             'Low': [100.0, 99.5, 99.5, 99.9],
+                             'Close': [100.0, 99.6, 99.6, 99.95]}, index=idx)
+
+    def _s(self, **kw):
+        s = strategy_engine.new_strategy()
+        s.update({'name': 'T', 'symbol': '0050', 'trade_type': '零股', 'qty': 501,
+                  'timed_entry': True, 'timed_entry_time': '10:30',
+                  'timed_entry_window_min': 10, 'timed_book_level': 3,
+                  'entry': [{'type': 'day_drop_over',
+                             'params': {'value': 0.2, 'base': '昨收', 'use': '盤中觸價'}}]})
+        s.update(kw)
+        return s
+
+    def test_timed_entry_uses_the_price_at_the_moment(self):
+        """使用者原話:「就要以這個時間去看 A 有沒有符合策略條件,
+        若沒有符合,就不會下單」。
+
+        當下只跌 0.05% < 0.2% → **不可以**下單,即使今天早上曾經跌 0.5%。
+        """
+        rt = strategy_engine.new_runtime()
+        self.assertIsNone(strategy_engine.check_timed_entry(
+            self._s(), rt, self._df(), live_price=99.95))
+
+    def test_timed_entry_fires_when_the_moment_qualifies(self):
+        """正向對照:當下真的跌 0.5% 就要送。"""
+        rt = strategy_engine.new_runtime()
+        it = strategy_engine.check_timed_entry(
+            self._s(), rt, self._df(), live_price=99.5)
+        self.assertIsNotNone(it)
+        self.assertEqual(it['action'], '買進')
+        self.assertIn('當下', it['reason'])
+
+    def test_bar_path_keeps_the_ever_touched_semantics(self):
+        """反向對照:K 棒路徑的「盤中觸價」語意**不可以**被改掉 ——
+        那是「跌深買進」的字面意思,只有定時下單需要「此刻」。"""
+        chg = strategy_engine.day_pct_change(self._df(), '昨收', '盤中觸價', 'down')
+        self.assertLessEqual(chg, -0.2, '盤中曾經跌 0.5%,K 棒語意要成立')
+
+    def test_no_entry_conditions_still_fires_at_the_moment(self):
+        """「到點必送」的用法不受影響。"""
+        rt = strategy_engine.new_runtime()
+        self.assertIsNotNone(strategy_engine.check_timed_entry(
+            self._s(entry=[]), rt, self._df(), live_price=99.95))
+
+    def test_price_is_zero_so_caller_must_use_the_book(self):
+        """反向對照:intent 的價刻意留 0 —— 定時下單的成交價一定來自五檔,
+        留一個看起來合理的 K 棒價會讓「五檔取不到時悄悄用了 K 棒價」很容易發生。"""
+        rt = strategy_engine.new_runtime()
+        it = strategy_engine.check_timed_entry(self._s(entry=[]), rt, self._df(),
+                                               live_price=99.95)
+        self.assertEqual(it['price'], 0.0)
+
+
 class TestResetDailyCounters(unittest.TestCase):
     """【ADR-150】換日重置抽成共用函式 —— 回測的自訂策略路徑不經過
     evaluate_strategy,少了這一份 trades_today 會一路累加。"""

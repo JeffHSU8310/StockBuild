@@ -1534,7 +1534,7 @@ def mark_timed_done(runtime, now_dt):
         runtime['timed_done_day'] = now_dt.strftime('%Y-%m-%d')
 
 
-def check_timed_entry(strategy, runtime, df_closed=None):
+def check_timed_entry(strategy, runtime, df_closed=None, live_price=None):
     """定時單要送什麼。回傳 OPEN intent 或 None。
 
     **進場條件仍然要成立**,只是判斷的時機從「K 棒收盤」換成「指定時刻」:
@@ -1558,12 +1558,46 @@ def check_timed_entry(strategy, runtime, df_closed=None):
     if conds:
         if df_closed is None or len(df_closed) < 1:
             return None
-        try:
-            ok, details = eval_conditions(df_closed, conds, 'AND')
-        except Exception:
-            return None
-        if not ok:
-            return None
+        # 【ADR-153】「當日漲跌幅」類條件在**定時下單**這條路上,語意必須是
+        # 「**這個時刻**符不符合」,不是「今天曾經符合過」。
+        #
+        # `day_pct_change(use='盤中觸價')` 的語意是「當日到目前為止的最低/最高」
+        # —— 那是一個**狀態**,今天早上曾經跌 0.3%,10:30 已經回到 -0.05% 時
+        # 它仍然成立。K 棒路徑要那個語意沒問題(那是「跌深買進」的字面意思),
+        # 但定時下單是使用者指定「在 10:30 看一眼」——
+        # 使用者原話:「當我有設定什麼時候下單,就要以這個時間去看 A 有沒有
+        # 符合策略條件,若沒有符合,就不會下單。」
+        #
+        # 所以這裡對這一類條件強制改用「當下的價」比:帶入 live_price、
+        # 並用 '收盤價' 語意(拿單一價格比,不取當日極值)。其餘條件(均線、
+        # KD…)本來就只能看已收盤 K 棒,照舊走 eval_conditions。
+        _now_conds = [c for c in conds if str(c.get('type')) in LIVE_ENTRY_CONDITIONS]
+        _bar_conds = [c for c in conds if str(c.get('type')) not in LIVE_ENTRY_CONDITIONS]
+        details = []
+        for c in _now_conds:
+            p = c.get('params', {}) or {}
+            t = str(c.get('type'))
+            side = 'down' if t == 'day_drop_over' else 'up'
+            try:
+                v = abs(float(p.get('value', 3.0)))
+                chg = day_pct_change(df_closed, p.get('base', '昨收'), '收盤價', side,
+                                     live_price=live_price)
+            except Exception:
+                return None
+            if chg is None:
+                return None
+            hit = (chg <= -v) if side == 'down' else (chg >= v)
+            if not hit:
+                return None
+            details.append((f"{condition_label(c)} [當下 {chg:+.2f}%]", True))
+        if _bar_conds:
+            try:
+                ok, bar_details = eval_conditions(df_closed, _bar_conds, 'AND')
+            except Exception:
+                return None
+            if not ok:
+                return None
+            details.extend(bar_details)
         why = "進場條件成立: " + " 且 ".join(lab for lab, _ in details)
     else:
         why = "無進場條件 (到點即進場)"
